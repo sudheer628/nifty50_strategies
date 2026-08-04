@@ -73,7 +73,14 @@ def build_headers() -> dict:
 
     jwt_token = get_jwt_token()
     if not jwt_token:
+        logger.error("AngelOne: JWT token retrieval failed; check Redis "
+                     "key 'angelone_jwt_feed'")
         return {}
+
+    # Log a masked preview of the JWT for diagnosis
+    jwt_preview = jwt_token[:20] + "..." if len(jwt_token) > 20 else jwt_token
+    logger.info("AngelOne: JWT retrieved (preview: %s), API key length=%d",
+                jwt_preview, len(api_key))
 
     return {
         "Authorization": f"Bearer {jwt_token}",
@@ -120,9 +127,20 @@ def get_nifty_spot() -> dict:
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        logger.info("NIFTY spot HTTP %s", resp.status_code)
+
+        # Log the raw response text on failure for diagnosis
+        if resp.status_code != 200 or not resp.text.strip():
+            logger.error(
+                "NIFTY spot unexpected response: status=%s body=%s",
+                resp.status_code,
+                resp.text[:500] if resp.text else "(empty)"
+            )
+            return {}
+
         body = resp.json()
-        logger.debug("NIFTY spot HTTP %s: %s",
-                     resp.status_code, json.dumps(body, indent=2)[:500])
+        logger.debug("NIFTY spot response: %s",
+                     json.dumps(body, indent=2)[:500])
 
         if resp.status_code != 200:
             logger.error("NIFTY spot HTTP %s", resp.status_code)
