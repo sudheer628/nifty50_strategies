@@ -103,7 +103,8 @@ def get_nifty_spot() -> dict:
     """
     Fetch current NIFTY50 spot market data.
 
-    Calls the Angel One LTP endpoint for the NIFTY 50 index token.
+    First searches for the NIFTY 50 index instrument via the search API to
+    obtain the correct Angel One symbol token, then calls the LTP endpoint.
 
     Returns:
         Dictionary with keys:
@@ -114,44 +115,79 @@ def get_nifty_spot() -> dict:
             - ``low`` (float)   : day low (if available)
         Returns empty dict on failure.
     """
-    url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/order/v1/getLtp"
     headers = build_headers()
     if not headers:
         return {}
 
+    # ------------------------------------------------------------------
+    # Step 1: Search for NIFTY 50 to get the correct Angel One token
+    # ------------------------------------------------------------------
+    nifty50_token = NIFTY50_TOKEN  # fallback to configured default
+    nifty50_symbol = NIFTY50_TRADING_SYMBOL
+
+    try:
+        search_url = (
+            f"{ANGELONE_BASE_URL}"
+            f"/rest/secure/angelbroking/order/v1/searchScrip"
+        )
+        search_payload = {
+            "exchange": "NSE",
+            "searchscrip": "NIFTY 50",
+        }
+        search_resp = requests.post(
+            search_url, headers=headers, json=search_payload, timeout=15
+        )
+        logger.info("NIFTY search HTTP %s", search_resp.status_code)
+
+        if search_resp.status_code == 200 and search_resp.text.strip():
+            search_body = search_resp.json()
+            results = search_body.get("data", [])
+            if isinstance(results, list):
+                for item in results:
+                    ts = item.get("symbol", "")
+                    name = item.get("name", "")
+                    token = item.get("token", "")
+                    if "NIFTY 50" in name.upper() or ts == "NIFTY 50":
+                        nifty50_token = token
+                        nifty50_symbol = ts
+                        logger.info("NIFTY 50 found: token=%s symbol=%s",
+                                     nifty50_token, nifty50_symbol)
+                        break
+    except (requests.RequestException, json.JSONDecodeError) as exc:
+        logger.warning("NIFTY search failed (will use default token): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 2: Call LTP endpoint
+    # ------------------------------------------------------------------
+    url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/order/v1/getLtp"
     payload = {
         "exchange": "NSE",
-        "tradingsymbol": NIFTY50_TRADING_SYMBOL,
-        "symboltoken": NIFTY50_TOKEN,
+        "tradingsymbol": nifty50_symbol,
+        "symboltoken": nifty50_token,
     }
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        logger.info("NIFTY spot HTTP %s", resp.status_code)
+        # Log raw response at INFO so we can diagnose API issues
+        logger.info(
+            "NIFTY LTP HTTP %s  body=%s",
+            resp.status_code,
+            resp.text[:300] if resp.text else "(empty)"
+        )
 
-        # Log the raw response text on failure for diagnosis
         if resp.status_code != 200 or not resp.text.strip():
-            logger.error(
-                "NIFTY spot unexpected response: status=%s body=%s",
-                resp.status_code,
-                resp.text[:500] if resp.text else "(empty)"
-            )
+            logger.error("NIFTY LTP call failed: status=%s", resp.status_code)
             return {}
 
         body = resp.json()
-        logger.debug("NIFTY spot response: %s",
-                     json.dumps(body, indent=2)[:500])
-
-        if resp.status_code != 200:
-            logger.error("NIFTY spot HTTP %s", resp.status_code)
-            return {}
 
         if body.get("status") is False:
-            logger.error("NIFTY spot API error: %s", body.get("message", ""))
+            logger.error("NIFTY LTP API error: %s", body.get("message", body))
             return {}
 
         data = body.get("data", {})
         if not data:
+            logger.warning("NIFTY LTP returned no data: %s", body)
             return {}
 
         return {
@@ -191,16 +227,21 @@ def get_option_ltp(exchange: str, trading_symbol: str, token: str) -> dict:
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        body = resp.json()
-        logger.debug("Option LTP %s HTTP %s", trading_symbol, resp.status_code)
+        logger.info(
+            "Option LTP %s HTTP %s body=%s",
+            trading_symbol, resp.status_code,
+            resp.text[:300] if resp.text else "(empty)"
+        )
 
-        if resp.status_code != 200:
+        if resp.status_code != 200 or not resp.text.strip():
             logger.error("Option LTP HTTP %s for %s", resp.status_code, trading_symbol)
             return {}
 
+        body = resp.json()
+
         if body.get("status") is False:
             logger.error("Option LTP API error for %s: %s",
-                         trading_symbol, body.get("message", ""))
+                         trading_symbol, body.get("message", body))
             return {}
 
         data = body.get("data", {})
