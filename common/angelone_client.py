@@ -119,56 +119,16 @@ def get_nifty_spot() -> dict:
     if not headers:
         return {}
 
-    # ------------------------------------------------------------------
-    # Step 1: Search for NIFTY 50 to get the correct Angel One token
-    # ------------------------------------------------------------------
-    nifty50_token = NIFTY50_TOKEN  # fallback to configured default
-    nifty50_symbol = NIFTY50_TRADING_SYMBOL
-
-    try:
-        search_url = (
-            f"{ANGELONE_BASE_URL}"
-            f"/rest/secure/angelbroking/order/v1/searchScrip"
-        )
-        search_payload = {
-            "exchange": "NSE",
-            "searchscrip": "NIFTY 50",
-        }
-        search_resp = requests.post(
-            search_url, headers=headers, json=search_payload, timeout=15
-        )
-        logger.info("NIFTY search HTTP %s", search_resp.status_code)
-
-        if search_resp.status_code == 200 and search_resp.text.strip():
-            search_body = search_resp.json()
-            results = search_body.get("data", [])
-            if isinstance(results, list):
-                for item in results:
-                    ts = item.get("symbol", "")
-                    name = item.get("name", "")
-                    token = item.get("token", "")
-                    if "NIFTY 50" in name.upper() or ts == "NIFTY 50":
-                        nifty50_token = token
-                        nifty50_symbol = ts
-                        logger.info("NIFTY 50 found: token=%s symbol=%s",
-                                     nifty50_token, nifty50_symbol)
-                        break
-    except (requests.RequestException, json.JSONDecodeError) as exc:
-        logger.warning("NIFTY search failed (will use default token): %s", exc)
-
-    # ------------------------------------------------------------------
-    # Step 2: Call LTP endpoint
-    # ------------------------------------------------------------------
+    # NIFTY50 in Angel One is token=2, exch_seg=CDS (per OpenAPIScripMaster)
     url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/order/v1/getLtp"
     payload = {
         "exchange": "NSE",
-        "tradingsymbol": nifty50_symbol,
-        "symboltoken": nifty50_token,
+        "tradingsymbol": NIFTY50_TRADING_SYMBOL,
+        "symboltoken": NIFTY50_TOKEN,
     }
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        # Log raw response at INFO so we can diagnose API issues
         logger.info(
             "NIFTY LTP HTTP %s  body=%s",
             resp.status_code,

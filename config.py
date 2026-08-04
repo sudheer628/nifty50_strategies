@@ -87,7 +87,13 @@ def get_redis_client() -> redis.Redis:
 # ---------------------------------------------------------------------------
 ANGELONE_BASE_URL = "https://apiconnect.angelone.in"
 
-# NIFTY50 token (index token for spot LTP queries)
-NIFTY50_TOKEN = "99926000"
+# NIFTY50 token and symbol for Angel One SmartAPI.
+# These are the default values; the actual token is resolved at runtime
+# by searching for "NIFTY 50" via the searchScrip API if the search
+# succeeds, falling back to the token below.
+#
+# From Angel One's OpenAPIScripMaster:
+#   token=2  symbol=NIFTY50  exch_seg=CDS  instrumenttype=INDEX
+NIFTY50_TOKEN = "2"
 NIFTY50_SYMBOL = "NIFTY"
-NIFTY50_TRADING_SYMBOL = "NIFTY 50"
+NIFTY50_TRADING_SYMBOL = "NIFTY50"
