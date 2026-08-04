@@ -99,12 +99,37 @@ def build_headers() -> dict:
 # Public data fetchers
 # ---------------------------------------------------------------------------
 
+def _resolve_nifty50_token() -> tuple:
+    """
+    Search for the NIFTY50 index on NSE to get the correct token.
+
+    Returns:
+        Tuple of (token, exchange, trading_symbol) or default fallback.
+    """
+    results = search_instruments("NIFTY 50", exchange="NSE")
+    for item in results:
+        name = item.get("name", "")
+        symbol = item.get("symbol", "")
+        inst_type = item.get("instrumenttype", "")
+        token = item.get("token", "")
+        exch = item.get("exch_seg", "NSE")
+        if inst_type == "INDEX" and "NIFTY" in name.upper():
+            logger.info(
+                "Resolved NIFTY50: token=%s symbol=%s exchange=%s",
+                token, symbol, exch
+            )
+            return (token, exch, symbol)
+
+    logger.warning("Could not resolve NIFTY50 via search; using defaults")
+    return (NIFTY50_TOKEN, "NSE", NIFTY50_TRADING_SYMBOL)
+
+
 def get_nifty_spot() -> dict:
     """
     Fetch current NIFTY50 spot market data via the Market Data API.
 
-    Uses OHLC mode which returns LTP, open, high, low, and close.
-    NIFTY50: token=2, exch_seg=CDS (per Angel One OpenAPIScripMaster).
+    Searches for the NIFTY50 index on NSE at runtime, then queries the
+    quote endpoint in FULL mode.
 
     Returns:
         Dictionary with keys:
@@ -119,11 +144,13 @@ def get_nifty_spot() -> dict:
     if not headers:
         return {}
 
+    token, exchange, trading_symbol = _resolve_nifty50_token()
+
     url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/market/v1/quote/"
     payload = {
         "mode": "FULL",
         "exchangeTokens": {
-            "CDS": [NIFTY50_TOKEN]
+            exchange: [token]
         }
     }
 
@@ -238,9 +265,7 @@ def search_instruments(search_text: str, exchange: str = "NFO") -> list:
         exchange:     Exchange, defaults to ``"NFO"`` for F&O.
 
     Returns:
-        List of matching instrument dicts, each containing ``symbol``,
-        ``token``, ``name``, ``expiry``, ``strike``, ``lotsize``, and
-        ``instrumenttype`` fields.  Returns empty list on failure.
+        List of matching instrument dicts.  Returns empty list on failure.
     """
     url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/order/v1/searchScrip"
     headers = build_headers()
@@ -254,13 +279,15 @@ def search_instruments(search_text: str, exchange: str = "NFO") -> list:
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        body = resp.json()
-        logger.debug("searchScrip '%s' HTTP %s: %d results",
-                     search_text, resp.status_code,
-                     len(body.get("data", [])))
+        logger.info("searchScrip '%s' HTTP %s", search_text, resp.status_code)
 
-        if resp.status_code != 200:
-            logger.error("searchScrip HTTP %s", resp.status_code)
+        if resp.status_code != 200 or not resp.text.strip():
+            logger.error("searchScrip HTTP %s (empty response)", resp.status_code)
+            return []
+
+        body = resp.json()
+        if body is None:
+            logger.error("searchScrip returned null body")
             return []
 
         if body.get("status") is False:
@@ -269,8 +296,11 @@ def search_instruments(search_text: str, exchange: str = "NFO") -> list:
 
         data = body.get("data", [])
         if not isinstance(data, list):
+            logger.warning("searchScrip data is not a list: %s", type(data))
             return []
 
+        logger.info("searchScrip '%s' returned %d results",
+                    search_text, len(data))
         return data
     except (requests.RequestException, json.JSONDecodeError) as exc:
         logger.error("searchScrip failed: %s", exc)
