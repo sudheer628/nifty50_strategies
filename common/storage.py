@@ -12,7 +12,7 @@ import os
 import sqlite3
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import (
     logger,
@@ -198,7 +198,7 @@ def insert_buy_snapshot(db_path: str, snapshot: dict) -> None:
         snapshot.get("put_strike"),
         snapshot.get("call_buy_price"),
         snapshot.get("put_buy_price"),
-        snapshot.get("captured_at", datetime.now().isoformat()),
+        snapshot.get("captured_at", datetime.now(timezone.utc).isoformat()),
     ))
     conn.commit()
     conn.close()

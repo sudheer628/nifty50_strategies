@@ -18,8 +18,16 @@ Usage (cron):
 """
 
 import argparse
+import os
 import sys
 from datetime import datetime, date, time
+
+# Ensure the project root directory is on the Python import path so that
+# ``config`` and ``common.*`` can be imported when the script is invoked
+# directly (e.g. via cron).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import pytz
 
@@ -51,13 +59,20 @@ from common.storage import (
     generate_cycle_id,
 )
 
-# IST timezone
+# IST timezone (used for business-logic decisions: market hours,
+# Tuesday detection, expiry resolution).
 IST = pytz.timezone("Asia/Kolkata")
+UTC = pytz.UTC
 
 
 def _now_ist() -> datetime:
     """Return the current datetime in IST."""
     return datetime.now(IST)
+
+
+def _now_utc() -> datetime:
+    """Return the current datetime in UTC (used for DB timestamps)."""
+    return datetime.now(UTC)
 
 
 def _today_ist() -> date:
@@ -103,7 +118,7 @@ def _build_record(
     """Build a standard hourly record dictionary."""
     return {
         "strategy_name": STRATEGY_NAME,
-        "collection_timestamp": _now_ist().isoformat(),
+        "collection_timestamp": _now_utc().isoformat(),
         "expiry_date": expiry_file,
         "nifty_open": nifty_open,
         "nifty_ltp": nifty_ltp,
@@ -200,7 +215,7 @@ def collect_once() -> bool:
                 "put_strike": put_strike,
                 "call_buy_price": call_buy_price,
                 "put_buy_price": put_buy_price,
-                "captured_at": _now_ist().isoformat(),
+                "captured_at": _now_utc().isoformat(),
             }
 
             # Archives the previous snapshot (if any) before overwriting
