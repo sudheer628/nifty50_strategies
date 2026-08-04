@@ -170,29 +170,44 @@ def collect_once() -> bool:
     start_str = format_expiry_file(week_start)
 
     if is_first_run_of_week:
-        # --- Tuesday: fresh cycle, fresh buy prices ---
-        cycle_id = generate_cycle_id(start_str)
-        call_buy_price = call_ltp
-        put_buy_price = put_ltp
+        # --- Tuesday logic ---
+        # Check whether an active snapshot for THIS Tuesday already exists
+        # (e.g. manually created with correct 9:30 AM prices). If so,
+        # reuse it instead of overwriting with mid-day LTPs.
+        active = load_active_snapshot()
+        if active and active.get("week_start_date") == start_str:
+            logger.info(
+                "Active snapshot already exists for today (%s); "
+                "reusing those buy prices.", start_str
+            )
+            cycle_id = active.get("cycle_id", generate_cycle_id(start_str))
+            call_buy_price = active.get("call_buy_price")
+            put_buy_price = active.get("put_buy_price")
+            db_path = _ensure_db(week_start, expiry_date)
+        else:
+            # --- Genuinely fresh Tuesday: capture new buy prices ---
+            db_path = _ensure_db(week_start, expiry_date)
+            cycle_id = generate_cycle_id(start_str)
+            call_buy_price = call_ltp
+            put_buy_price = put_ltp
 
-        snapshot = {
-            "strategy_name": STRATEGY_NAME,
-            "cycle_id": cycle_id,
-            "week_start_date": start_str,
-            "expiry_date": expiry_file,
-            "call_strike": call_strike,
-            "put_strike": put_strike,
-            "call_buy_price": call_buy_price,
-            "put_buy_price": put_buy_price,
-            "captured_at": _now_ist().isoformat(),
-        }
+            snapshot = {
+                "strategy_name": STRATEGY_NAME,
+                "cycle_id": cycle_id,
+                "week_start_date": start_str,
+                "expiry_date": expiry_file,
+                "call_strike": call_strike,
+                "put_strike": put_strike,
+                "call_buy_price": call_buy_price,
+                "put_buy_price": put_buy_price,
+                "captured_at": _now_ist().isoformat(),
+            }
 
-        # Archives the previous snapshot (if any) before overwriting
-        save_active_snapshot(snapshot)
-        db_path = _ensure_db(week_start, expiry_date)
-        insert_buy_snapshot(db_path, snapshot)
+            # Archives the previous snapshot (if any) before overwriting
+            save_active_snapshot(snapshot)
+            insert_buy_snapshot(db_path, snapshot)
 
-        logger.info("Tuesday buy prices captured: CALL=%.2f  PUT=%.2f",
+            logger.info("Tuesday buy prices captured: CALL=%.2f  PUT=%.2f",
                      call_buy_price, put_buy_price)
     else:
         # --- Wednesday onward: reuse existing buy prices ---
