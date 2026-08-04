@@ -101,61 +101,63 @@ def build_headers() -> dict:
 
 def get_nifty_spot() -> dict:
     """
-    Fetch current NIFTY50 spot market data.
+    Fetch current NIFTY50 spot market data via the Market Data API.
 
-    First searches for the NIFTY 50 index instrument via the search API to
-    obtain the correct Angel One symbol token, then calls the LTP endpoint.
+    Uses OHLC mode which returns LTP, open, high, low, and close.
+    NIFTY50: token=2, exch_seg=CDS (per Angel One OpenAPIScripMaster).
 
     Returns:
         Dictionary with keys:
             - ``ltp`` (float)   : last traded price
-            - ``open`` (float)  : day open price (if available)
-            - ``close`` (float) : previous close (if available)
-            - ``high`` (float)  : day high (if available)
-            - ``low`` (float)   : day low (if available)
+            - ``open`` (float)  : day open price
+            - ``close`` (float) : previous close
+            - ``high`` (float)  : day high
+            - ``low`` (float)   : day low
         Returns empty dict on failure.
     """
     headers = build_headers()
     if not headers:
         return {}
 
-    # NIFTY50 in Angel One is token=2, exch_seg=CDS (per OpenAPIScripMaster)
-    url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/order/v1/getLtp"
+    url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/market/v1/quote/"
     payload = {
-        "exchange": "NSE",
-        "tradingsymbol": NIFTY50_TRADING_SYMBOL,
-        "symboltoken": NIFTY50_TOKEN,
+        "mode": "FULL",
+        "exchangeTokens": {
+            "CDS": [NIFTY50_TOKEN]
+        }
     }
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         logger.info(
-            "NIFTY LTP HTTP %s  body=%s",
+            "NIFTY quote HTTP %s  body=%s",
             resp.status_code,
-            resp.text[:300] if resp.text else "(empty)"
+            resp.text[:500] if resp.text else "(empty)"
         )
 
         if resp.status_code != 200 or not resp.text.strip():
-            logger.error("NIFTY LTP call failed: status=%s", resp.status_code)
+            logger.error("NIFTY quote call failed: status=%s", resp.status_code)
             return {}
 
         body = resp.json()
 
-        if body.get("status") is False:
-            logger.error("NIFTY LTP API error: %s", body.get("message", body))
+        if body.get("status") is not True:
+            logger.error("NIFTY quote API error: %s",
+                         body.get("message", body))
             return {}
 
-        data = body.get("data", {})
-        if not data:
-            logger.warning("NIFTY LTP returned no data: %s", body)
+        fetched = (body.get("data") or {}).get("fetched", [])
+        if not fetched:
+            logger.warning("NIFTY quote returned no fetched data: %s", body)
             return {}
 
+        item = fetched[0]
         return {
-            "ltp": float(data.get("ltp", 0) or 0),
-            "open": float(data.get("open", 0) or 0),
-            "close": float(data.get("close", 0) or 0),
-            "high": float(data.get("high", 0) or 0),
-            "low": float(data.get("low", 0) or 0),
+            "ltp": float(item.get("ltp", 0) or 0),
+            "open": float(item.get("open", 0) or 0),
+            "close": float(item.get("close", 0) or 0),
+            "high": float(item.get("high", 0) or 0),
+            "low": float(item.get("low", 0) or 0),
         }
     except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
         logger.error("NIFTY spot fetch failed: %s", exc)
@@ -164,7 +166,9 @@ def get_nifty_spot() -> dict:
 
 def get_option_ltp(exchange: str, trading_symbol: str, token: str) -> dict:
     """
-    Fetch LTP for a specific option contract.
+    Fetch LTP for a specific option contract via the Market Data API.
+
+    Uses LTP mode for efficiency (only need the last traded price).
 
     Args:
         exchange:        Exchange code, e.g. ``"NFO"``.
@@ -172,17 +176,18 @@ def get_option_ltp(exchange: str, trading_symbol: str, token: str) -> dict:
         token:           Angel One symbol token for the contract.
 
     Returns:
-        Dictionary with ``ltp`` (float) and raw data.  Empty dict on failure.
+        Dictionary with ``ltp`` (float).  Empty dict on failure.
     """
-    url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/order/v1/getLtp"
+    url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/market/v1/quote/"
     headers = build_headers()
     if not headers:
         return {}
 
     payload = {
-        "exchange": exchange,
-        "tradingsymbol": trading_symbol,
-        "symboltoken": token,
+        "mode": "LTP",
+        "exchangeTokens": {
+            exchange: [token]
+        }
     }
 
     try:
@@ -199,19 +204,22 @@ def get_option_ltp(exchange: str, trading_symbol: str, token: str) -> dict:
 
         body = resp.json()
 
-        if body.get("status") is False:
+        if body.get("status") is not True:
             logger.error("Option LTP API error for %s: %s",
                          trading_symbol, body.get("message", body))
             return {}
 
-        data = body.get("data", {})
-        if not data:
+        fetched = (body.get("data") or {}).get("fetched", [])
+        if not fetched:
+            unfetched = (body.get("data") or {}).get("unfetched", [])
+            if unfetched:
+                logger.error("Option LTP unfetched for %s: %s",
+                             trading_symbol, unfetched[0])
             return {}
 
+        item = fetched[0]
         return {
-            "ltp": float(data.get("ltp", 0) or 0),
-            "open": float(data.get("open", 0) or 0),
-            "close": float(data.get("close", 0) or 0),
+            "ltp": float(item.get("ltp", 0) or 0),
         }
     except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
         logger.error("Option LTP fetch failed for %s: %s", trading_symbol, exc)
