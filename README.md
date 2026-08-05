@@ -75,7 +75,7 @@ The original plan (section 4.4) proposed a "double collection" model where the o
 ### 4.2 Collection schedule
 
 - Every Tuesday at 9:30 AM IST, a fresh weekly cycle begins targeting the **next** weekly expiry.
-- Data is collected hourly from 9:30 AM to 3:30 PM IST, Tuesday through Monday.
+- Data is collected hourly from 9:30 AM to 3:40 PM IST, Tuesday through Monday.
 - The cycle ends on Monday; the next Tuesday starts a new cycle.
 
 ### 4.3 Example: Aug 4 through Aug 11
@@ -141,7 +141,7 @@ Day open = 24540 → PUT = 24000, CALL = 24500.
 
 - **Start time**: 9:30 AM IST
 - **Interval**: Hourly
-- **Duration**: Tuesday through Monday during market hours (9:30 AM - 3:30 PM IST)
+- **Duration**: Tuesday through Monday during market hours (9:30 AM - 3:40 PM IST)
 
 ### Cron entry
 
@@ -149,7 +149,7 @@ Day open = 24540 → PUT = 24000, CALL = 24500.
 30 4-10 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
 ```
 
-(UTC hours `4-10` correspond to IST 9:30 AM - 3:30 PM)
+(UTC hours `4-10` correspond to IST 9:30 AM - 3:40 PM)
 
 ---
 
