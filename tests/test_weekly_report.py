@@ -1,9 +1,14 @@
 import os
+import sys
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from common.storage import init_db, insert_buy_snapshot, insert_record
 from scripts.send_weekly_report import (
