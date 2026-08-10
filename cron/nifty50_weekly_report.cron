@@ -1,0 +1,2 @@
+# Monday 10:45 UTC = Monday 16:15 IST, after the final hourly collection.
+45 10 * * 1 cd /home/ubuntu/nifty50_strategies && /home/ubuntu/nifty50_strategies/.venv/bin/python scripts/send_weekly_report.py >> /home/ubuntu/nifty50_weekly_report.log 2>&1

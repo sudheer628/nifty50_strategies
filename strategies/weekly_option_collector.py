@@ -7,7 +7,7 @@ invoked by cron every hour during market hours.
 Simplified weekly cycle model:
     - Tuesday, 9:30 AM:  Previous weekly cycle ends.  A fresh cycle
       begins targeting the *next* weekly expiry.  New CALL/PUT strikes
-      are selected from the day open, and new buy prices are captured.
+      are selected from that trigger's NIFTY LTP, and new buy prices are captured.
       The old snapshot is archived; the new one becomes active.
     - Wednesday through Monday:  Collection continues for the same
       active cycle using the Tuesday buy prices.
@@ -167,6 +167,7 @@ def _build_record(
     call_ltp,
     call_buy_price,
     put_buy_price,
+    gainloss,
 ) -> dict:
     """Build a standard hourly record dictionary."""
     return {
@@ -182,6 +183,7 @@ def _build_record(
         "call_ltp": call_ltp,
         "call_buy_price": call_buy_price,
         "put_buy_price": put_buy_price,
+        "gainloss": gainloss,
         "source": "angelone",
         "cycle_id": cycle_id,
     }
@@ -240,8 +242,11 @@ def collect_once() -> bool:
             active_cycle["week_start_date"], put_strike, call_strike
         )
     else:
-        put_strike, call_strike = strike_selector(nifty_open)
-        logger.info("Selected new strikes: PUT=%d  CALL=%d", put_strike, call_strike)
+        put_strike, call_strike = strike_selector(nifty_ltp)
+        logger.info(
+            "Selected new strikes from first-trigger LTP %.2f: PUT=%d  CALL=%d",
+            nifty_ltp, put_strike, call_strike
+        )
 
     option_data = get_nifty_option_chain(
         expiry_angelone, call_strike, put_strike
@@ -337,6 +342,15 @@ def collect_once() -> bool:
     if put_buy_price is None:
         put_buy_price = put_ltp
 
+    gainloss = None
+    prices = (call_ltp, call_buy_price, put_ltp, put_buy_price)
+    if all(price is not None for price in prices):
+        gainloss = round(
+            (float(call_ltp) - float(call_buy_price))
+            + (float(put_ltp) - float(put_buy_price)),
+            2,
+        )
+
     # ------------------------------------------------------------------
     # Write the hourly record
     # ------------------------------------------------------------------
@@ -352,6 +366,7 @@ def collect_once() -> bool:
         call_ltp=call_ltp,
         call_buy_price=call_buy_price,
         put_buy_price=put_buy_price,
+        gainloss=gainloss,
     )
     insert_record(db_path, record)
 
@@ -366,6 +381,7 @@ def collect_once() -> bool:
                  call_strike, call_ltp, call_buy_price)
     logger.info("  PUT  %d  LTP=%s  BuyPrice=%s",
                  put_strike, put_ltp, put_buy_price)
+    logger.info("  Gain/Loss: %s", gainloss)
     logger.info("  Expiry: %s  |  DB: %s", expiry_file, db_path)
     logger.info("=" * 50)
 

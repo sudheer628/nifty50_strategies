@@ -96,10 +96,33 @@ def init_db(db_path: str) -> None:
             call_ltp        REAL,
             call_buy_price  REAL,
             put_buy_price   REAL,
+            gainloss        REAL,
             source          TEXT    DEFAULT 'angelone',
             cycle_id        TEXT    NOT NULL
         )
     """)
+
+    # Migrate weekly databases created before gainloss was introduced.
+    cur.execute("PRAGMA table_info(strategy_hourly_data)")
+    hourly_columns = {row[1] for row in cur.fetchall()}
+    if "gainloss" not in hourly_columns:
+        cur.execute("ALTER TABLE strategy_hourly_data ADD COLUMN gainloss REAL")
+        logger.info("Added gainloss column to existing database: %s", db_path)
+
+    cur.execute("""
+        UPDATE strategy_hourly_data
+        SET gainloss = ROUND(
+            (call_ltp - call_buy_price) + (put_ltp - put_buy_price),
+            2
+        )
+        WHERE gainloss IS NULL
+          AND call_ltp IS NOT NULL
+          AND call_buy_price IS NOT NULL
+          AND put_ltp IS NOT NULL
+          AND put_buy_price IS NOT NULL
+    """)
+    if cur.rowcount:
+        logger.info("Backfilled gainloss for %d existing rows", cur.rowcount)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS strategy_buy_snapshots (
@@ -146,9 +169,10 @@ def insert_record(db_path: str, record: dict) -> None:
             call_ltp,
             call_buy_price,
             put_buy_price,
+            gainloss,
             source,
             cycle_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         record.get("strategy_name", STRATEGY_NAME),
         record.get("collection_timestamp", ""),
@@ -162,6 +186,7 @@ def insert_record(db_path: str, record: dict) -> None:
         record.get("call_ltp"),
         record.get("call_buy_price"),
         record.get("put_buy_price"),
+        record.get("gainloss"),
         record.get("source", "angelone"),
         record.get("cycle_id", ""),
     ))

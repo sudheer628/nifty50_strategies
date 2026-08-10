@@ -6,7 +6,7 @@ Build one self-contained option data collection strategy for NIFTY50 without pla
 
 This strategy:
 - Collects NIFTY50 market data via Angel One SmartAPI,
-- Selects one PUT strike and one CALL strike based on the day open,
+- Selects one PUT strike and one CALL strike from Tuesday's first-trigger LTP,
 - Collects option prices for the selected strikes across the full weekly window,
 - Stores all data in SQLite for long-term reuse,
 - Is isolated from other strategies while sharing a common Angel One SmartAPI data layer.
@@ -38,16 +38,20 @@ This strategy:
 nifty50_strategies/
 ├── .env.example                         # Template for credentials
 ├── .gitignore
-├── requirements.txt                     # python-dotenv, redis, requests, pytz
+├── requirements.txt                     # Runtime dependencies
 ├── config.py                            # Central config, Redis factory, constants
 ├── common/
 │   ├── __init__.py
 │   ├── angelone_client.py               # SmartAPI auth + market data fetchers
 │   ├── expiry.py                        # Expiry resolution + strike selector
 │   └── storage.py                       # SQLite persistence + JSON snapshot
-└── strategies/
-    ├── __init__.py
-    └── weekly_option_collector.py       # Main strategy entry point
+├── strategies/
+│   ├── __init__.py
+│   └── weekly_option_collector.py       # Main strategy entry point
+├── scripts/
+│   └── send_weekly_report.py            # Monday HTML email + chart
+└── cron/
+    └── nifty50_weekly_report.cron       # Monday EOD report schedule
 ```
 
 ### Module descriptions
@@ -131,13 +135,14 @@ cycle is recognized without calling SmartAPI or writing to SQLite.
 
 For each hourly interval, the strategy collects:
 
-- NIFTY50 day open
+- NIFTY50 day open (stored independently from the strike-selection LTP)
 - NIFTY50 current LTP
 - NIFTY50 previous close (if available)
-- PUT strike (selected from day open)
-- CALL strike (selected from day open)
+- PUT strike (selected from Tuesday's first-trigger LTP)
+- CALL strike (selected from Tuesday's first-trigger LTP)
 - Option LTPs for the selected strikes
 - Tuesday buy prices for CALL and PUT
+- Combined option gain/loss: `(CALL LTP - CALL buy) + (PUT LTP - PUT buy)`
 
 ---
 
@@ -149,14 +154,14 @@ For each hourly interval, the strategy collects:
 ### 6.2 Algorithm
 
 ```python
-anchor = floor(day_open / 100) * 100
+anchor = floor(first_trigger_ltp / 100) * 100
 put_strike  = anchor - 100  # one step below
-call_strike = anchor        # at the anchor
+call_strike = anchor + 100  # one step above
 ```
 
 ### 6.3 Example
 
-Day open = 24540 → PUT = 24000, CALL = 24500.
+First-trigger LTP = 25000 → PUT = 24900, CALL = 25100.
 
 ---
 
@@ -169,10 +174,10 @@ Day open = 24540 → PUT = 24000, CALL = 24500.
 ### Cron entry
 
 ```
-30 4-10 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
+0 4-10 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
 ```
 
-(UTC hours `4-10` correspond to IST 9:30 AM - 3:40 PM)
+(UTC hours `4-10` at minute `0` correspond to IST 9:30 AM - 3:30 PM.)
 
 ---
 
@@ -204,6 +209,7 @@ Follows the same pattern as the existing `news-analyzer-for-market-sentiment` pr
 | `call_ltp` | REAL | CALL option LTP |
 | `call_buy_price` | REAL | Tuesday CALL buy price (carried through week) |
 | `put_buy_price` | REAL | Tuesday PUT buy price (carried through week) |
+| `gainloss` | REAL | `(current CALL - CALL buy) + (current PUT - PUT buy)` |
 | `source` | TEXT | Always `"angelone"` |
 | `cycle_id` | TEXT | Unique cycle identifier |
 
@@ -304,7 +310,45 @@ python strategies/weekly_option_collector.py --dry-run
 python strategies/weekly_option_collector.py --force
 
 # Cron (every hour during market hours)
-30 4-10 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
+0 4-10 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
+```
+
+### Weekly Monday email report
+
+The report reads the active Tuesday-Monday SQLite database and sends a styled
+HTML email containing summary metrics, the complete hourly gain/loss table,
+and an embedded chart of NIFTY LTP and combined option gain/loss.
+
+It uses the same Gmail SMTP environment variables as the legacy market signal
+reporter:
+
+```env
+EMAIL_SENDER=your_email@gmail.com
+EMAIL_APP_PASSWORD=your_gmail_app_password
+EMAIL_RECIPIENT=recipient@example.com
+EMAIL_SMTP_SERVER=smtp.gmail.com
+EMAIL_SMTP_PORT=465
+```
+
+Generate a preview without sending email:
+
+```bash
+python scripts/send_weekly_report.py --dry-run
+```
+
+Send immediately:
+
+```bash
+python scripts/send_weekly_report.py
+```
+
+The preview HTML and PNG chart are archived under
+`/home/ubuntu/sqlite/strategies/reports/` by default.
+
+Monday EOD cron (10:45 UTC / 4:15 PM IST, after the 3:30 PM collector):
+
+```cron
+45 10 * * 1 cd /home/ubuntu/nifty50_strategies && /home/ubuntu/nifty50_strategies/.venv/bin/python scripts/send_weekly_report.py >> /home/ubuntu/nifty50_weekly_report.log 2>&1
 ```
 
 ---

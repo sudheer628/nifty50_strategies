@@ -69,46 +69,27 @@ def format_expiry_file(expiry_date: date) -> str:
     return expiry_date.strftime("%Y%m%d")
 
 
-def strike_selector(day_open: float) -> tuple:
+def strike_selector(reference_ltp: float) -> tuple:
     """
-    Select one PUT and one CALL strike based on the day open price.
+    Select one PUT and one CALL strike from the first-trigger NIFTY LTP.
 
-    Uses 100-point strike increments:
+    The LTP is floored to a 100-point anchor. The selected options are one
+    100-point step below and above that anchor:
 
-        - PUT  strike = floor(day_open / 100) * 100  (rounded down to nearest 100)
-        - CALL strike = put_strike + STRIKE_STEP
+        - PUT  strike = anchor - 100
+        - CALL strike = anchor + 100
 
-    Example:  day_open=24540 -> PUT=24000, CALL=24500 (per plan 6.3).
+    Example: reference_ltp=25000 -> PUT=24900, CALL=25100.
 
     Args:
-        day_open:  NIFTY50 day open price (float).
+        reference_ltp: NIFTY50 LTP at the cycle's first trigger.
 
     Returns:
         Tuple ``(put_strike, call_strike)`` as integers.
     """
-    # Round down the day open to the nearest multiple of STRIKE_STEP
-    # Using a "higher multiple of 100 below the open" for PUT as per example:
-    # day_open=24540, floor(24540/100)=245, -> 245*100=24500...wait...
-    # The plan example: day_open 24540 -> PUT 24000, CALL 24500.
-    # That means PUT = floor((day_open - 500) / 100) * 100 (roughly) or
-    # more simply: anchor = floor(day_open / 100) * 100, then
-    # PUT = anchor - (some offset to get a lower strike).
-    # But the plan says "select one lower 100-point strike for PUT".
-    # With day_open=24540: 24500 is nearest 100-multiple, PUT=24000 (1 step below).
-    # So PUT = anchor - 100 * round((anchor % 500 + 1) / 100)... no.
-    # Let's just follow the natural reading:
-    # anchor = floor(day_open / 100) * 100
-    # If the day_open is above the anchor by more than a small threshold,
-    # we take a PUT that is one step lower.
-    # For simplicity and determinism: we'll pick the PUT as one 100-step
-    # below the anchor, and CALL as the anchor itself.
-
     from config import STRIKE_STEP
-    anchor = int(day_open / STRIKE_STEP) * STRIKE_STEP
-
-    # PUT: one STRIKE_STEP below the anchor
+    anchor = int(reference_ltp / STRIKE_STEP) * STRIKE_STEP
     put_strike = anchor - STRIKE_STEP
-    # CALL: at the anchor (or one above if we prefer OTM)
-    call_strike = anchor
+    call_strike = anchor + STRIKE_STEP
 
     return put_strike, call_strike
