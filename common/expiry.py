@@ -1,39 +1,36 @@
 """
 Weekly expiry resolution helpers for NIFTY50.
 
-Weekly index options expire every Thursday.  If a Thursday is a trading
-holiday, expiry moves to the previous trading day, but for the purposes
-of this strategy we resolve the calendar Thursday and let the option
-chain data reflect the actual expiry.
+NIFTY weekly index options expire every Tuesday. The strategy always
+targets a future expiry: on Monday it selects the next day, while on an
+expiry Tuesday it rolls to the following Tuesday.
 """
 
 from datetime import date, datetime, timedelta
 
 
 # Weekday constants: Monday=0 ... Sunday=6
-THURSDAY = 3
 TUESDAY = 1
 
 
 def get_next_weekly_expiry(from_date: date = None) -> date:
     """
-    Return the *next* weekly expiry (Thursday) on or after ``from_date``.
+    Return the next future weekly expiry (Tuesday) after ``from_date``.
 
-    If ``from_date`` is a Thursday, it returns the *following* Thursday
+    If ``from_date`` is a Tuesday, it returns the *following* Tuesday
     (per the plan rule: do not collect the current week's expiry).
 
     Args:
         from_date:  Reference date (defaults to today if None).
 
     Returns:
-        The Thursday date of the next weekly expiry.
+        The Tuesday date of the next weekly expiry.
     """
     ref = from_date if from_date else date.today()
-    # Move to next day so we always get a *future* Thursday
+    # Move to the next day first so an expiry Tuesday rolls to next week.
     ref += timedelta(days=1)
-    # Days until next Thursday (0 = Monday)
-    days_until_thursday = (THURSDAY - ref.weekday()) % 7
-    return ref + timedelta(days=days_until_thursday)
+    days_until_tuesday = (TUESDAY - ref.weekday()) % 7
+    return ref + timedelta(days=days_until_tuesday)
 
 
 def is_tuesday(d: date = None) -> bool:

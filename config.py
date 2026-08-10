@@ -87,13 +87,17 @@ def get_redis_client() -> redis.Redis:
 # ---------------------------------------------------------------------------
 ANGELONE_BASE_URL = "https://apiconnect.angelone.in"
 
-# NIFTY50 token and symbol for Angel One SmartAPI.
-# These are the default values; the actual token is resolved at runtime
-# by searching for "NIFTY 50" via the searchScrip API if the search
-# succeeds, falling back to the token below.
-#
-# From Angel One's OpenAPIScripMaster:
-#   token=2  symbol=NIFTY50  exch_seg=CDS  instrumenttype=INDEX
-NIFTY50_TOKEN = "2"
+# NIFTY 50 cash-index identifiers from Angel One's OpenAPIScripMaster:
+#   token=99926000  symbol="Nifty 50"  exch_seg=NSE
+#   instrumenttype=AMXIDX
+# Token 2 is a CDS-segment instrument and must not be used with NSE.
+NIFTY50_TOKEN = "99926000"
 NIFTY50_SYMBOL = "NIFTY"
-NIFTY50_TRADING_SYMBOL = "NIFTY50"
+NIFTY50_TRADING_SYMBOL = "Nifty 50"
+
+# Angel One publishes the current instrument/token catalogue here. Option
+# tokens are contract-specific, so they are resolved from this daily file.
+ANGELONE_INSTRUMENT_MASTER_URL = (
+    "https://margincalculator.angelone.in/"
+    "OpenAPI_File/files/OpenAPIScripMaster.json"
+)

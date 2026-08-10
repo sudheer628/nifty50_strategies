@@ -11,13 +11,15 @@ script: static API key from .env, dynamic JWT from Redis Cloud.
 
 import os
 import json
-import logging
+from datetime import datetime
+from functools import lru_cache
 import requests
 
 from config import (
     logger,
     get_redis_client,
     ANGELONE_BASE_URL,
+    ANGELONE_INSTRUMENT_MASTER_URL,
     NIFTY50_TOKEN,
     NIFTY50_SYMBOL,
     NIFTY50_TRADING_SYMBOL,
@@ -101,26 +103,11 @@ def build_headers() -> dict:
 
 def _resolve_nifty50_token() -> tuple:
     """
-    Search for the NIFTY50 index on NSE to get the correct token.
+    Return the official NIFTY 50 cash-index identifiers.
 
     Returns:
-        Tuple of (token, exchange, trading_symbol) or default fallback.
+        Tuple of (token, exchange, trading_symbol).
     """
-    results = search_instruments("NIFTY 50", exchange="NSE")
-    for item in results:
-        name = item.get("name", "")
-        symbol = item.get("symbol", "")
-        inst_type = item.get("instrumenttype", "")
-        token = item.get("token", "")
-        exch = item.get("exch_seg", "NSE")
-        if inst_type == "INDEX" and "NIFTY" in name.upper():
-            logger.info(
-                "Resolved NIFTY50: token=%s symbol=%s exchange=%s",
-                token, symbol, exch
-            )
-            return (token, exch, symbol)
-
-    logger.warning("Could not resolve NIFTY50 via search; using defaults")
     return (NIFTY50_TOKEN, "NSE", NIFTY50_TRADING_SYMBOL)
 
 
@@ -128,8 +115,7 @@ def get_nifty_spot() -> dict:
     """
     Fetch current NIFTY50 spot market data via the Market Data API.
 
-    Searches for the NIFTY50 index on NSE at runtime, then queries the
-    quote endpoint in FULL mode.
+    Queries the official NIFTY 50 NSE index token in FULL mode.
 
     Returns:
         Dictionary with keys:
@@ -144,7 +130,7 @@ def get_nifty_spot() -> dict:
     if not headers:
         return {}
 
-    token, exchange, trading_symbol = _resolve_nifty50_token()
+    token, exchange, _trading_symbol = _resolve_nifty50_token()
 
     url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/market/v1/quote/"
     payload = {
@@ -253,6 +239,80 @@ def get_option_ltp(exchange: str, trading_symbol: str, token: str) -> dict:
         return {}
 
 
+def get_option_ltps(option_infos: list) -> dict:
+    """Fetch several resolved option contracts in one Market Data request."""
+    if not option_infos:
+        return {}
+
+    exchange_tokens = {}
+    for info in option_infos:
+        exchange = info.get("exchange", "NFO")
+        token = str(info.get("token", ""))
+        if token:
+            exchange_tokens.setdefault(exchange, []).append(token)
+
+    if not exchange_tokens:
+        return {}
+
+    headers = build_headers()
+    if not headers:
+        return {}
+
+    url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/market/v1/quote/"
+    payload = {
+        "mode": "LTP",
+        "exchangeTokens": exchange_tokens,
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        logger.info(
+            "Option batch LTP HTTP %s body=%s",
+            resp.status_code,
+            resp.text[:500] if resp.text else "(empty)",
+        )
+        if resp.status_code != 200 or not resp.text.strip():
+            logger.error("Option batch LTP HTTP %s", resp.status_code)
+            return {}
+
+        body = resp.json()
+        if body.get("status") is not True:
+            logger.error("Option batch LTP API error: %s", body)
+            return {}
+
+        quotes = {}
+        for item in (body.get("data") or {}).get("fetched", []):
+            token = str(item.get("symbolToken") or item.get("symboltoken") or "")
+            if token:
+                quotes[token] = {
+                    "ltp": float(item.get("ltp", 0) or 0),
+                }
+
+        for item in (body.get("data") or {}).get("unfetched", []):
+            logger.error("Option batch LTP unfetched: %s", item)
+        return quotes
+    except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
+        logger.error("Option batch LTP fetch failed: %s", exc)
+        return {}
+
+
+@lru_cache(maxsize=1)
+def get_instrument_master() -> list:
+    """Download and cache Angel One's current instrument catalogue."""
+    try:
+        resp = requests.get(ANGELONE_INSTRUMENT_MASTER_URL, timeout=30)
+        resp.raise_for_status()
+        instruments = resp.json()
+        if not isinstance(instruments, list):
+            logger.error("Angel One instrument master is not a list")
+            return []
+        logger.info("Loaded %d instruments from Angel One master", len(instruments))
+        return instruments
+    except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
+        logger.error("Failed to load Angel One instrument master: %s", exc)
+        return []
+
+
 def search_instruments(search_text: str, exchange: str = "NFO") -> list:
     """
     Search for instrument tokens and metadata by name.
@@ -326,28 +386,67 @@ def resolve_option_token(
         Dict with ``token`` (str), ``trading_symbol`` (str), ``exchange`` (str),
         and ``lotsize`` (int).  Returns empty dict if not found.
     """
-    # Build the expected trading symbol prefix
-    symbol_prefix = f"{NIFTY50_SYMBOL}{expiry_str}{strike}"
-    search_term = f"{symbol_prefix}{option_type}"
+    expiry_str = expiry_str.upper()
+    option_type = option_type.upper()
+    if option_type not in ("CE", "PE"):
+        raise ValueError("option_type must be CE or PE")
 
-    results = search_instruments(search_term, exchange="NFO")
-    if not results:
-        logger.warning("No instrument found for %s", search_term)
+    # In the instrument master, equity/index option strikes are represented
+    # in paise (24500 is stored as 2450000.000000).
+    expected_master_strike = int(strike) * 100
+    for inst in get_instrument_master():
+        try:
+            master_strike = int(round(float(inst.get("strike", 0))))
+        except (TypeError, ValueError):
+            continue
+
+        symbol = str(inst.get("symbol", ""))
+        if (
+            inst.get("exch_seg") == "NFO"
+            and inst.get("name") == NIFTY50_SYMBOL
+            and inst.get("instrumenttype") == "OPTIDX"
+            and str(inst.get("expiry", "")).upper() == expiry_str
+            and master_strike == expected_master_strike
+            and symbol.upper().endswith(option_type)
+        ):
+            resolved = {
+                "token": str(inst.get("token", "")),
+                "trading_symbol": symbol,
+                "exchange": "NFO",
+                "lotsize": int(inst.get("lotsize", 0) or 0),
+            }
+            logger.info(
+                "Resolved NIFTY option: symbol=%s token=%s exchange=NFO",
+                resolved["trading_symbol"], resolved["token"]
+            )
+            return resolved
+
+    # Fallback to Search Scrip if the public master is temporarily
+    # unavailable. Weekly NIFTY symbols use DDMMMYY, not DDMMMYYYY.
+    try:
+        expiry_symbol = datetime.strptime(expiry_str, "%d%b%Y").strftime(
+            "%d%b%y"
+        ).upper()
+    except ValueError:
+        logger.error("Invalid Angel One expiry date: %s", expiry_str)
         return {}
 
-    # Pick the best match: exact trading symbol match
-    for inst in results:
-        ts = inst.get("symbol", "")
-        if ts.upper().startswith(symbol_prefix.upper()):
+    search_term = f"{NIFTY50_SYMBOL}{expiry_symbol}{int(strike)}{option_type}"
+    for inst in search_instruments(search_term, exchange="NFO"):
+        # searchScrip uses these names; the instrument master uses the
+        # alternatives after ``or``.
+        symbol = str(inst.get("tradingsymbol") or inst.get("symbol") or "")
+        token = str(inst.get("symboltoken") or inst.get("token") or "")
+        exchange = str(inst.get("exchange") or inst.get("exch_seg") or "NFO")
+        if symbol.upper() == search_term and token:
             return {
-                "token": inst.get("token", ""),
-                "trading_symbol": inst.get("symbol", ""),
-                "exchange": inst.get("exch_seg", "NFO"),
+                "token": token,
+                "trading_symbol": symbol,
+                "exchange": exchange,
                 "lotsize": int(inst.get("lotsize", 0) or 0),
             }
 
-    logger.warning("No exact match for %s among %d results",
-                   search_term, len(results))
+    logger.warning("No instrument found for %s", search_term)
     return {}
 
 
@@ -369,30 +468,18 @@ def get_nifty_option_chain(
             ``{"call": {ltp, token, ...}, "put": {ltp, token, ...}}``
         Missing keys on failure.
     """
-    result = {}
-
     call_info = resolve_option_token(expiry_str, call_strike, "CE")
-    if call_info:
-        call_data = get_option_ltp(
-            call_info["exchange"],
-            call_info["trading_symbol"],
-            call_info["token"]
-        )
-        call_data.update(call_info)
-        result["call"] = call_data
-    else:
-        result["call"] = None
-
     put_info = resolve_option_token(expiry_str, put_strike, "PE")
-    if put_info:
-        put_data = get_option_ltp(
-            put_info["exchange"],
-            put_info["trading_symbol"],
-            put_info["token"]
-        )
-        put_data.update(put_info)
-        result["put"] = put_data
-    else:
-        result["put"] = None
+    resolved = [info for info in (call_info, put_info) if info]
+    quotes = get_option_ltps(resolved)
+
+    result = {}
+    for key, info in (("call", call_info), ("put", put_info)):
+        if not info:
+            result[key] = None
+            continue
+        data = quotes.get(str(info["token"]), {}).copy()
+        data.update(info)
+        result[key] = data
 
     return result

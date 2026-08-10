@@ -55,7 +55,7 @@ nifty50_strategies/
 | Module | Purpose |
 |--------|---------|
 | `config.py` | Loads `.env`, Redis client factory, constants (strike step=100, NIFTY token, Angel One base URL, storage paths) |
-| `common/angelone_client.py` | JWT auth from Redis `angelone_jwt_feed`, LTP fetcher, `searchScrip` for instrument lookup, `get_nifty_option_chain()` for CALL+PUT LTPs |
+| `common/angelone_client.py` | JWT auth from Redis `angelone_jwt_feed`, NIFTY spot LTP, daily instrument-master option lookup, and `get_nifty_option_chain()` for CALL+PUT LTPs |
 | `common/expiry.py` | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()` |
 | `common/storage.py` | `build_db_path()`, `init_db()`, `insert_record()`, `insert_buy_snapshot()`, `save_active_snapshot()`, `load_active_snapshot()`, `generate_cycle_id()` |
 | `strategies/weekly_option_collector.py` | Cron-invoked collector: one cycle per invocation, Tuesday buy-price capture, SQLite + JSON persistence |
@@ -82,9 +82,9 @@ The original plan (section 4.4) proposed a "double collection" model where the o
 
 | Date | Day | Active cycle | Snapshot |
 |------|-----|-------------|----------|
-| 4 Aug | Tue | New: expiry Aug 6 | `current_week_buy.json` (4th Aug prices) |
+| 4 Aug | Tue | New: expiry Aug 11 | `current_week_buy.json` (4th Aug prices) |
 | 5-10 Aug | Wed-Mon | Same cycle continues | Unchanged |
-| 11 Aug | Tue | Old ends; new: expiry Aug 13 | Snapshot archived as `current_week_buy_20260804.json`; new `current_week_buy.json` written |
+| 11 Aug | Tue | Old ends; new: expiry Aug 18 | Snapshot archived as `current_week_buy_20260804.json`; new `current_week_buy.json` written |
 
 ### 4.4 Mid-Tuesday start (Scenario 1)
 
@@ -96,11 +96,34 @@ If the script is started mid-Tuesday (missing the 9:30 AM trigger) with **no** p
 
 ### 4.5 Manual snapshot (Scenario 2)
 
-If `current_week_buy.json` is manually created with correct 9:30 AM prices before the script runs:
+If `current_week_buy.json` is manually created with correct Tuesday 9:30 AM
+prices before the script runs:
 
-- The code detects that a snapshot with today's `week_start_date` already exists.
-- It reuses those buy prices instead of overwriting them with mid-day values.
+- The code detects that the snapshot covers the currently active Tuesday-Monday cycle.
+- It reuses that snapshot's expiry, CALL/PUT strikes, and buy prices instead of
+  recalculating them from later daily opens.
 - This is useful when the first few triggers are missed and accurate 9:30 AM prices are known.
+
+For a mid-cycle start on Monday 10 Aug 2026, with the cycle that began Tuesday
+4 Aug and expires Tuesday 11 Aug, the manual snapshot is:
+
+```json
+{
+  "strategy_name": "nifty50_weekly_option_collector",
+  "cycle_id": "20260804-manual",
+  "week_start_date": "20260804",
+  "expiry_date": "20260811",
+  "call_strike": 24700,
+  "put_strike": 24500,
+  "call_buy_price": 92.0,
+  "put_buy_price": 82.0,
+  "captured_at": "2026-08-04T04:00:00+00:00"
+}
+```
+
+Save it as `/home/ubuntu/sqlite/strategies/current_week_buy.json`, then run
+`python strategies/weekly_option_collector.py --dry-run` to validate that the
+cycle is recognized without calling SmartAPI or writing to SQLite.
 
 ---
 

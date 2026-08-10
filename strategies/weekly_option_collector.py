@@ -20,7 +20,7 @@ Usage (cron):
 import argparse
 import os
 import sys
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 
 # Ensure the project root directory is on the Python import path so that
 # ``config`` and ``common.*`` can be imported when the script is invoked
@@ -102,6 +102,59 @@ def _ensure_db(week_start: date, expiry_date: date) -> str:
     return db_path
 
 
+def _parse_file_date(value: str) -> date:
+    """Parse a snapshot date stored in YYYYMMDD format."""
+    return datetime.strptime(value, "%Y%m%d").date()
+
+
+def _cycle_start_for_day(d: date) -> date:
+    """Return the Tuesday that started the cycle containing ``d``."""
+    days_since_tuesday = (d.weekday() - 1) % 7
+    return d - timedelta(days=days_since_tuesday)
+
+
+def _active_cycle(snapshot: dict, today: date) -> dict:
+    """Validate and normalize a snapshot that may be active today."""
+    if not snapshot:
+        return {}
+
+    required = (
+        "week_start_date",
+        "expiry_date",
+        "call_strike",
+        "put_strike",
+        "call_buy_price",
+        "put_buy_price",
+    )
+    if any(snapshot.get(field) is None for field in required):
+        logger.warning("Active snapshot is missing required cycle fields")
+        return {}
+
+    try:
+        week_start = _parse_file_date(str(snapshot["week_start_date"]))
+        expiry_date = _parse_file_date(str(snapshot["expiry_date"]))
+        call_strike = int(snapshot["call_strike"])
+        put_strike = int(snapshot["put_strike"])
+    except (TypeError, ValueError):
+        logger.warning("Active snapshot contains invalid dates or strikes")
+        return {}
+
+    # A Tuesday always starts a new cycle unless a snapshot has explicitly
+    # been prepared for that same Tuesday (manual snapshot scenario).
+    if is_tuesday(today) and week_start != today:
+        return {}
+    if week_start > today or expiry_date < today:
+        return {}
+
+    return {
+        **snapshot,
+        "week_start": week_start,
+        "expiry": expiry_date,
+        "call_strike": call_strike,
+        "put_strike": put_strike,
+    }
+
+
 def _build_record(
     cycle_id: str,
     expiry_file: str,
@@ -148,11 +201,21 @@ def collect_once() -> bool:
     """
     today = _today_ist()
     is_first_run_of_week = is_tuesday(today)
+    today_str = format_expiry_file(today)
+
+    active = load_active_snapshot()
+    active_cycle = _active_cycle(active, today)
 
     # ------------------------------------------------------------------
     # Determine expiry, strikes, and spot data
     # ------------------------------------------------------------------
-    expiry_date = get_next_weekly_expiry(today)
+    if active_cycle:
+        expiry_date = active_cycle["expiry"]
+        week_start = active_cycle["week_start"]
+    else:
+        expiry_date = get_next_weekly_expiry(today)
+        week_start = _cycle_start_for_day(today)
+
     expiry_angelone = format_expiry_angelone(expiry_date)
     expiry_file = format_expiry_file(expiry_date)
 
@@ -169,8 +232,16 @@ def collect_once() -> bool:
     logger.info("NIFTY LTP=%.2f  Open=%.2f  PrevClose=%.2f",
                 nifty_ltp, nifty_open, nifty_prev_close)
 
-    put_strike, call_strike = strike_selector(nifty_open)
-    logger.info("Selected strikes: PUT=%d  CALL=%d", put_strike, call_strike)
+    if active_cycle:
+        put_strike = active_cycle["put_strike"]
+        call_strike = active_cycle["call_strike"]
+        logger.info(
+            "Reusing cycle strikes from %s: PUT=%d  CALL=%d",
+            active_cycle["week_start_date"], put_strike, call_strike
+        )
+    else:
+        put_strike, call_strike = strike_selector(nifty_open)
+        logger.info("Selected new strikes: PUT=%d  CALL=%d", put_strike, call_strike)
 
     option_data = get_nifty_option_chain(
         expiry_angelone, call_strike, put_strike
@@ -181,7 +252,6 @@ def collect_once() -> bool:
     # ------------------------------------------------------------------
     # Cycle identity: Tuesday = new, else = reuse active snapshot
     # ------------------------------------------------------------------
-    week_start = today
     start_str = format_expiry_file(week_start)
 
     if is_first_run_of_week:
@@ -189,16 +259,18 @@ def collect_once() -> bool:
         # Check whether an active snapshot for THIS Tuesday already exists
         # (e.g. manually created with correct 9:30 AM prices). If so,
         # reuse it instead of overwriting with mid-day LTPs.
-        active = load_active_snapshot()
-        if active and active.get("week_start_date") == start_str:
+        if active_cycle and active_cycle.get("week_start_date") == today_str:
             logger.info(
                 "Active snapshot already exists for today (%s); "
-                "reusing those buy prices.", start_str
+                "reusing its strikes and buy prices.", today_str
             )
-            cycle_id = active.get("cycle_id", generate_cycle_id(start_str))
-            call_buy_price = active.get("call_buy_price")
-            put_buy_price = active.get("put_buy_price")
+            cycle_id = active_cycle.get(
+                "cycle_id", generate_cycle_id(start_str)
+            )
+            call_buy_price = active_cycle.get("call_buy_price")
+            put_buy_price = active_cycle.get("put_buy_price")
             db_path = _ensure_db(week_start, expiry_date)
+            insert_buy_snapshot(db_path, active_cycle)
         else:
             # --- Genuinely fresh Tuesday: capture new buy prices ---
             db_path = _ensure_db(week_start, expiry_date)
@@ -225,20 +297,39 @@ def collect_once() -> bool:
             logger.info("Tuesday buy prices captured: CALL=%.2f  PUT=%.2f",
                      call_buy_price, put_buy_price)
     else:
-        # --- Wednesday onward: reuse existing buy prices ---
-        active = load_active_snapshot()
-        if not active:
+        # --- Wednesday-Monday: reuse the complete active cycle ---
+        if not active_cycle:
             logger.warning("No active snapshot found on non-Tuesday; "
-                           "capturing fresh buy prices as fallback.")
+                           "capturing a midweek fallback snapshot. Its prices "
+                           "are current prices, not Tuesday prices.")
             cycle_id = generate_cycle_id(start_str)
             call_buy_price = call_ltp
             put_buy_price = put_ltp
+
+            snapshot = {
+                "strategy_name": STRATEGY_NAME,
+                "cycle_id": cycle_id,
+                "week_start_date": start_str,
+                "expiry_date": expiry_file,
+                "call_strike": call_strike,
+                "put_strike": put_strike,
+                "call_buy_price": call_buy_price,
+                "put_buy_price": put_buy_price,
+                "captured_at": _now_utc().isoformat(),
+            }
+            save_active_snapshot(snapshot)
         else:
-            cycle_id = active.get("cycle_id", generate_cycle_id(start_str))
-            call_buy_price = active.get("call_buy_price")
-            put_buy_price = active.get("put_buy_price")
+            cycle_id = active_cycle.get(
+                "cycle_id", generate_cycle_id(start_str)
+            )
+            call_buy_price = active_cycle.get("call_buy_price")
+            put_buy_price = active_cycle.get("put_buy_price")
 
         db_path = _ensure_db(week_start, expiry_date)
+        if active_cycle:
+            insert_buy_snapshot(db_path, active_cycle)
+        else:
+            insert_buy_snapshot(db_path, snapshot)
 
     # Fallback: if buy prices are still None, use current LTP
     if call_buy_price is None:
@@ -302,9 +393,23 @@ def main():
     args = parser.parse_args()
 
     if args.dry_run:
+        today = _today_ist()
         logger.info("DRY RUN mode - would collect at %s", _now_ist().isoformat())
-        logger.info("Next expiry: %s", get_next_weekly_expiry())
-        logger.info("Is Tuesday: %s", is_tuesday())
+        logger.info("Next calendar expiry: %s", get_next_weekly_expiry(today))
+        logger.info("Is Tuesday: %s", is_tuesday(today))
+        active_cycle = _active_cycle(load_active_snapshot(), today)
+        if active_cycle:
+            logger.info(
+                "Active cycle: start=%s expiry=%s PUT=%d @ %s CALL=%d @ %s",
+                active_cycle["week_start_date"],
+                active_cycle["expiry_date"],
+                active_cycle["put_strike"],
+                active_cycle["put_buy_price"],
+                active_cycle["call_strike"],
+                active_cycle["call_buy_price"],
+            )
+        else:
+            logger.info("No valid active cycle snapshot for today")
         return
 
     if not args.force and not _is_market_time():
