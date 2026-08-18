@@ -79,7 +79,7 @@ The original plan (section 4.4) proposed a "double collection" model where the o
 ### 4.2 Collection schedule
 
 - Every Tuesday at 9:30 AM IST, a fresh weekly cycle begins targeting the **next** weekly expiry.
-- Data is collected hourly from 9:30 AM to 3:40 PM IST, Tuesday through Monday.
+- Data is collected hourly from 9:30 AM to 3:15 PM IST, Tuesday through Monday.
 - The cycle ends on Monday; the next Tuesday starts a new cycle.
 
 ### 4.3 Example: Aug 4 through Aug 11
@@ -169,15 +169,19 @@ First-trigger LTP = 25000 → PUT = 24900, CALL = 25100.
 
 - **Start time**: 9:30 AM IST
 - **Interval**: Hourly
-- **Duration**: Tuesday through Monday during market hours (9:30 AM - 3:40 PM IST)
+- **Duration**: Tuesday through Monday during market hours (9:30 AM - 3:15 PM IST)
 
 ### Cron entry
 
-```
-0 4-10 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
+```bash
+# Hourly collection during market hours (10:00-15:00 IST)
+30 4-9 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
+
+# Final tick at LTP freeze point (15:15 IST)
+45 9 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
 ```
 
-(UTC hours `4-10` at minute `0` correspond to IST 9:30 AM - 3:30 PM.)
+(UTC hours `4-9` at minute `30` correspond to IST 10:00 AM - 3:00 PM. Final tick at `45 9` = 15:15 IST.)
 
 ---
 
@@ -345,10 +349,10 @@ python scripts/send_weekly_report.py
 The preview HTML and PNG chart are archived under
 `/home/ubuntu/sqlite/strategies/reports/` by default.
 
-Monday EOD cron (10:45 UTC / 4:15 PM IST, after the 3:30 PM collector):
+Monday EOD cron (10:10 UTC / 3:40 PM IST, after the final 3:15 PM collector):
 
 ```cron
-45 10 * * 1 cd /home/ubuntu/nifty50_strategies && /home/ubuntu/nifty50_strategies/.venv/bin/python scripts/send_weekly_report.py >> /home/ubuntu/nifty50_weekly_report.log 2>&1
+10 10 * * 1 cd /home/ubuntu/nifty50_strategies && /home/ubuntu/nifty50_strategies/.venv/bin/python scripts/send_weekly_report.py >> /home/ubuntu/nifty50_weekly_report.log 2>&1
 ```
 
 ---
