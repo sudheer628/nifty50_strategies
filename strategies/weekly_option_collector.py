@@ -231,6 +231,11 @@ def collect_once() -> bool:
     nifty_open = float(spot.get("open", 0))
     nifty_prev_close = float(spot.get("close", 0))
 
+    if nifty_ltp <= 0 or nifty_open <= 0:
+        logger.error("Invalid NIFTY spot data: LTP=%.2f, Open=%.2f; aborting.", 
+                     nifty_ltp, nifty_open)
+        return False
+
     logger.info("NIFTY LTP=%.2f  Open=%.2f  PrevClose=%.2f",
                 nifty_ltp, nifty_open, nifty_prev_close)
 
@@ -251,8 +256,20 @@ def collect_once() -> bool:
     option_data = get_nifty_option_chain(
         expiry_angelone, call_strike, put_strike
     )
+    
+    # Validate option data before proceeding
     call_ltp = (option_data.get("call") or {}).get("ltp")
     put_ltp = (option_data.get("put") or {}).get("ltp")
+    
+    if call_ltp is None or put_ltp is None:
+        logger.error("Failed to fetch option LTPs: call_ltp=%s, put_ltp=%s; aborting.",
+                     call_ltp, put_ltp)
+        return False
+    
+    if call_ltp <= 0 or put_ltp <= 0:
+        logger.error("Invalid option LTPs: call=%.2f, put=%.2f; aborting.",
+                     call_ltp, put_ltp)
+        return False
 
     # ------------------------------------------------------------------
     # Cycle identity: Tuesday = new, else = reuse active snapshot
