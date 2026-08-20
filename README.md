@@ -187,7 +187,7 @@ First-trigger LTP = 25000 → PUT = 24900, CALL = 25100.
 
 (UTC hours `4-9` at minute `30` correspond to IST 10:00 AM - 3:00 PM. Final tick at `45 9` = 15:15 IST.)
 
-**Timestamp format:** All timestamps in SQLite are stored as Unix integers (seconds since epoch, UTC) matching the format used in `market_signal_agent` for consistency across projects.
+**Timestamp format:** All timestamps in SQLite are stored as Unix integers (seconds since epoch, UTC) matching the format used in `market_signal_agent` for cross-project joins and consistent querying. The storage layer (`storage.init_db()`) automatically migrates any legacy TEXT (ISO 8601) timestamps to integers on startup.
 
 ---
 
@@ -281,13 +281,22 @@ Example: `nifty50_weekly_data_20260804_20260811.db`
 - [x] Scenario 1 support (auto-create snapshot mid-Tuesday)
 - [x] Scenario 2 support (respect manually-created snapshot)
 
-### Phase 3: Validation and monitoring (PENDING)
+### Phase 3: Validation and monitoring (COMPLETE)
 
-- [ ] Verify collection runs on Tuesday
-- [ ] Verify correct expiry selected
-- [ ] Verify PUT/CALL strikes logged correctly
-- [ ] Verify hourly data from 9:30 AM onward
-- [ ] Verify JSON snapshot stability through the week
+- [x] Verify collection runs on Tuesday
+- [x] Verify correct expiry selected
+- [x] Verify PUT/CALL strikes logged correctly
+- [x] Verify hourly data from 9:30 AM onward
+- [x] Verify JSON snapshot stability through the week
+
+### Phase 4: Timestamp alignment (COMPLETE)
+
+- [x] Migrated `collection_timestamp` from ISO 8601 TEXT to Unix INTEGER
+- [x] Migrated `captured_at` from ISO 8601 TEXT to Unix INTEGER
+- [x] Automatic migration in `storage.init_db()` for existing databases
+- [x] Aligned with `market_signal_agent` (`ts` column) and `nifty_signal_features` (`ts` column)
+- [x] `send_daily_report.py` (in `market_signal_agent`) queries using integer range comparison
+- [x] `send_weekly_report.py` handles both integer and legacy TEXT timestamps via `_parse_timestamp()`
 
 ---
 
@@ -319,8 +328,9 @@ python strategies/weekly_option_collector.py --dry-run
 # Force run outside market hours
 python strategies/weekly_option_collector.py --force
 
-# Cron (every hour during market hours)
-0 4-10 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
+# Cron (every hour during market hours, two entries to cover 10:00-15:30 IST)
+30 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
+0 5-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
 ```
 
 ### Weekly Monday email report
@@ -358,7 +368,7 @@ The preview HTML and PNG chart are archived under
 Monday EOD cron (10:10 UTC / 3:40 PM IST, after the final 3:15 PM collector):
 
 ```cron
-10 10 * * 1 cd /home/ubuntu/nifty50_strategies && /home/ubuntu/nifty50_strategies/.venv/bin/python scripts/send_weekly_report.py >> /home/ubuntu/nifty50_weekly_report.log 2>&1
+10 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/send_weekly_report.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 ```
 
 ---
@@ -381,3 +391,5 @@ Monday EOD cron (10:10 UTC / 3:40 PM IST, after the final 3:15 PM collector):
 | Simplified single-cycle model | Eliminates double-collection complexity on rollover Tuesday                      |
 | Two-scenario Tuesday handling | Supports both fresh auto-start and manual snapshot injection                     |
 | SQLite per weekly cycle       | Clear separation, sortable filenames, append-only per cycle                      |
+| Unix integer timestamps       | Aligns with `market_signal_agent` and `nifty_signal_features` for cross-project joins |
+| Auto-migration in `init_db()` | Converts legacy TEXT timestamps on startup; no manual scripts needed             |
