@@ -125,21 +125,20 @@ def init_db(db_path: str) -> None:
         logger.info("Backfilled gainloss for %d existing rows", cur.rowcount)
 
     # Migrate collection_timestamp from TEXT (ISO string) to INTEGER (Unix epoch)
-    if "collection_timestamp" in hourly_columns:
-        # Check if current column is TEXT type
-        cur.execute("PRAGMA table_info(strategy_hourly_data)")
-        for row in cur.fetchall():
-            if row[1] == "collection_timestamp" and row[2].upper() == "TEXT":
-                # Migrate existing TEXT timestamps to INTEGER
-                cur.execute("""
-                    UPDATE strategy_hourly_data
-                    SET collection_timestamp = CAST(strftime('%s', 
-                        REPLACE(REPLACE(collection_timestamp, 'Z', '+00:00'), '+00:00', '')
-                    ) AS INTEGER)
-                    WHERE typeof(collection_timestamp) = 'text'
-                """)
-                logger.info("Migrated collection_timestamp to INTEGER format in %s", db_path)
-                break
+    # Only run if the column exists and is still TEXT type (from an old schema)
+    cur.execute("PRAGMA table_info(strategy_hourly_data)")
+    current_columns = {row[1]: row[2].upper() for row in cur.fetchall()}
+    
+    if "collection_timestamp" in current_columns and current_columns["collection_timestamp"] == "TEXT":
+        # Migrate existing TEXT timestamps to INTEGER
+        cur.execute("""
+            UPDATE strategy_hourly_data
+            SET collection_timestamp = CAST(strftime('%s', 
+                REPLACE(REPLACE(collection_timestamp, 'Z', '+00:00'), '+00:00', '')
+            ) AS INTEGER)
+            WHERE typeof(collection_timestamp) = 'text'
+        """)
+        logger.info("Migrated collection_timestamp to INTEGER format in %s", db_path)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS strategy_buy_snapshots (

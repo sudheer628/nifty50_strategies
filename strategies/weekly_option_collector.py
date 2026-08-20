@@ -314,7 +314,7 @@ def collect_once() -> bool:
                 "put_strike": put_strike,
                 "call_buy_price": call_buy_price,
                 "put_buy_price": put_buy_price,
-                "captured_at": _now_utc().isoformat(),
+                "captured_at": _now_utc_ts(),
             }
 
             # Archives the previous snapshot (if any) before overwriting
@@ -342,7 +342,7 @@ def collect_once() -> bool:
                 "put_strike": put_strike,
                 "call_buy_price": call_buy_price,
                 "put_buy_price": put_buy_price,
-                "captured_at": _now_utc().isoformat(),
+                "captured_at": _now_utc_ts(),
             }
             save_active_snapshot(snapshot)
         else:
