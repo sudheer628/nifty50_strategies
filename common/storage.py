@@ -137,10 +137,14 @@ def init_db(db_path: str) -> None:
         migrated = 0
         for row_id, ts_text in text_rows:
             try:
-                # Handle both 'Z' suffix and explicit '+00:00' offset
-                ts_clean = ts_text.replace("Z", "+00:00")
-                dt = datetime.fromisoformat(ts_clean)
-                epoch = int(dt.timestamp())
+                # Already a Unix epoch stored as text (e.g. '1787027402')
+                if ts_text.isdigit():
+                    epoch = int(ts_text)
+                else:
+                    # Handle both 'Z' suffix and explicit '+00:00' offset
+                    ts_clean = ts_text.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(ts_clean)
+                    epoch = int(dt.timestamp())
                 cur.execute(
                     "UPDATE strategy_hourly_data SET collection_timestamp = ? WHERE id = ?",
                     (epoch, row_id),
