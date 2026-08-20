@@ -21,7 +21,7 @@ This strategy:
 - Data collection only
 - One strategy implementation
 - Weekly expiry-based data collection
-- Hourly price collection from 9:30 AM onward
+- Price collection every 30 minutes from 10:00 AM onward
 - Common data source via Angel One SmartAPI
 - Persistent storage in SQLite for analysis and later strategy review
 
@@ -82,7 +82,7 @@ The original plan (section 4.4) proposed a "double collection" model where the o
 ### 4.2 Collection schedule
 
 - Every Tuesday at 9:30 AM IST, a fresh weekly cycle begins targeting the **next** weekly expiry.
-- Data is collected hourly from 9:30 AM to 3:15 PM IST, Tuesday through Monday.
+- Data is collected every 30 minutes from 10:00 AM to 3:30 PM IST, Tuesday through Monday.
 - The cycle ends on Monday; the next Tuesday starts a new cycle.
 
 ### 4.3 Example: Aug 4 through Aug 11
@@ -136,7 +136,7 @@ cycle is recognized without calling SmartAPI or writing to SQLite.
 
 ## 5. Data Collected
 
-For each hourly interval, the strategy collects:
+For each 30-minute interval, the strategy collects:
 
 - NIFTY50 day open (stored independently from the strike-selection LTP)
 - NIFTY50 current LTP
@@ -171,21 +171,20 @@ First-trigger LTP = 25000 → PUT = 24900, CALL = 25100.
 
 ## 7. Collection Frequency
 
-- **Start time**: 9:30 AM IST
-- **Interval**: Hourly
-- **Duration**: Tuesday through Monday during market hours (9:30 AM - 3:15 PM IST)
+- **Start time**: 10:00 AM IST
+- **Interval**: Every 30 minutes
+- **Duration**: Tuesday through Monday during market hours (10:00 AM - 3:30 PM IST)
 
 ### Cron entry
 
 ```bash
-# Hourly collection during market hours (10:00-15:00 IST)
-30 4-9 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
-
-# Final tick at LTP freeze point (15:15 IST)
-45 9 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
+# Every 30 minutes during market hours (10:00-15:30 IST)
+# Two entries: :30 past (hours 4-9 UTC) and :00 past (hours 5-10 UTC)
+30 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
+0 5-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
 ```
 
-(UTC hours `4-9` at minute `30` correspond to IST 10:00 AM - 3:00 PM. Final tick at `45 9` = 15:15 IST.)
+(Combined, these fire at 4:30, 5:00, 5:30, …, 9:30, 10:00 UTC = every 30 min from 10:00 to 15:30 IST.)
 
 **Timestamp format:** All timestamps in SQLite are stored as Unix integers (seconds since epoch, UTC) matching the format used in `market_signal_agent` for cross-project joins and consistent querying. The storage layer (`storage.init_db()`) automatically migrates any legacy TEXT (ISO 8601) timestamps to integers on startup.
 
@@ -203,7 +202,7 @@ Follows the same pattern as the existing `news-analyzer-for-market-sentiment` pr
 
 ## 9. Data Model
 
-### 9.1 Hourly record (`strategy_hourly_data` table)
+### 9.1 Collection record (`strategy_hourly_data` table)
 
 | Column                 | Type    | Description                                           |
 | ---------------------- | ------- | ----------------------------------------------------- |
@@ -274,7 +273,7 @@ Example: `nifty50_weekly_data_20260804_20260811.db`
 
 - [x] Weekly cycle logic
 - [x] Strike selection logic (100-point grid)
-- [x] Hourly interval collection
+- [x] 30-minute interval collection
 - [x] Tuesday buy price capture
 - [x] SQLite + JSON persistence
 - [x] Automated snapshot archival on Tuesday rollover
@@ -328,7 +327,7 @@ python strategies/weekly_option_collector.py --dry-run
 # Force run outside market hours
 python strategies/weekly_option_collector.py --force
 
-# Cron (every hour during market hours, two entries to cover 10:00-15:30 IST)
+# Cron (every 30 minutes during market hours, 10:00-15:30 IST)
 30 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
 0 5-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
 ```
@@ -387,7 +386,7 @@ Monday EOD cron (10:10 UTC / 3:40 PM IST, after the final 3:15 PM collector):
 | Decision                      | Rationale                                                                        |
 | ----------------------------- | -------------------------------------------------------------------------------- |
 | No `smartapi-python` SDK      | Reuses existing direct HTTP + Redis JWT pattern from `check_active_positions.py` |
-| Synchronous code              | Hourly cron-triggered; no need for async                                         |
+| Synchronous code              | 30-minute cron-triggered; no need for async                                      |
 | Simplified single-cycle model | Eliminates double-collection complexity on rollover Tuesday                      |
 | Two-scenario Tuesday handling | Supports both fresh auto-start and manual snapshot injection                     |
 | SQLite per weekly cycle       | Clear separation, sortable filenames, append-only per cycle                      |
