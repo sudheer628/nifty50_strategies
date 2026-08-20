@@ -5,6 +5,7 @@
 Build one self-contained option data collection strategy for NIFTY50 without placing any orders.
 
 This strategy:
+
 - Collects NIFTY50 market data via Angel One SmartAPI,
 - Selects one PUT strike and one CALL strike from Tuesday's first-trigger LTP,
 - Collects option prices for the selected strikes across the full weekly window,
@@ -16,6 +17,7 @@ This strategy:
 ## 2. Scope
 
 ### In scope
+
 - Data collection only
 - One strategy implementation
 - Weekly expiry-based data collection
@@ -24,6 +26,7 @@ This strategy:
 - Persistent storage in SQLite for analysis and later strategy review
 
 ### Out of scope
+
 - Order placement
 - Trade execution
 - Risk management
@@ -56,13 +59,13 @@ nifty50_strategies/
 
 ### Module descriptions
 
-| Module | Purpose |
-|--------|---------|
-| `config.py` | Loads `.env`, Redis client factory, constants (strike step=100, NIFTY token, Angel One base URL, storage paths) |
-| `common/angelone_client.py` | JWT auth from Redis `angelone_jwt_feed`, NIFTY spot LTP, daily instrument-master option lookup, and `get_nifty_option_chain()` for CALL+PUT LTPs |
-| `common/expiry.py` | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()` |
-| `common/storage.py` | `build_db_path()`, `init_db()`, `insert_record()`, `insert_buy_snapshot()`, `save_active_snapshot()`, `load_active_snapshot()`, `generate_cycle_id()` |
-| `strategies/weekly_option_collector.py` | Cron-invoked collector: one cycle per invocation, Tuesday buy-price capture, SQLite + JSON persistence |
+| Module                                  | Purpose                                                                                                                                               |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config.py`                             | Loads `.env`, Redis client factory, constants (strike step=100, NIFTY token, Angel One base URL, storage paths)                                       |
+| `common/angelone_client.py`             | JWT auth from Redis `angelone_jwt_feed`, NIFTY spot LTP, daily instrument-master option lookup, and `get_nifty_option_chain()` for CALL+PUT LTPs      |
+| `common/expiry.py`                      | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()`                                   |
+| `common/storage.py`                     | `build_db_path()`, `init_db()`, `insert_record()`, `insert_buy_snapshot()`, `save_active_snapshot()`, `load_active_snapshot()`, `generate_cycle_id()` |
+| `strategies/weekly_option_collector.py` | Cron-invoked collector: one cycle per invocation, Tuesday buy-price capture, SQLite + JSON persistence                                                |
 
 ---
 
@@ -84,11 +87,11 @@ The original plan (section 4.4) proposed a "double collection" model where the o
 
 ### 4.3 Example: Aug 4 through Aug 11
 
-| Date | Day | Active cycle | Snapshot |
-|------|-----|-------------|----------|
-| 4 Aug | Tue | New: expiry Aug 11 | `current_week_buy.json` (4th Aug prices) |
-| 5-10 Aug | Wed-Mon | Same cycle continues | Unchanged |
-| 11 Aug | Tue | Old ends; new: expiry Aug 18 | Snapshot archived as `current_week_buy_20260804.json`; new `current_week_buy.json` written |
+| Date     | Day     | Active cycle                 | Snapshot                                                                                   |
+| -------- | ------- | ---------------------------- | ------------------------------------------------------------------------------------------ |
+| 4 Aug    | Tue     | New: expiry Aug 11           | `current_week_buy.json` (4th Aug prices)                                                   |
+| 5-10 Aug | Wed-Mon | Same cycle continues         | Unchanged                                                                                  |
+| 11 Aug   | Tue     | Old ends; new: expiry Aug 18 | Snapshot archived as `current_week_buy_20260804.json`; new `current_week_buy.json` written |
 
 ### 4.4 Mid-Tuesday start (Scenario 1)
 
@@ -121,7 +124,7 @@ For a mid-cycle start on Monday 10 Aug 2026, with the cycle that began Tuesday
   "put_strike": 24500,
   "call_buy_price": 92.0,
   "put_buy_price": 82.0,
-  "captured_at": "2026-08-04T04:00:00+00:00"
+  "captured_at": 1785854400
 }
 ```
 
@@ -149,6 +152,7 @@ For each hourly interval, the strategy collects:
 ## 6. Strike Selection Rule
 
 ### 6.1 Strike grid
+
 100-point strike increments (not 50-point).
 
 ### 6.2 Algorithm
@@ -183,6 +187,8 @@ First-trigger LTP = 25000 → PUT = 24900, CALL = 25100.
 
 (UTC hours `4-9` at minute `30` correspond to IST 10:00 AM - 3:00 PM. Final tick at `45 9` = 15:15 IST.)
 
+**Timestamp format:** All timestamps in SQLite are stored as Unix integers (seconds since epoch, UTC) matching the format used in `market_signal_agent` for consistency across projects.
+
 ---
 
 ## 8. Authentication (Angel One SmartAPI)
@@ -199,37 +205,37 @@ Follows the same pattern as the existing `news-analyzer-for-market-sentiment` pr
 
 ### 9.1 Hourly record (`strategy_hourly_data` table)
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `strategy_name` | TEXT | Strategy identifier |
-| `collection_timestamp` | TEXT | ISO 8601 timestamp |
-| `expiry_date` | TEXT | Expiry in `YYYYMMDD` |
-| `nifty_open` | REAL | NIFTY50 day open |
-| `nifty_ltp` | REAL | NIFTY50 current LTP |
-| `nifty_previous_close` | REAL | NIFTY50 previous close |
-| `put_strike` | INTEGER | PUT strike price |
-| `put_ltp` | REAL | PUT option LTP |
-| `call_strike` | INTEGER | CALL strike price |
-| `call_ltp` | REAL | CALL option LTP |
-| `call_buy_price` | REAL | Tuesday CALL buy price (carried through week) |
-| `put_buy_price` | REAL | Tuesday PUT buy price (carried through week) |
-| `gainloss` | REAL | `(current CALL - CALL buy) + (current PUT - PUT buy)` |
-| `source` | TEXT | Always `"angelone"` |
-| `cycle_id` | TEXT | Unique cycle identifier |
+| Column                 | Type    | Description                                           |
+| ---------------------- | ------- | ----------------------------------------------------- |
+| `strategy_name`        | TEXT    | Strategy identifier                                   |
+| `collection_timestamp` | INTEGER | Unix timestamp (seconds since epoch, UTC)             |
+| `expiry_date`          | TEXT    | Expiry in `YYYYMMDD`                                  |
+| `nifty_open`           | REAL    | NIFTY50 day open                                      |
+| `nifty_ltp`            | REAL    | NIFTY50 current LTP                                   |
+| `nifty_previous_close` | REAL    | NIFTY50 previous close                                |
+| `put_strike`           | INTEGER | PUT strike price                                      |
+| `put_ltp`              | REAL    | PUT option LTP                                        |
+| `call_strike`          | INTEGER | CALL strike price                                     |
+| `call_ltp`             | REAL    | CALL option LTP                                       |
+| `call_buy_price`       | REAL    | Tuesday CALL buy price (carried through week)         |
+| `put_buy_price`        | REAL    | Tuesday PUT buy price (carried through week)          |
+| `gainloss`             | REAL    | `(current CALL - CALL buy) + (current PUT - PUT buy)` |
+| `source`               | TEXT    | Always `"angelone"`                                   |
+| `cycle_id`             | TEXT    | Unique cycle identifier                               |
 
 ### 9.2 Buy snapshot table (`strategy_buy_snapshots`)
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `strategy_name` | TEXT | Strategy identifier |
-| `cycle_id` | TEXT | Unique cycle identifier |
-| `week_start_date` | TEXT | Tuesday date in `YYYYMMDD` |
-| `expiry_date` | TEXT | Expiry date in `YYYYMMDD` |
-| `call_strike` | INTEGER | CALL strike |
-| `put_strike` | INTEGER | PUT strike |
-| `call_buy_price` | REAL | CALL buy price at capture |
-| `put_buy_price` | REAL | PUT buy price at capture |
-| `captured_at` | TEXT | ISO 8601 capture timestamp |
+| Column            | Type    | Description                               |
+| ----------------- | ------- | ----------------------------------------- |
+| `strategy_name`   | TEXT    | Strategy identifier                       |
+| `cycle_id`        | TEXT    | Unique cycle identifier                   |
+| `week_start_date` | TEXT    | Tuesday date in `YYYYMMDD`                |
+| `expiry_date`     | TEXT    | Expiry date in `YYYYMMDD`                 |
+| `call_strike`     | INTEGER | CALL strike                               |
+| `put_strike`      | INTEGER | PUT strike                                |
+| `call_buy_price`  | REAL    | CALL buy price at capture                 |
+| `put_buy_price`   | REAL    | PUT buy price at capture                  |
+| `captured_at`     | INTEGER | Unix timestamp (seconds since epoch, UTC) |
 
 ---
 
@@ -368,10 +374,10 @@ Monday EOD cron (10:10 UTC / 3:40 PM IST, after the final 3:15 PM collector):
 
 ## 14. Design Decisions (from implementation)
 
-| Decision | Rationale |
-|----------|-----------|
-| No `smartapi-python` SDK | Reuses existing direct HTTP + Redis JWT pattern from `check_active_positions.py` |
-| Synchronous code | Hourly cron-triggered; no need for async |
-| Simplified single-cycle model | Eliminates double-collection complexity on rollover Tuesday |
-| Two-scenario Tuesday handling | Supports both fresh auto-start and manual snapshot injection |
-| SQLite per weekly cycle | Clear separation, sortable filenames, append-only per cycle |
+| Decision                      | Rationale                                                                        |
+| ----------------------------- | -------------------------------------------------------------------------------- |
+| No `smartapi-python` SDK      | Reuses existing direct HTTP + Redis JWT pattern from `check_active_positions.py` |
+| Synchronous code              | Hourly cron-triggered; no need for async                                         |
+| Simplified single-cycle model | Eliminates double-collection complexity on rollover Tuesday                      |
+| Two-scenario Tuesday handling | Supports both fresh auto-start and manual snapshot injection                     |
+| SQLite per weekly cycle       | Clear separation, sortable filenames, append-only per cycle                      |

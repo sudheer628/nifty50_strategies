@@ -21,7 +21,7 @@ class StorageMigrationTests(unittest.TestCase):
                     CREATE TABLE strategy_hourly_data (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         strategy_name TEXT NOT NULL,
-                        collection_timestamp TEXT NOT NULL,
+                        collection_timestamp INTEGER NOT NULL,
                         expiry_date TEXT NOT NULL,
                         nifty_open REAL,
                         nifty_ltp REAL,
