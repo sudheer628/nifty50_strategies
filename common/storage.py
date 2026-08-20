@@ -125,20 +125,37 @@ def init_db(db_path: str) -> None:
         logger.info("Backfilled gainloss for %d existing rows", cur.rowcount)
 
     # Migrate collection_timestamp from TEXT (ISO string) to INTEGER (Unix epoch)
-    # Only run if the column exists and is still TEXT type (from an old schema)
-    cur.execute("PRAGMA table_info(strategy_hourly_data)")
-    current_columns = {row[1]: row[2].upper() for row in cur.fetchall()}
-    
-    if "collection_timestamp" in current_columns and current_columns["collection_timestamp"] == "TEXT":
-        # Migrate existing TEXT timestamps to INTEGER
-        cur.execute("""
-            UPDATE strategy_hourly_data
-            SET collection_timestamp = CAST(strftime('%s', 
-                REPLACE(REPLACE(collection_timestamp, 'Z', '+00:00'), '+00:00', '')
-            ) AS INTEGER)
-            WHERE typeof(collection_timestamp) = 'text'
-        """)
-        logger.info("Migrated collection_timestamp to INTEGER format in %s", db_path)
+    # Uses Python-based conversion because SQLite's strftime('%s', ...) is
+    # unavailable before v3.38.0 and can return NULL for some ISO formats,
+    # which would violate the NOT NULL constraint on this column.
+    text_rows = cur.execute(
+        "SELECT id, collection_timestamp FROM strategy_hourly_data "
+        "WHERE typeof(collection_timestamp) = 'text'"
+    ).fetchall()
+
+    if text_rows:
+        migrated = 0
+        for row_id, ts_text in text_rows:
+            try:
+                # Handle both 'Z' suffix and explicit '+00:00' offset
+                ts_clean = ts_text.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(ts_clean)
+                epoch = int(dt.timestamp())
+                cur.execute(
+                    "UPDATE strategy_hourly_data SET collection_timestamp = ? WHERE id = ?",
+                    (epoch, row_id),
+                )
+                migrated += 1
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "Could not convert timestamp '%s' (row %d): %s",
+                    ts_text, row_id, exc,
+                )
+        if migrated:
+            logger.info(
+                "Migrated %d/%d collection_timestamp values to INTEGER in %s",
+                migrated, len(text_rows), db_path,
+            )
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS strategy_buy_snapshots (
