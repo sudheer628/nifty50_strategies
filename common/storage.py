@@ -85,7 +85,7 @@ def init_db(db_path: str) -> None:
         CREATE TABLE IF NOT EXISTS strategy_hourly_data (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             strategy_name   TEXT    NOT NULL,
-            collection_timestamp TEXT NOT NULL,
+            collection_timestamp INTEGER NOT NULL,
             expiry_date     TEXT    NOT NULL,
             nifty_open      REAL,
             nifty_ltp       REAL,
@@ -124,6 +124,23 @@ def init_db(db_path: str) -> None:
     if cur.rowcount:
         logger.info("Backfilled gainloss for %d existing rows", cur.rowcount)
 
+    # Migrate collection_timestamp from TEXT (ISO string) to INTEGER (Unix epoch)
+    if "collection_timestamp" in hourly_columns:
+        # Check if current column is TEXT type
+        cur.execute("PRAGMA table_info(strategy_hourly_data)")
+        for row in cur.fetchall():
+            if row[1] == "collection_timestamp" and row[2].upper() == "TEXT":
+                # Migrate existing TEXT timestamps to INTEGER
+                cur.execute("""
+                    UPDATE strategy_hourly_data
+                    SET collection_timestamp = CAST(strftime('%s', 
+                        REPLACE(REPLACE(collection_timestamp, 'Z', '+00:00'), '+00:00', '')
+                    ) AS INTEGER)
+                    WHERE typeof(collection_timestamp) = 'text'
+                """)
+                logger.info("Migrated collection_timestamp to INTEGER format in %s", db_path)
+                break
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS strategy_buy_snapshots (
             strategy_name   TEXT    NOT NULL,
@@ -134,7 +151,7 @@ def init_db(db_path: str) -> None:
             put_strike      INTEGER,
             call_buy_price  REAL,
             put_buy_price   REAL,
-            captured_at     TEXT    NOT NULL,
+            captured_at     INTEGER NOT NULL,
             PRIMARY KEY (strategy_name, cycle_id)
         )
     """)
@@ -175,7 +192,7 @@ def insert_record(db_path: str, record: dict) -> None:
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         record.get("strategy_name", STRATEGY_NAME),
-        record.get("collection_timestamp", ""),
+        int(record.get("collection_timestamp", 0)),
         record.get("expiry_date", ""),
         record.get("nifty_open"),
         record.get("nifty_ltp"),
@@ -223,7 +240,7 @@ def insert_buy_snapshot(db_path: str, snapshot: dict) -> None:
         snapshot.get("put_strike"),
         snapshot.get("call_buy_price"),
         snapshot.get("put_buy_price"),
-        snapshot.get("captured_at", datetime.now(timezone.utc).isoformat()),
+        snapshot.get("captured_at", int(datetime.now(timezone.utc).timestamp())),
     ))
     conn.commit()
     conn.close()

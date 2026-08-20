@@ -56,11 +56,18 @@ def _parse_yyyymmdd(value: str) -> date:
     return datetime.strptime(value, "%Y%m%d").date()
 
 
-def _parse_timestamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = UTC.localize(parsed)
-    return parsed.astimezone(IST)
+def _parse_timestamp(value) -> datetime:
+    """Parse timestamp that can be either integer (Unix epoch) or ISO string."""
+    if isinstance(value, (int, float)):
+        # Unix timestamp
+        dt = datetime.fromtimestamp(int(value), tz=UTC)
+    else:
+        # ISO string format
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = UTC.localize(parsed)
+        dt = parsed
+    return dt.astimezone(IST)
 
 
 def find_weekly_db(report_date: date, explicit_path: Optional[str] = None) -> Path:

@@ -43,7 +43,7 @@ class StorageMigrationTests(unittest.TestCase):
                         cycle_id
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    "test", "2026-08-10T08:22:00+00:00", "20260811",
+                    "test", 1786452120, "20260811",
                     33.7, 47.5, 92.0, 82.0, "legacy-cycle",
                 ))
                 conn.commit()
@@ -76,7 +76,7 @@ class StorageMigrationTests(unittest.TestCase):
                 db_path,
                 {
                     "strategy_name": "test",
-                    "collection_timestamp": "2026-08-10T08:22:00+00:00",
+                    "collection_timestamp": 1786452120,
                     "expiry_date": "20260811",
                     "gainloss": -92.8,
                     "cycle_id": "test-cycle",

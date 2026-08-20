@@ -155,6 +155,11 @@ def _active_cycle(snapshot: dict, today: date) -> dict:
     }
 
 
+def _now_utc_ts() -> int:
+    """Return current UTC timestamp as Unix integer (seconds since epoch)."""
+    return int(datetime.now(UTC).timestamp())
+
+
 def _build_record(
     cycle_id: str,
     expiry_file: str,
@@ -172,7 +177,7 @@ def _build_record(
     """Build a standard hourly record dictionary."""
     return {
         "strategy_name": STRATEGY_NAME,
-        "collection_timestamp": _now_utc().isoformat(),
+        "collection_timestamp": _now_utc_ts(),
         "expiry_date": expiry_file,
         "nifty_open": nifty_open,
         "nifty_ltp": nifty_ltp,

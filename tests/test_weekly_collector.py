@@ -25,7 +25,7 @@ MANUAL_SNAPSHOT = {
     "put_strike": 24500,
     "call_buy_price": 92.0,
     "put_buy_price": 82.0,
-    "captured_at": "2026-08-04T04:00:00+00:00",
+    "captured_at": 1785854400,
 }
 
 
