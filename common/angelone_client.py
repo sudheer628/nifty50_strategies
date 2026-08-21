@@ -11,6 +11,7 @@ script: static API key from .env, dynamic JWT from Redis Cloud.
 
 import os
 import json
+import time
 from datetime import datetime
 from functools import lru_cache
 import requests
@@ -296,20 +297,51 @@ def get_option_ltps(option_infos: list) -> dict:
         return {}
 
 
+_INSTRUMENT_MASTER_RETRIES = 3
+_INSTRUMENT_MASTER_BACKOFF = (5, 15, 30)  # seconds between retries
+
+
 @lru_cache(maxsize=1)
+def _fetch_instrument_master() -> list:
+    """Internal: download instrument master with retry.
+
+    Raises on failure so lru_cache does NOT cache empty results.
+    """
+    last_exc = None
+    for attempt in range(_INSTRUMENT_MASTER_RETRIES):
+        try:
+            resp = requests.get(ANGELONE_INSTRUMENT_MASTER_URL, timeout=30)
+            resp.raise_for_status()
+            instruments = resp.json()
+            if not isinstance(instruments, list):
+                raise ValueError("Angel One instrument master is not a list")
+            logger.info("Loaded %d instruments from Angel One master (attempt %d)",
+                        len(instruments), attempt + 1)
+            return instruments
+        except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
+            last_exc = exc
+            if attempt < _INSTRUMENT_MASTER_RETRIES - 1:
+                wait = _INSTRUMENT_MASTER_BACKOFF[attempt]
+                logger.warning(
+                    "Instrument master attempt %d/%d failed: %s — retrying in %ds",
+                    attempt + 1, _INSTRUMENT_MASTER_RETRIES, exc, wait
+                )
+                time.sleep(wait)
+    # All retries exhausted — raise so lru_cache does not cache the failure
+    raise last_exc  # type: ignore[misc]
+
+
 def get_instrument_master() -> list:
-    """Download and cache Angel One's current instrument catalogue."""
+    """Download and cache Angel One's current instrument catalogue.
+
+    Retries up to 3 times with exponential backoff (5s, 15s, 30s).
+    Returns an empty list on total failure (callers unchanged).
+    """
     try:
-        resp = requests.get(ANGELONE_INSTRUMENT_MASTER_URL, timeout=30)
-        resp.raise_for_status()
-        instruments = resp.json()
-        if not isinstance(instruments, list):
-            logger.error("Angel One instrument master is not a list")
-            return []
-        logger.info("Loaded %d instruments from Angel One master", len(instruments))
-        return instruments
-    except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
-        logger.error("Failed to load Angel One instrument master: %s", exc)
+        return _fetch_instrument_master()
+    except Exception as exc:
+        logger.error("Failed to load Angel One instrument master after %d retries: %s",
+                     _INSTRUMENT_MASTER_RETRIES, exc)
         return []
 
 
