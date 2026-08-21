@@ -82,14 +82,14 @@ def _today_ist() -> date:
 
 def _is_market_time() -> bool:
     """
-    Return True if the current IST time is between 9:30 AM and 3:15 PM
+    Return True if the current IST time is between 9:15 AM and 3:35 PM
     on a weekday (Monday-Friday).
     """
     now = _now_ist()
     if now.weekday() >= 5:  # Saturday or Sunday
         return False
-    market_open = time(9, 30)
-    market_close = time(15, 15)
+    market_open = time(9, 15)
+    market_close = time(15, 35)
     return market_open <= now.time() <= market_close
 
 
