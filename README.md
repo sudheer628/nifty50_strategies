@@ -163,6 +163,32 @@ On Tuesday at 09:30 AM IST, `weekly_option_collector.py` invokes [`common/ai_str
    ```
    This reconstructs the static $\pm 100$ strike performance using `option_chain_surface` from `market_signal_agent` without requiring duplicate live API calls.
 
+### 4.7 Weekly Closed-Loop Lifecycle (Weeks 1 to 20)
+
+```
+                            WEEKLY LIFECYCLE (Weeks 1 to 20)
+                            
+  Tuesday 09:30 AM IST:  nifty50_strategies picks AI Strikes & enters Strangle
+                                          │
+                                          ▼
+  Tue-Mon (Every 30m):   sentinel-hermes inference_runner.py evaluates trade:
+                         • Logs predictions to predictions.db (Paper Trading)
+                         • Sends immediate Email Alert on TAKE_PROFIT / STOP_LOSS
+                                          │
+                                          ▼
+  Monday 15:40 IST:      compare_ai_vs_static_benchmark.py scores AI vs Static
+                                          │
+                                          ▼
+  Monday 15:50 IST:      run_weekly_merge.sh creates merged_weekly_*.db
+                                          │
+                                          ▼
+  Monday 15:55 IST:      skill_generator.py generates skills/skill_YYYYMMDD.md
+                                          │
+                                          ▼
+  Dynamic Injection:     inference_runner.py automatically reads the new skill
+                         on Tuesday morning, making Week 2 smarter than Week 1!
+```
+
 ---
 
 ## 5. Data Collected
