@@ -181,6 +181,10 @@ def calculate_summary(rows: Sequence[Dict], snapshot: Dict, db_path: Path) -> Di
         "best_gainloss": max(gains) if gains else None,
         "worst_gainloss": min(gains) if gains else None,
         "cycle_id": snapshot.get("cycle_id") or latest["cycle_id"],
+        "selection_mode": snapshot.get("selection_mode") or "STATIC_RULE",
+        "selection_rationale": snapshot.get("selection_rationale") or "",
+        "static_call_strike": snapshot.get("static_call_strike"),
+        "static_put_strike": snapshot.get("static_put_strike"),
         "db_name": db_path.name,
     }
 
@@ -252,6 +256,19 @@ def render_html(rows: Sequence[Dict], summary: Dict, chart_src: str) -> str:
         if summary["start_date"]
         else summary["latest_timestamp"].strftime("%d %b %Y")
     )
+
+    mode_badge = summary.get("selection_mode", "STATIC_RULE")
+    badge_bg = "#2563eb" if "AI" in mode_badge else "#64748b"
+    rationale_html = ""
+    if summary.get("selection_rationale"):
+        rationale_html = f"""<div style="margin-top:8px;font-size:12px;color:#1e40af;line-height:1.4;">
+          <strong>AI Selection Rationale:</strong> {html.escape(summary['selection_rationale'])}
+        </div>"""
+
+    benchmark_info = ""
+    if summary.get("static_call_strike") and summary.get("static_put_strike"):
+        benchmark_info = f" &nbsp;·&nbsp; <span style='color:#64748b;'>Static Benchmark: PUT {summary['static_put_strike']} / CALL {summary['static_call_strike']}</span>"
+
     return f"""<!doctype html>
 <html><body style="margin:0;background:#eef2f7;font-family:Arial,sans-serif;color:#0f172a;">
 <div style="max-width:900px;margin:0 auto;padding:24px 12px;">
@@ -268,9 +285,13 @@ def render_html(rows: Sequence[Dict], summary: Dict, chart_src: str) -> str:
     </tr></table>
 
     <div style="margin:16px 8px;padding:16px;background:#eff6ff;border-left:4px solid #2563eb;border-radius:8px;">
+      <div style="margin-bottom:6px;">
+        <span style="background:{badge_bg};color:white;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:0.5px;">{html.escape(mode_badge)}</span>
+      </div>
       <strong>Cycle setup:</strong> PUT {summary['put_strike']} @ {_number(summary['put_buy_price'])} &nbsp;·&nbsp;
-      CALL {summary['call_strike']} @ {_number(summary['call_buy_price'])}<br>
+      CALL {summary['call_strike']} @ {_number(summary['call_buy_price'])}{benchmark_info}<br>
       <span style="font-size:12px;color:#475569;">Cycle {html.escape(str(summary['cycle_id']))} · {summary['row_count']} observations · Last update {summary['latest_timestamp'].strftime('%d %b %Y %H:%M IST')}</span>
+      {rationale_html}
     </div>
 
     <img src="{html.escape(chart_src)}" alt="NIFTY50 and gain/loss chart" style="display:block;width:100%;max-width:840px;margin:22px auto;border:1px solid #e2e8f0;border-radius:12px;">
