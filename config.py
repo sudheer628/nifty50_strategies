@@ -7,7 +7,10 @@ and helper factories used across all strategy modules.
 
 import os
 import logging
-import redis
+try:
+    import redis
+except ImportError:
+    redis = None
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -65,21 +68,28 @@ ACTIVE_SNAPSHOT_FILE = os.path.join(
 # ---------------------------------------------------------------------------
 # Redis connection (shared with existing generate_trading_keys infra)
 # ---------------------------------------------------------------------------
-def get_redis_client() -> redis.Redis:
+def get_redis_client():
     """
     Return a Redis client configured from environment variables.
 
     Uses the same Redis Cloud instance that stores the Angel One JWT
     under key ``angelone_jwt_feed``.
     """
-    return redis.Redis(
-        host=os.environ["REDIS_HOST"],
-        port=int(os.environ.get("REDIS_PORT", "12203")),
-        username=os.environ.get("REDIS_USERNAME", ""),
-        password=os.environ.get("REDIS_PASSWORD", ""),
-        decode_responses=True,
-        socket_timeout=5,
-    )
+    if redis is None:
+        logger.warning("Redis package not installed.")
+        return None
+    try:
+        return redis.Redis(
+            host=os.environ.get("REDIS_HOST", ""),
+            port=int(os.environ.get("REDIS_PORT", "12203")),
+            username=os.environ.get("REDIS_USERNAME", ""),
+            password=os.environ.get("REDIS_PASSWORD", ""),
+            decode_responses=True,
+            socket_timeout=5,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create Redis client: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -172,9 +172,25 @@ def init_db(db_path: str) -> None:
             call_buy_price  REAL,
             put_buy_price   REAL,
             captured_at     INTEGER NOT NULL,
+            static_call_strike INTEGER,
+            static_put_strike  INTEGER,
+            selection_mode  TEXT,
+            selection_rationale TEXT,
             PRIMARY KEY (strategy_name, cycle_id)
         )
     """)
+
+    # Migrate buy snapshot table if columns are missing
+    cur.execute("PRAGMA table_info(strategy_buy_snapshots)")
+    snapshot_cols = {row[1] for row in cur.fetchall()}
+    for col_name, col_type in [
+        ("static_call_strike", "INTEGER"),
+        ("static_put_strike", "INTEGER"),
+        ("selection_mode", "TEXT"),
+        ("selection_rationale", "TEXT"),
+    ]:
+        if col_name not in snapshot_cols:
+            cur.execute(f"ALTER TABLE strategy_buy_snapshots ADD COLUMN {col_name} {col_type}")
 
     conn.commit()
     conn.close()
@@ -249,8 +265,12 @@ def insert_buy_snapshot(db_path: str, snapshot: dict) -> None:
             put_strike,
             call_buy_price,
             put_buy_price,
-            captured_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            captured_at,
+            static_call_strike,
+            static_put_strike,
+            selection_mode,
+            selection_rationale
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         snapshot.get("strategy_name", STRATEGY_NAME),
         snapshot.get("cycle_id", ""),
@@ -261,6 +281,10 @@ def insert_buy_snapshot(db_path: str, snapshot: dict) -> None:
         snapshot.get("call_buy_price"),
         snapshot.get("put_buy_price"),
         snapshot.get("captured_at", int(datetime.now(timezone.utc).timestamp())),
+        snapshot.get("static_call_strike"),
+        snapshot.get("static_put_strike"),
+        snapshot.get("selection_mode"),
+        snapshot.get("selection_rationale"),
     ))
     conn.commit()
     conn.close()

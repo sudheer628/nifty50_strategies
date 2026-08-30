@@ -46,26 +46,30 @@ nifty50_strategies/
 ├── common/
 │   ├── __init__.py
 │   ├── angelone_client.py               # SmartAPI auth + market data fetchers
-│   ├── expiry.py                        # Expiry resolution + strike selector
+│   ├── expiry.py                        # Expiry resolution + static strike selector
+│   ├── ai_strike_selector.py            # Dynamic AI strike selector (VIX, ATR, Greeks)
 │   └── storage.py                       # SQLite persistence + JSON snapshot
 ├── strategies/
 │   ├── __init__.py
 │   └── weekly_option_collector.py       # Main strategy entry point
 ├── scripts/
-│   └── send_weekly_report.py            # Monday HTML email + chart
+│   ├── send_weekly_report.py            # Monday HTML email + chart
+│   └── compare_ai_vs_static_benchmark.py # Retrospective side-by-side P&L comparison
 └── cron/
     └── nifty50_weekly_report.cron       # Monday EOD report schedule
 ```
 
 ### Module descriptions
 
-| Module                                  | Purpose                                                                                                                                               |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `config.py`                             | Loads `.env`, Redis client factory, constants (strike step=100, NIFTY token, Angel One base URL, storage paths)                                       |
-| `common/angelone_client.py`             | JWT auth from Redis `angelone_jwt_feed`, NIFTY spot LTP, daily instrument-master option lookup, and `get_nifty_option_chain()` for CALL+PUT LTPs      |
-| `common/expiry.py`                      | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()`                                   |
-| `common/storage.py`                     | `build_db_path()`, `init_db()`, `insert_record()`, `insert_buy_snapshot()`, `save_active_snapshot()`, `load_active_snapshot()`, `generate_cycle_id()` |
-| `strategies/weekly_option_collector.py` | Cron-invoked collector: one cycle per invocation, Tuesday buy-price capture, SQLite + JSON persistence                                                |
+| Module | Purpose |
+|---|---|
+| `config.py` | Loads `.env`, Redis client factory, constants (strike step=100, NIFTY token, Angel One base URL, storage paths) |
+| `common/angelone_client.py` | JWT auth from Redis `angelone_jwt_feed`, NIFTY spot LTP, daily instrument-master option lookup, and `get_nifty_option_chain()` for CALL+PUT LTPs |
+| `common/expiry.py` | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()` |
+| `common/ai_strike_selector.py` | Tuesday 9:30 AM AI Strike Selector: optimizes strikes based on VIX, ATR, Greeks ($\Delta \approx 0.35$), and IV skew via OpenRouter with static fallback |
+| `common/storage.py` | `build_db_path()`, `init_db()`, `insert_record()`, `insert_buy_snapshot()`, `save_active_snapshot()`, `load_active_snapshot()`, `generate_cycle_id()` |
+| `strategies/weekly_option_collector.py` | Cron-invoked collector: one cycle per invocation, Tuesday buy-price capture, SQLite + JSON persistence |
+| `scripts/compare_ai_vs_static_benchmark.py` | Reconstructs static $\pm 100$ strike LTPs from `signals_data_*.db` `option_chain_surface` to compute side-by-side outperformance delta vs AI strategy |
 
 ---
 
@@ -128,9 +132,36 @@ For a mid-cycle start on Monday 10 Aug 2026, with the cycle that began Tuesday
 }
 ```
 
-Save it as `/home/ubuntu/sqlite/strategies/current_week_buy.json`, then run
-`python strategies/weekly_option_collector.py --dry-run` to validate that the
-cycle is recognized without calling SmartAPI or writing to SQLite.
+### 4.6 Dynamic AI Strike Selection & Retrospective Benchmark (September 2026+)
+
+On Tuesday at 09:30 AM IST, `weekly_option_collector.py` invokes [`common/ai_strike_selector.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/ai_strike_selector.py):
+1. **Dynamic Greeks & Volatility Ingestion**: Ingests live India VIX, ATR(14) daily range, Bollinger Band Width %, and option chain Greeks ($\Delta \approx 0.35, \Theta, \text{IV Skew}$) from SQLite.
+2. **AI Strike Calibration**: Queries OpenRouter LLMs via Redis `finance_llm_models` to select volatility-adaptive strikes (e.g. widening in high VIX, balancing Put IV skew).
+3. **Fail-Safe Fallback**: If OpenRouter times out (>5s) or returns invalid output, it automatically reverts to the standard static `anchor +/- 100` rule.
+4. **Snapshot Persistence**: Saves both the AI strikes and the static benchmark strikes in `current_week_buy.json`:
+   ```json
+   {
+     "strategy_name": "nifty50_weekly_option_collector",
+     "cycle_id": "20260901-a1b2c3d4",
+     "week_start_date": "20260901",
+     "expiry_date": "20260908",
+     "call_strike": 24650,
+     "put_strike": 24400,
+     "call_buy_price": 128.5,
+     "put_buy_price": 112.0,
+     "captured_at": 1788244200,
+     "static_call_strike": 24600,
+     "static_put_strike": 24400,
+     "selection_mode": "AI_deepseek-v4-pro",
+     "selection_rationale": "VIX at 15.4 with ATR 160; selected +100 CE / -150 PE due to elevated Put IV skew."
+   }
+   ```
+5. **Retrospective Benchmark Comparison**:
+   Run the comparison script anytime to see side-by-side performance:
+   ```bash
+   python scripts/compare_ai_vs_static_benchmark.py
+   ```
+   This reconstructs the static $\pm 100$ strike performance using `option_chain_surface` from `market_signal_agent` without requiring duplicate live API calls.
 
 ---
 

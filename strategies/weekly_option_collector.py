@@ -34,6 +34,7 @@ import pytz
 from config import (
     logger,
     STRATEGY_NAME,
+    SQLITE_DIR,
 )
 
 from common.expiry import (
@@ -42,6 +43,11 @@ from common.expiry import (
     format_expiry_angelone,
     format_expiry_file,
     strike_selector,
+)
+
+from common.ai_strike_selector import (
+    select_strikes,
+    compute_static_strikes,
 )
 
 from common.angelone_client import (
@@ -194,7 +200,7 @@ def _build_record(
     }
 
 
-def collect_once() -> bool:
+def collect_once(force_static: bool = False) -> bool:
     """
     Perform one hourly data collection cycle.
 
@@ -203,6 +209,9 @@ def collect_once() -> bool:
       archived to a dated JSON file; the new one becomes active.
     - **Wednesday-Monday**: reuses the active snapshot's buy prices and
       continues writing to the same weekly DB.
+
+    Args:
+        force_static: If True, bypass AI strike selector and use static anchor +/- 100 rule.
 
     Returns True on success, False on failure.
     """
@@ -247,15 +256,24 @@ def collect_once() -> bool:
     if active_cycle:
         put_strike = active_cycle["put_strike"]
         call_strike = active_cycle["call_strike"]
+        static_put_strike = active_cycle.get("static_put_strike")
+        static_call_strike = active_cycle.get("static_call_strike")
+        selection_mode = active_cycle.get("selection_mode", "REUSED")
+        selection_rationale = active_cycle.get("selection_rationale", "")
         logger.info(
-            "Reusing cycle strikes from %s: PUT=%d  CALL=%d",
-            active_cycle["week_start_date"], put_strike, call_strike
+            "Reusing cycle strikes from %s: PUT=%d  CALL=%d (Mode: %s)",
+            active_cycle["week_start_date"], put_strike, call_strike, selection_mode
         )
     else:
-        put_strike, call_strike = strike_selector(nifty_ltp)
+        # Dynamic AI strike selector (with fail-safe static anchor +/- 100 fallback)
+        put_strike, call_strike, static_put_strike, static_call_strike, selection_mode, selection_rationale = select_strikes(
+            reference_ltp=nifty_ltp,
+            sqlite_dir=SQLITE_DIR,
+            force_static=force_static
+        )
         logger.info(
-            "Selected new strikes from first-trigger LTP %.2f: PUT=%d  CALL=%d",
-            nifty_ltp, put_strike, call_strike
+            "Selected strikes from LTP %.2f [%s]: PUT=%d  CALL=%d (Static Benchmark: PUT=%d CALL=%d)",
+            nifty_ltp, selection_mode, put_strike, call_strike, static_put_strike, static_call_strike
         )
 
     option_data = get_nifty_option_chain(
@@ -315,14 +333,18 @@ def collect_once() -> bool:
                 "call_buy_price": call_buy_price,
                 "put_buy_price": put_buy_price,
                 "captured_at": _now_utc_ts(),
+                "static_call_strike": static_call_strike,
+                "static_put_strike": static_put_strike,
+                "selection_mode": selection_mode,
+                "selection_rationale": selection_rationale,
             }
 
             # Archives the previous snapshot (if any) before overwriting
             save_active_snapshot(snapshot)
             insert_buy_snapshot(db_path, snapshot)
 
-            logger.info("Tuesday buy prices captured: CALL=%.2f  PUT=%.2f",
-                     call_buy_price, put_buy_price)
+            logger.info("Tuesday buy prices captured [%s]: CALL=%d (₹%.2f)  PUT=%d (₹%.2f)",
+                     selection_mode, call_strike, call_buy_price, put_strike, put_buy_price)
     else:
         # --- Wednesday-Monday: reuse the complete active cycle ---
         if not active_cycle:
@@ -343,6 +365,10 @@ def collect_once() -> bool:
                 "call_buy_price": call_buy_price,
                 "put_buy_price": put_buy_price,
                 "captured_at": _now_utc_ts(),
+                "static_call_strike": static_call_strike,
+                "static_put_strike": static_put_strike,
+                "selection_mode": selection_mode,
+                "selection_rationale": selection_rationale,
             }
             save_active_snapshot(snapshot)
         else:
@@ -428,6 +454,11 @@ def main():
         action="store_true",
         help="Run even outside market hours",
     )
+    parser.add_argument(
+        "--force-static",
+        action="store_true",
+        help="Force static anchor +/- 100 pt strike rule instead of AI selector",
+    )
     args = parser.parse_args()
 
     if args.dry_run:
@@ -438,13 +469,14 @@ def main():
         active_cycle = _active_cycle(load_active_snapshot(), today)
         if active_cycle:
             logger.info(
-                "Active cycle: start=%s expiry=%s PUT=%d @ %s CALL=%d @ %s",
+                "Active cycle: start=%s expiry=%s PUT=%d @ %s CALL=%d @ %s (Mode: %s)",
                 active_cycle["week_start_date"],
                 active_cycle["expiry_date"],
                 active_cycle["put_strike"],
                 active_cycle["put_buy_price"],
                 active_cycle["call_strike"],
                 active_cycle["call_buy_price"],
+                active_cycle.get("selection_mode", "UNKNOWN"),
             )
         else:
             logger.info("No valid active cycle snapshot for today")
@@ -454,7 +486,7 @@ def main():
         logger.info("Outside market hours. Use --force to override.")
         return
 
-    success = collect_once()
+    success = collect_once(force_static=args.force_static)
     if not success:
         logger.error("Collection cycle failed.")
         sys.exit(1)
