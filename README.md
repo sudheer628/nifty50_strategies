@@ -384,9 +384,11 @@ python strategies/weekly_option_collector.py --dry-run
 # Force run outside market hours
 python strategies/weekly_option_collector.py --force
 
-# Cron (every 30 minutes during market hours, 10:00-15:30 IST)
-30 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
-0 5-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
+# Cron: Staggered to :01 & :31 past every hour (10:01-15:31 IST = 04:31-10:01 UTC)
+# Reason for +1m stagger: Allows upstream collectors (market_signal_agent & nifty_signal_features)
+# to write their 5-min Greeks and technicals at :00/:30 before strategy prices are captured.
+31 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
+1 5-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 ```
 
 ### Weekly Monday email report
