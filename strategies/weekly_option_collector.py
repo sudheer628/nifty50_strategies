@@ -81,6 +81,11 @@ def _now_utc() -> datetime:
     return datetime.now(UTC)
 
 
+def _now_utc_ts() -> int:
+    """Return the current UTC timestamp as Unix epoch integer (seconds)."""
+    return int(datetime.now(UTC).timestamp())
+
+
 def _today_ist() -> date:
     """Return today's date in IST."""
     return _now_ist().date()
