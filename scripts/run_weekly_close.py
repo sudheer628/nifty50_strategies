@@ -182,8 +182,16 @@ def main() -> int:
     logger.info("▶ Step 1/4: Generating and emailing weekly performance report...")
     report_script = os.path.join(PROJECT_ROOT, "scripts", "send_weekly_report.py")
     if os.path.exists(report_script):
+        report_cmd = [
+            python_bin,
+            report_script,
+            "--report-date",
+            target_date.strftime("%Y-%m-%d"),
+        ]
+        if args.dry_run:
+            report_cmd.append("--dry-run")
         step1_ok = run_command(
-            [python_bin, report_script, "--date", target_date.strftime("%Y%m%d")],
+            report_cmd,
             cwd=PROJECT_ROOT,
             dry_run=args.dry_run,
         )
@@ -231,8 +239,11 @@ def main() -> int:
         logger.info("▶ Step 4/4: Generating weekly AI skill and syncing to MongoDB Atlas...")
         skill_py = os.path.join(hermes_dir, "skill_generator.py")
         if os.path.exists(skill_py):
+            skill_cmd = [python_bin, skill_py, "--merged-db", "merged_latest.db"]
+            if args.dry_run:
+                skill_cmd.append("--dry-run")
             step4_ok = run_command(
-                [python_bin, skill_py, "--merged-db", "merged_latest.db"],
+                skill_cmd,
                 cwd=hermes_dir,
                 dry_run=args.dry_run,
             )

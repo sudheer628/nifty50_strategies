@@ -363,7 +363,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Send NIFTY50 weekly report")
     parser.add_argument("--dry-run", action="store_true", help="Generate preview only")
     parser.add_argument("--db", help="Explicit weekly SQLite database path")
-    parser.add_argument("--report-date", help="Date used to discover DB (YYYY-MM-DD)")
+    parser.add_argument(
+        "--report-date",
+        "--date",
+        dest="report_date",
+        help="Date used to discover DB (YYYY-MM-DD or YYYYMMDD)",
+    )
     parser.add_argument(
         "--output-dir",
         default=os.getenv("WEEKLY_REPORT_DIR", str(Path(SQLITE_DIR) / "reports")),
@@ -372,11 +377,11 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        report_date = (
-            date.fromisoformat(args.report_date)
-            if args.report_date
-            else datetime.now(IST).date()
-        )
+        if args.report_date:
+            clean_date = args.report_date.replace("-", "")
+            report_date = datetime.strptime(clean_date, "%Y%m%d").date()
+        else:
+            report_date = datetime.now(IST).date()
         db_path = find_weekly_db(report_date, args.db)
         logger.info("Using weekly database: %s", db_path)
         rows, snapshot = load_report_data(db_path)

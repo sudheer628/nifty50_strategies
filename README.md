@@ -163,30 +163,30 @@ On Tuesday at 09:30 AM IST, `weekly_option_collector.py` invokes [`common/ai_str
    ```
    This reconstructs the static $\pm 100$ strike performance using `option_chain_surface` from `market_signal_agent` without requiring duplicate live API calls.
 
-### 4.7 Weekly Closed-Loop Lifecycle (Weeks 1 to 20)
+### 4.7 Weekly Closed-Loop Lifecycle & Holiday Adaptation
 
 ```
-                            WEEKLY LIFECYCLE (Weeks 1 to 20)
-                            
-  Tuesday 09:30 AM IST:  nifty50_strategies picks AI Strikes & enters Strangle
+                    WEEKLY LIFECYCLE WITH HOLIDAY RESOLUTION
+                    
+  Strategy Start Day     nifty50_strategies picks AI Strikes & enters Strangle
+  (Tue, or Wed if Hol):  • Captures buy prices into current_week_buy.json
                                           │
                                           ▼
-  Tue-Mon (Every 30m):   sentinel-hermes inference_runner.py evaluates trade:
+  Market Trading Days:   sentinel-hermes inference_runner.py evaluates trade (every 30m):
                          • Logs predictions to predictions.db (Paper Trading)
                          • Sends immediate Email Alert on TAKE_PROFIT / STOP_LOSS
+                         • Skips automatically on exchange holidays
                                           │
                                           ▼
-  Monday 15:40 IST:      compare_ai_vs_static_benchmark.py scores AI vs Static
-                                          │
-                                          ▼
-  Monday 15:50 IST:      run_weekly_merge.sh creates merged_weekly_*.db
-                                          │
-                                          ▼
-  Monday 15:55 IST:      skill_generator.py generates skills/skill_YYYYMMDD.md
+  Strategy Closing Day   nifty50_strategies scripts/run_weekly_close.py orchestrates:
+  (Mon, or Tue if Hol)   1. send_weekly_report.py (PDF & Email weekly report)
+  15:37 IST (10:07 UTC): 2. compare_ai_vs_static_benchmark.py (AI vs Static comparison)
+                         3. sentinel-hermes/run_weekly_merge.sh (rebuilds merged SQLite)
+                         4. sentinel-hermes/skill_generator.py (synthesizes skill & Mongo sync)
                                           │
                                           ▼
   Dynamic Injection:     inference_runner.py automatically reads the new skill
-                         on Tuesday morning, making Week 2 smarter than Week 1!
+                         on the next cycle start, continuously compounding rules!
 ```
 
 ---
@@ -423,10 +423,11 @@ python scripts/send_weekly_report.py
 The preview HTML and PNG chart are archived under
 `/home/ubuntu/sqlite/strategies/reports/` by default.
 
-Monday EOD cron (10:10 UTC / 3:40 PM IST, after the final 3:15 PM collector):
+Weekly Close Orchestrator cron (10:07 UTC / 15:37 IST, runs Mondays and Tuesdays):
 
 ```cron
-10 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/send_weekly_report.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
+# Post-Market Strategy Weekly Close (Runs Mon & Tue at 10:07 UTC = 15:37 IST; automatically handles holiday shifts)
+7 10 * * 1,2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
 ```
 
 ---
