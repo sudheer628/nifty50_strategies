@@ -3,3 +3,5 @@ redis>=5.0.0
 requests>=2.31.0
 pytz>=2024.1
 matplotlib>=3.7,<4
+pymongo>=4.6.0
+dnspython>=2.4.0

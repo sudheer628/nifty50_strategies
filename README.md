@@ -451,3 +451,24 @@ Monday EOD cron (10:10 UTC / 3:40 PM IST, after the final 3:15 PM collector):
 | SQLite per weekly cycle       | Clear separation, sortable filenames, append-only per cycle                      |
 | Unix integer timestamps       | Aligns with `market_signal_agent` and `nifty_signal_features` for cross-project joins |
 | Auto-migration in `init_db()` | Converts legacy TEXT timestamps on startup; no manual scripts needed             |
+
+---
+
+## 15. MongoDB Atlas Derivatives Synchronization
+
+Strategy results and weekly prices can be persisted directly to MongoDB Atlas (`stock_recommendations` database) in the collections:
+- `derivative_strategies`: Full weekly cycle performance dossier
+- `derivative_master`: Living rollup KPI for NIFTY50 options
+
+### CLI Usage
+
+```bash
+# Push sample cycle to verify MongoDB connection
+python scripts/sync_to_mongodb.py --sample
+
+# Check collection status and document counts
+python scripts/sync_to_mongodb.py --status
+
+# Sync latest weekly strategy DB
+python scripts/sync_to_mongodb.py
+```

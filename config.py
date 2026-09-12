@@ -45,6 +45,22 @@ STRIKE_STEP = 100                 # 100-point strike grid
 COLLECTION_START_HOUR = 9         # 9:30 AM IST is the first collection
 COLLECTION_START_MINUTE = 30
 COLLECTION_INTERVAL_MINUTES = 60  # Hourly after start
+NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))  # Default Nifty contract lot size
+
+# ---------------------------------------------------------------------------
+# MongoDB Atlas Database Configuration (Derivatives & Predictions)
+# ---------------------------------------------------------------------------
+MONGODB_URI = os.getenv("MONGODB_URI", "")
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "stock_recommendations")
+MONGODB_COLLECTION_DERIVATIVE_STRATEGIES = os.getenv(
+    "MONGODB_COLLECTION_DERIVATIVE_STRATEGIES", "derivative_strategies"
+)
+MONGODB_COLLECTION_DERIVATIVE_MASTER = os.getenv(
+    "MONGODB_COLLECTION_DERIVATIVE_MASTER", "derivative_master"
+)
+MONGODB_COLLECTION_DERIVATIVE_PREDICTIONS = os.getenv(
+    "MONGODB_COLLECTION_DERIVATIVE_PREDICTIONS", "derivative_predictions"
+)
 
 
 # ---------------------------------------------------------------------------
