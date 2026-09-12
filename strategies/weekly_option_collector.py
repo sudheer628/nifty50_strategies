@@ -45,6 +45,13 @@ from common.expiry import (
     strike_selector,
 )
 
+from common.calendar_utils import (
+    check_nse_holiday,
+    is_strategy_start_day,
+    is_strategy_closing_day,
+    get_strategy_cycle_role,
+)
+
 from common.ai_strike_selector import (
     select_strikes,
     compute_static_strikes,
@@ -119,9 +126,17 @@ def _parse_file_date(value: str) -> date:
 
 
 def _cycle_start_for_day(d: date) -> date:
-    """Return the Tuesday that started the cycle containing ``d``."""
+    """Return the start date of the weekly cycle containing ``d``."""
+    if is_strategy_start_day(d):
+        return d
     days_since_tuesday = (d.weekday() - 1) % 7
-    return d - timedelta(days=days_since_tuesday)
+    tue = d - timedelta(days=days_since_tuesday)
+    mon = tue - timedelta(days=1)
+    if check_nse_holiday(mon):
+        wed = tue + timedelta(days=1)
+        if wed <= d:
+            return wed
+    return tue
 
 
 def _active_cycle(snapshot: dict, today: date) -> dict:
@@ -150,9 +165,9 @@ def _active_cycle(snapshot: dict, today: date) -> dict:
         logger.warning("Active snapshot contains invalid dates or strikes")
         return {}
 
-    # A Tuesday always starts a new cycle unless a snapshot has explicitly
-    # been prepared for that same Tuesday (manual snapshot scenario).
-    if is_tuesday(today) and week_start != today:
+    # When today is a designated START_DAY, any prior cycle is retired
+    # unless a snapshot has explicitly been prepared for today.
+    if is_strategy_start_day(today) and week_start != today:
         return {}
     if week_start > today or expiry_date < today:
         return {}
@@ -221,7 +236,11 @@ def collect_once(force_static: bool = False) -> bool:
     Returns True on success, False on failure.
     """
     today = _today_ist()
-    is_first_run_of_week = is_tuesday(today)
+    if check_nse_holiday(today):
+        logger.info("Today (%s) is an NSE market holiday or weekend. Skipping data collection.", today)
+        return True
+
+    is_first_run_of_week = is_strategy_start_day(today)
     today_str = format_expiry_file(today)
 
     active = load_active_snapshot()
@@ -305,8 +324,8 @@ def collect_once(force_static: bool = False) -> bool:
     start_str = format_expiry_file(week_start)
 
     if is_first_run_of_week:
-        # --- Tuesday logic ---
-        # Check whether an active snapshot for THIS Tuesday already exists
+        # --- Strategy Start Day (Tuesday or holiday-shifted Wednesday) ---
+        # Check whether an active snapshot for THIS start day already exists
         # (e.g. manually created with correct 9:30 AM prices). If so,
         # reuse it instead of overwriting with mid-day LTPs.
         if active_cycle and active_cycle.get("week_start_date") == today_str:
@@ -322,7 +341,7 @@ def collect_once(force_static: bool = False) -> bool:
             db_path = _ensure_db(week_start, expiry_date)
             insert_buy_snapshot(db_path, active_cycle)
         else:
-            # --- Genuinely fresh Tuesday: capture new buy prices ---
+            # --- Genuinely fresh cycle: capture new buy prices ---
             db_path = _ensure_db(week_start, expiry_date)
             cycle_id = generate_cycle_id(start_str)
             call_buy_price = call_ltp
@@ -348,12 +367,12 @@ def collect_once(force_static: bool = False) -> bool:
             save_active_snapshot(snapshot)
             insert_buy_snapshot(db_path, snapshot)
 
-            logger.info("Tuesday buy prices captured [%s]: CALL=%d (₹%.2f)  PUT=%d (₹%.2f)",
+            logger.info("Cycle buy prices captured [%s]: CALL=%d (₹%.2f)  PUT=%d (₹%.2f)",
                      selection_mode, call_strike, call_buy_price, put_strike, put_buy_price)
     else:
-        # --- Wednesday-Monday: reuse the complete active cycle ---
+        # --- Mid-cycle holding/closing day: reuse the complete active cycle ---
         if not active_cycle:
-            logger.warning("No active snapshot found on non-Tuesday; "
+            logger.warning("No active snapshot found on non-start day; "
                            "capturing a midweek fallback snapshot. Its prices "
                            "are current prices, not Tuesday prices.")
             cycle_id = generate_cycle_id(start_str)
