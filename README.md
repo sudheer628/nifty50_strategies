@@ -463,9 +463,6 @@ Strategy results and weekly prices can be persisted directly to MongoDB Atlas (`
 ### CLI Usage
 
 ```bash
-# Push sample cycle to verify MongoDB connection
-python scripts/sync_to_mongodb.py --sample
-
 # Check collection status and document counts
 python scripts/sync_to_mongodb.py --status
 

@@ -37,7 +37,6 @@ from config import (
 def main():
     parser = argparse.ArgumentParser(description="Sync NIFTY50 weekly option strategy to MongoDB Atlas")
     parser.add_argument("--db", help="Path to weekly strategy database (defaults to latest)")
-    parser.add_argument("--sample", action="store_true", help="Generate and push a sample test cycle")
     parser.add_argument("--status", action="store_true", help="Check MongoDB Atlas connection and collection counts")
     args = parser.parse_args()
 
@@ -61,16 +60,10 @@ def main():
             sys.exit(1)
         db = store._db
         logger.info(f"Connected to MongoDB Atlas: database={store.db_name}")
-        for col_name in (store.strategies_col_name, store.master_col_name, store.predictions_col_name):
+        for col_name in (store.strategies_col_name, store.master_col_name):
             cnt = db[col_name].count_documents({})
             logger.info(f"  • Collection '{col_name}': {cnt} documents")
         sys.exit(0)
-
-    if args.sample:
-        logger.info("Pushing sample NIFTY50 cycle to MongoDB Atlas...")
-        sample_doc, sample_preds = store.generate_sample_cycle()
-        success = store.push_week_cycle(sample_doc, sample_preds)
-        sys.exit(0 if success else 1)
 
     # Push from strategy DB
     target_db = args.db
