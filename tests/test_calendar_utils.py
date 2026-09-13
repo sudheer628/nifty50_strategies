@@ -60,31 +60,31 @@ class TestCalendarUtils(unittest.TestCase):
     def test_monday_holiday_shift_ganesh_chaturthi(self):
         """
         When Monday is an NSE holiday (2026-09-14 Ganesh Chaturthi):
-        - Monday is HOLIDAY.
-        - Tuesday (2026-09-15) is deferred CLOSING_DAY for the current cycle.
-        - Wednesday (2026-09-16) is deferred START_DAY for the new cycle.
+        - Monday is HOLIDAY (closed early morning before VM shutdown).
+        - Tuesday (2026-09-15) is START_DAY for the fresh cycle.
+        - Wednesday (2026-09-16) is REGULAR_DAY.
         """
         mon_holiday = date(2026, 9, 14)  # Ganesh Chaturthi
-        tue_close = date(2026, 9, 15)
-        wed_start = date(2026, 9, 16)
+        tue_start = date(2026, 9, 15)
+        wed_reg = date(2026, 9, 16)
 
-        # Monday: Market is closed
+        # Monday: Market is closed (closed early morning via --morning-holiday-check)
         self.assertTrue(check_nse_holiday(mon_holiday))
         self.assertFalse(is_strategy_closing_day(mon_holiday))
         self.assertFalse(is_strategy_start_day(mon_holiday))
         self.assertEqual(get_strategy_cycle_role(mon_holiday), "HOLIDAY")
 
-        # Tuesday: Deferred closing day
-        self.assertFalse(check_nse_holiday(tue_close))
-        self.assertTrue(is_strategy_closing_day(tue_close))
-        self.assertFalse(is_strategy_start_day(tue_close))
-        self.assertEqual(get_strategy_cycle_role(tue_close), "CLOSING_DAY")
+        # Tuesday: Start day for the new cycle
+        self.assertFalse(check_nse_holiday(tue_start))
+        self.assertFalse(is_strategy_closing_day(tue_start))
+        self.assertTrue(is_strategy_start_day(tue_start))
+        self.assertEqual(get_strategy_cycle_role(tue_start), "START_DAY")
 
-        # Wednesday: Deferred start day for the new cycle
-        self.assertFalse(check_nse_holiday(wed_start))
-        self.assertFalse(is_strategy_closing_day(wed_start))
-        self.assertTrue(is_strategy_start_day(wed_start))
-        self.assertEqual(get_strategy_cycle_role(wed_start), "START_DAY")
+        # Wednesday: Regular mid-cycle day
+        self.assertFalse(check_nse_holiday(wed_reg))
+        self.assertFalse(is_strategy_closing_day(wed_reg))
+        self.assertFalse(is_strategy_start_day(wed_reg))
+        self.assertEqual(get_strategy_cycle_role(wed_reg), "REGULAR_DAY")
 
     def test_tuesday_holiday_shift(self):
         """

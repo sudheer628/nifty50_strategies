@@ -123,6 +123,11 @@ def main() -> int:
         help="Date to evaluate in YYYY-MM-DD format (default: today)",
     )
     parser.add_argument(
+        "--morning-holiday-check",
+        action="store_true",
+        help="Early morning check on Monday: if today is an NSE holiday, close the strategy immediately before VM stops",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Bypass holiday calendar and force execution of closing sequence",
@@ -147,6 +152,19 @@ def main() -> int:
     day_name = target_date.strftime("%A")
     role = get_strategy_cycle_role(target_date)
 
+    # -----------------------------------------------------------------
+    # Morning Holiday Mode Check
+    # -----------------------------------------------------------------
+    if args.morning_holiday_check:
+        if target_date.weekday() != 0:
+            logger.info(f"Morning holiday check is only applicable on Mondays (today is {day_name}). Skipping.")
+            return 0
+        if not check_nse_holiday(target_date):
+            logger.info(f"Monday ({target_date}) is a normal trading day. Strategy will close post-market at 15:37 IST.")
+            return 0
+        logger.info(f"🚨 Monday ({target_date}) is an NSE holiday! Executing early morning weekly close before VM stops...")
+        args.force = True
+
     logger.info(f"Evaluating strategy close schedule for: {target_date} ({day_name})")
     logger.info(f"Calculated Strategy Lifecycle Role: {role}")
 
@@ -155,22 +173,17 @@ def main() -> int:
         if not is_strategy_closing_day(target_date):
             if target_date.weekday() == 0 and check_nse_holiday(target_date):
                 logger.info(
-                    f"Monday ({target_date}) is an NSE holiday. Weekly close is deferred to Tuesday."
+                    f"Monday ({target_date}) was an NSE holiday (closed in morning). Skipping post-market close."
                 )
                 return 0
-            elif target_date.weekday() == 1:
-                logger.info(
-                    f"Tuesday ({target_date}) is a regular week day. Weekly close was completed on Monday."
-                )
-                return 0
-            else:
-                logger.info(
-                    f"Today ({target_date}) is not an active Strategy Closing Day. Skipping cleanly."
-                )
-                return 0
+            logger.info(
+                f"Today ({target_date}) is not an active Strategy Closing Day. Skipping cleanly."
+            )
+            return 0
 
+    mode_label = "EARLY MORNING HOLIDAY" if args.morning_holiday_check else "POST-MARKET"
     logger.info("=" * 65)
-    logger.info(f"🚀 INITIATING POST-MARKET WEEKLY STRATEGY CLOSE: {target_date}")
+    logger.info(f"🚀 INITIATING {mode_label} WEEKLY STRATEGY CLOSE: {target_date}")
     logger.info("=" * 65)
 
     python_bin = sys.executable
@@ -223,11 +236,11 @@ def main() -> int:
     if hermes_dir:
         logger.info(f"Found sentinel-hermes directory at: {hermes_dir}")
 
-        # Step 3: Run weekly merge script
+        # Step 3: Run weekly merge script (pass --force so holiday checks don't block orchestrator)
         logger.info("▶ Step 3/4: Executing sentinel-hermes weekly merge pipeline...")
         merge_sh = os.path.join(hermes_dir, "run_weekly_merge.sh")
         if os.path.exists(merge_sh) and sys.platform != "win32":
-            step3_ok = run_command(["bash", merge_sh], cwd=hermes_dir, dry_run=args.dry_run)
+            step3_ok = run_command(["bash", merge_sh, "--force"], cwd=hermes_dir, dry_run=args.dry_run)
         else:
             # Fallback to python db_registry.py directly
             registry_py = os.path.join(hermes_dir, "db_registry.py")
@@ -235,11 +248,11 @@ def main() -> int:
         if not step3_ok:
             success = False
 
-        # Step 4: Run skill generator (synthesizes skill & syncs to MongoDB Atlas)
+        # Step 4: Run skill generator (pass --force so holiday checks don't block orchestrator)
         logger.info("▶ Step 4/4: Generating weekly AI skill and syncing to MongoDB Atlas...")
         skill_py = os.path.join(hermes_dir, "skill_generator.py")
         if os.path.exists(skill_py):
-            skill_cmd = [python_bin, skill_py, "--merged-db", "merged_latest.db"]
+            skill_cmd = [python_bin, skill_py, "--merged-db", "merged_latest.db", "--force"]
             if args.dry_run:
                 skill_cmd.append("--dry-run")
             step4_ok = run_command(

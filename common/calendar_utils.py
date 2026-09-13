@@ -104,57 +104,38 @@ def is_strategy_closing_day(target_date: Optional[date] = None) -> bool:
     """
     Returns True if target_date is the strategy closing day:
     - Normal week: Monday (if not a holiday).
-    - Holiday week: Tuesday (if Monday was an NSE holiday and Tuesday is open).
+    (Holiday Mondays are closed early morning via --morning-holiday-check).
     """
     today = target_date if target_date else date.today()
 
-    # If today itself is a holiday/weekend, it cannot be an active closing day
     if check_nse_holiday(today):
         return False
 
-    weekday = today.weekday()
-
-    # Case A: Monday open -> standard closing day
-    if weekday == 0:
-        return True
-
-    # Case B: Tuesday open, but Monday was a holiday -> deferred closing day
-    if weekday == 1:
-        monday = today - timedelta(days=1)
-        if check_nse_holiday(monday):
-            logger.info(f"Monday ({monday}) was an NSE holiday. Tuesday ({today}) is active Strategy Closing Day.")
-            return True
-
-    return False
+    return today.weekday() == 0
 
 
 def is_strategy_start_day(target_date: Optional[date] = None) -> bool:
     """
     Returns True if target_date is the strategy beginning day:
-    - Normal week: Tuesday (if Monday was a normal trading day and Tuesday is open).
-    - Holiday week: Wednesday (if Monday was a holiday, making Tuesday closing day,
-                    OR if Tuesday was itself a holiday).
+    - Normal week (and Monday holiday week): Tuesday (if open).
+    - Tuesday holiday week (Scenario-2): Wednesday (if open).
     """
     today = target_date if target_date else date.today()
 
-    # If today itself is a holiday/weekend, it cannot be an active start day
     if check_nse_holiday(today):
         return False
 
     weekday = today.weekday()
 
-    # Case A: Tuesday open, and Monday was open (normal week start)
+    # Tuesday open is always the start day
     if weekday == 1:
-        monday = today - timedelta(days=1)
-        if not check_nse_holiday(monday):
-            return True
+        return True
 
-    # Case B: Wednesday open, but either Monday or Tuesday was a holiday
+    # Wednesday open is start day ONLY IF Tuesday was an exchange holiday (Scenario-2)
     if weekday == 2:
         tuesday = today - timedelta(days=1)
-        monday = today - timedelta(days=2)
-        if check_nse_holiday(tuesday) or check_nse_holiday(monday):
-            logger.info(f"Prior trading days shifted. Wednesday ({today}) is active Strategy Beginning Day.")
+        if check_nse_holiday(tuesday):
+            logger.info(f"Tuesday was an NSE holiday. Wednesday ({today}) is active Strategy Beginning Day.")
             return True
 
     return False
@@ -164,8 +145,8 @@ def get_strategy_cycle_role(target_date: Optional[date] = None) -> str:
     """
     Returns the designated role for target_date in the strategy lifecycle:
     - 'HOLIDAY': Market closed.
-    - 'CLOSING_DAY': Strategy closes today (Monday, or Tuesday if Monday holiday).
-    - 'START_DAY': Strategy begins today (Tuesday, or Wednesday if Monday/Tuesday holiday).
+    - 'CLOSING_DAY': Strategy closes today (Monday).
+    - 'START_DAY': Strategy begins today (Tuesday, or Wednesday if Tuesday holiday).
     - 'REGULAR_DAY': Mid-cycle holding day.
     """
     today = target_date if target_date else date.today()
