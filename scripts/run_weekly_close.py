@@ -168,6 +168,13 @@ def main() -> int:
     logger.info(f"Evaluating strategy close schedule for: {target_date} ({day_name})")
     logger.info(f"Calculated Strategy Lifecycle Role: {role}")
 
+    # Check if the active cycle is already marked closed (idempotent protection)
+    from common.storage import load_active_snapshot, mark_active_cycle_closed
+    snapshot = load_active_snapshot()
+    if snapshot and snapshot.get("status") == "closed" and not args.force:
+        logger.info(f"Strategy cycle {snapshot.get('cycle_id')} is already marked CLOSED. Skipping close.")
+        return 0
+
     # Validation: Is today the active Strategy Closing Day?
     if not args.force:
         if not is_strategy_closing_day(target_date):
@@ -268,6 +275,11 @@ def main() -> int:
     logger.info("=" * 65)
     if success:
         logger.info(f"✅ Weekly strategy close completed successfully for {target_date}.")
+        if not args.dry_run:
+            try:
+                mark_active_cycle_closed()
+            except Exception as e:
+                logger.warning(f"Could not update cycle status in snapshot: {e}")
         return 0
     else:
         logger.error(f"⚠️ Weekly strategy close completed with one or more errors for {target_date}.")

@@ -106,6 +106,37 @@ class TestCalendarUtils(unittest.TestCase):
         self.assertTrue(is_strategy_start_day(wed_after))
         self.assertEqual(get_strategy_cycle_role(wed_after), "START_DAY")
 
+    def test_cycle_status_lifecycle(self):
+        """Verify that a closed status in active snapshot is recognized and retired."""
+        from strategies.weekly_option_collector import _active_cycle
+
+        # Snapshot with status: closed
+        closed_snapshot = {
+            "week_start_date": "20260908",
+            "expiry_date": "20260915",
+            "call_strike": 25000,
+            "put_strike": 24800,
+            "call_buy_price": 100.0,
+            "put_buy_price": 90.0,
+            "status": "closed",
+        }
+        # Even mid-cycle, a closed status must retire the cycle
+        self.assertEqual(_active_cycle(closed_snapshot, date(2026, 9, 11)), {})
+
+        # Snapshot with status: ongoing
+        ongoing_snapshot = {
+            "week_start_date": "20260908",
+            "expiry_date": "20260915",
+            "call_strike": 25000,
+            "put_strike": 24800,
+            "call_buy_price": 100.0,
+            "put_buy_price": 90.0,
+            "status": "ongoing",
+        }
+        result = _active_cycle(ongoing_snapshot, date(2026, 9, 11))
+        self.assertEqual(result.get("call_strike"), 25000)
+        self.assertEqual(result.get("status"), "ongoing")
+
 
 if __name__ == "__main__":
     unittest.main()

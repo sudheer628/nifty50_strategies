@@ -165,6 +165,10 @@ def _active_cycle(snapshot: dict, today: date) -> dict:
         logger.warning("Active snapshot contains invalid dates or strikes")
         return {}
 
+    # If the cycle was explicitly marked closed, retire it
+    if snapshot.get("status") == "closed":
+        return {}
+
     # When today is a designated START_DAY, any prior cycle is retired
     # unless a snapshot has explicitly been prepared for today.
     if is_strategy_start_day(today) and week_start != today:

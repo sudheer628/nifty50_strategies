@@ -319,6 +319,9 @@ def save_active_snapshot(snapshot: dict) -> None:
         except OSError as exc:
             logger.warning("Failed to archive snapshot: %s", exc)
 
+    if "status" not in snapshot:
+        snapshot["status"] = "ongoing"
+
     with open(ACTIVE_SNAPSHOT_FILE, "w", encoding="utf-8") as fh:
         json.dump(snapshot, fh, indent=2)
 
@@ -337,6 +340,24 @@ def load_active_snapshot() -> dict:
         return {}
     with open(ACTIVE_SNAPSHOT_FILE, "r", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def mark_active_cycle_closed() -> bool:
+    """
+    Mark the active cycle in current_week_buy.json as 'closed'.
+    
+    Provides an explicit lifecycle flag so downstream inference runners
+    and health validators know the weekly strategy has concluded.
+    """
+    snapshot = load_active_snapshot()
+    if not snapshot:
+        return False
+    snapshot["status"] = "closed"
+    snapshot["closed_at"] = int(datetime.now(timezone.utc).timestamp())
+    with open(ACTIVE_SNAPSHOT_FILE, "w", encoding="utf-8") as fh:
+        json.dump(snapshot, fh, indent=2)
+    logger.info("Marked active strategy cycle %s as CLOSED", snapshot.get("cycle_id"))
+    return True
 
 
 # ---------------------------------------------------------------------------
