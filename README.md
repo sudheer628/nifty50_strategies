@@ -143,6 +143,7 @@ On Tuesday at 09:30 AM IST, `weekly_option_collector.py` invokes [`common/ai_str
    {
      "strategy_name": "nifty50_weekly_option_collector",
      "cycle_id": "20260901-a1b2c3d4",
+     "status": "ongoing",
      "week_start_date": "20260901",
      "expiry_date": "20260908",
      "call_strike": 24650,
@@ -169,20 +170,21 @@ On Tuesday at 09:30 AM IST, `weekly_option_collector.py` invokes [`common/ai_str
                     WEEKLY LIFECYCLE WITH HOLIDAY RESOLUTION
                     
   Strategy Start Day     nifty50_strategies picks AI Strikes & enters Strangle
-  (Tue, or Wed if Hol):  • Captures buy prices into current_week_buy.json
+  (Tue 09:31 IST,        • Captures buy prices into current_week_buy.json (status: ongoing)
+  or Wed if Tue Hol):    • Evaluated 3 mins later at 09:34 IST by sentinel-hermes
                                           │
                                           ▼
-  Market Trading Days:   sentinel-hermes inference_runner.py evaluates trade (every 30m):
-                         • Logs predictions to predictions.db (Paper Trading)
-                         • Sends immediate Email Alert on TAKE_PROFIT / STOP_LOSS
+  Market Trading Days    • Collector (:01 & :31) saves option LTPs to SQLite
+  (Every 30 mins):       • Inference runner (:04 & :34) evaluates P&L and Greeks
                          • Skips automatically on exchange holidays
                                           │
                                           ▼
   Strategy Closing Day   nifty50_strategies scripts/run_weekly_close.py orchestrates:
-  (Mon, or Tue if Hol)   1. send_weekly_report.py (PDF & Email weekly report)
-  15:37 IST (10:07 UTC): 2. compare_ai_vs_static_benchmark.py (AI vs Static comparison)
-                         3. sentinel-hermes/run_weekly_merge.sh (rebuilds merged SQLite)
-                         4. sentinel-hermes/skill_generator.py (synthesizes skill & Mongo sync)
+  (Mondays):             1. send_weekly_report.py (PDF & Email weekly report)
+  • Normal Monday:       2. compare_ai_vs_static_benchmark.py (AI vs Static comparison)
+    15:37 IST (10:07 UTC) 3. sentinel-hermes/run_weekly_merge.sh (rebuilds merged SQLite)
+  • Holiday Monday:      4. sentinel-hermes/skill_generator.py (synthesizes skill & Mongo sync)
+    08:45 IST (03:15 UTC)5. Updates current_week_buy.json status: "closed"
                                           │
                                           ▼
   Dynamic Injection:     inference_runner.py automatically reads the new skill
@@ -228,20 +230,19 @@ First-trigger LTP = 25000 → PUT = 24900, CALL = 25100.
 
 ## 7. Collection Frequency
 
-- **Start time**: 10:00 AM IST
-- **Interval**: Every 30 minutes
-- **Duration**: Tuesday through Monday during market hours (10:00 AM - 3:30 PM IST)
+- **Start time**: 09:31 AM IST (04:01 UTC)
+- **Interval**: Every 30 minutes (:01 and :31 past every hour)
+- **Duration**: Tuesday through Monday during market hours (09:31 AM - 15:31 PM IST)
 
 ### Cron entry
 
 ```bash
-# Every 30 minutes during market hours (10:00-15:30 IST)
-# Two entries: :30 past (hours 4-9 UTC) and :00 past (hours 5-10 UTC)
-30 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
-0 5-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py
+# Every 30 minutes during market hours (:01 and :31 past every hour from 09:31 to 15:31 IST)
+1 4-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
+31 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 ```
 
-(Combined, these fire at 4:30, 5:00, 5:30, …, 9:30, 10:00 UTC = every 30 min from 10:00 to 15:30 IST.)
+(Fires at 04:01, 04:31, 05:01, ..., 09:31, 10:01 UTC = every 30 min from 09:31 to 15:31 IST, followed 3 minutes later by `sentinel-hermes` inference runner.)
 
 **Timestamp format:** All timestamps in SQLite are stored as Unix integers (seconds since epoch, UTC) matching the format used in `market_signal_agent` for cross-project joins and consistent querying. The storage layer (`storage.init_db()`) automatically migrates any legacy TEXT (ISO 8601) timestamps to integers on startup.
 
@@ -384,11 +385,11 @@ python strategies/weekly_option_collector.py --dry-run
 # Force run outside market hours
 python strategies/weekly_option_collector.py --force
 
-# Cron: Staggered to :01 & :31 past every hour (10:01-15:31 IST = 04:31-10:01 UTC)
-# Reason for +1m stagger: Allows upstream collectors (market_signal_agent & nifty_signal_features)
+# Cron: Staggered to :01 & :31 past every hour (09:31-15:31 IST = 04:01-10:01 UTC)
+# Reason for stagger: Allows upstream collectors (market_signal_agent & nifty_signal_features)
 # to write their 5-min Greeks and technicals at :00/:30 before strategy prices are captured.
+1 4-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 31 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
-1 5-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 ```
 
 ### Weekly Monday email report
@@ -423,11 +424,14 @@ python scripts/send_weekly_report.py
 The preview HTML and PNG chart are archived under
 `/home/ubuntu/sqlite/strategies/reports/` by default.
 
-Weekly Close Orchestrator cron (10:07 UTC / 15:37 IST, runs Mondays and Tuesdays):
+Weekly Close Orchestrator cron entries:
 
 ```cron
-# Post-Market Strategy Weekly Close (Runs Mon & Tue at 10:07 UTC = 15:37 IST; automatically handles holiday shifts)
-7 10 * * 1,2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
+# Monday 03:15 UTC (08:45 IST) — Early morning close IF Monday is an NSE holiday (runs before 03:23 UTC shutdown)
+15 3 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py --morning-holiday-check >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
+
+# Post-Market Strategy Weekly Close (Runs Mondays at 10:07 UTC = 15:37 IST; skips if already closed in morning)
+7 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
 ```
 
 ---
