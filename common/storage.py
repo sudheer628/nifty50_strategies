@@ -98,7 +98,16 @@ def init_db(db_path: str) -> None:
             put_buy_price   REAL,
             gainloss        REAL,
             source          TEXT    DEFAULT 'angelone',
-            cycle_id        TEXT    NOT NULL
+            cycle_id        TEXT    NOT NULL,
+            fsm_state       TEXT    DEFAULT 'DUAL_LONG',
+            fsm_call_status TEXT    DEFAULT 'ACTIVE',
+            fsm_put_status  TEXT    DEFAULT 'ACTIVE',
+            fsm_call_exit_price REAL,
+            fsm_put_exit_price  REAL,
+            fsm_realized_pnl    REAL DEFAULT 0.0,
+            fsm_unrealized_pnl  REAL DEFAULT 0.0,
+            fsm_total_gainloss  REAL DEFAULT 0.0,
+            fsm_roi_pct         REAL DEFAULT 0.0
         )
     """)
 
@@ -108,6 +117,23 @@ def init_db(db_path: str) -> None:
     if "gainloss" not in hourly_columns:
         cur.execute("ALTER TABLE strategy_hourly_data ADD COLUMN gainloss REAL")
         logger.info("Added gainloss column to existing database: %s", db_path)
+
+    # Migrate weekly databases for Decoupled Alpha FSM strategy tracking
+    fsm_columns = [
+        ("fsm_state", "TEXT DEFAULT 'DUAL_LONG'"),
+        ("fsm_call_status", "TEXT DEFAULT 'ACTIVE'"),
+        ("fsm_put_status", "TEXT DEFAULT 'ACTIVE'"),
+        ("fsm_call_exit_price", "REAL"),
+        ("fsm_put_exit_price", "REAL"),
+        ("fsm_realized_pnl", "REAL DEFAULT 0.0"),
+        ("fsm_unrealized_pnl", "REAL DEFAULT 0.0"),
+        ("fsm_total_gainloss", "REAL DEFAULT 0.0"),
+        ("fsm_roi_pct", "REAL DEFAULT 0.0"),
+    ]
+    for col_name, col_def in fsm_columns:
+        if col_name not in hourly_columns:
+            cur.execute(f"ALTER TABLE strategy_hourly_data ADD COLUMN {col_name} {col_def}")
+            logger.info("Added %s column to strategy_hourly_data in %s", col_name, db_path)
 
     cur.execute("""
         UPDATE strategy_hourly_data
@@ -201,6 +227,9 @@ def insert_record(db_path: str, record: dict) -> None:
     """
     Insert one hourly collection record into the weekly SQLite database.
 
+    Dynamically matches keys in ``record`` to available table columns,
+    guaranteeing seamless compatibility for both base and FSM columns.
+
     Args:
         db_path:  Path to the weekly ``.db`` file.
         record:   Dictionary with keys matching ``strategy_hourly_data`` columns.
@@ -208,41 +237,15 @@ def insert_record(db_path: str, record: dict) -> None:
     """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO strategy_hourly_data (
-            strategy_name,
-            collection_timestamp,
-            expiry_date,
-            nifty_open,
-            nifty_ltp,
-            nifty_previous_close,
-            put_strike,
-            put_ltp,
-            call_strike,
-            call_ltp,
-            call_buy_price,
-            put_buy_price,
-            gainloss,
-            source,
-            cycle_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        record.get("strategy_name", STRATEGY_NAME),
-        int(record.get("collection_timestamp", 0)),
-        record.get("expiry_date", ""),
-        record.get("nifty_open"),
-        record.get("nifty_ltp"),
-        record.get("nifty_previous_close"),
-        record.get("put_strike"),
-        record.get("put_ltp"),
-        record.get("call_strike"),
-        record.get("call_ltp"),
-        record.get("call_buy_price"),
-        record.get("put_buy_price"),
-        record.get("gainloss"),
-        record.get("source", "angelone"),
-        record.get("cycle_id", ""),
-    ))
+    cur.execute("PRAGMA table_info(strategy_hourly_data)")
+    table_cols = [row[1] for row in cur.fetchall()]
+
+    insert_cols = [col for col in table_cols if col in record and col != "id"]
+    placeholders = ["?"] * len(insert_cols)
+    values = [record[col] for col in insert_cols]
+
+    query = f"INSERT INTO strategy_hourly_data ({', '.join(insert_cols)}) VALUES ({', '.join(placeholders)})"
+    cur.execute(query, values)
     conn.commit()
     conn.close()
 
@@ -357,6 +360,22 @@ def mark_active_cycle_closed() -> bool:
     with open(ACTIVE_SNAPSHOT_FILE, "w", encoding="utf-8") as fh:
         json.dump(snapshot, fh, indent=2)
     logger.info("Marked active strategy cycle %s as CLOSED", snapshot.get("cycle_id"))
+    return True
+
+
+def update_active_fsm_state(fsm_dict: dict) -> bool:
+    """
+    Update or initialize the alpha_fsm section of current_week_buy.json in-place.
+    
+    Guarantees that Decoupled Leg state, trailing stops, and realized gains
+    persist across 30-minute cron executions without disturbing base snapshot fields.
+    """
+    snapshot = load_active_snapshot()
+    if not snapshot:
+        return False
+    snapshot["alpha_fsm"] = fsm_dict
+    with open(ACTIVE_SNAPSHOT_FILE, "w", encoding="utf-8") as fh:
+        json.dump(snapshot, fh, indent=2)
     return True
 
 

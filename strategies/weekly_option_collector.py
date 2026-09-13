@@ -55,6 +55,7 @@ from common.calendar_utils import (
 from common.ai_strike_selector import (
     select_strikes,
     compute_static_strikes,
+    get_last_composite_score,
 )
 
 from common.angelone_client import (
@@ -69,7 +70,13 @@ from common.storage import (
     insert_buy_snapshot,
     save_active_snapshot,
     load_active_snapshot,
+    update_active_fsm_state,
     generate_cycle_id,
+)
+
+from common.fsm_strategy import (
+    init_fsm_state,
+    evaluate_fsm_tick,
 )
 
 # IST timezone (used for business-logic decisions: market hours,
@@ -203,9 +210,10 @@ def _build_record(
     call_buy_price,
     put_buy_price,
     gainloss,
+    fsm_data: Optional[dict] = None,
 ) -> dict:
-    """Build a standard hourly record dictionary."""
-    return {
+    """Build a standard hourly record dictionary with both Base and FSM metrics."""
+    record = {
         "strategy_name": STRATEGY_NAME,
         "collection_timestamp": _now_utc_ts(),
         "expiry_date": expiry_file,
@@ -222,6 +230,9 @@ def _build_record(
         "source": "angelone",
         "cycle_id": cycle_id,
     }
+    if fsm_data and isinstance(fsm_data, dict):
+        record.update(fsm_data)
+    return record
 
 
 def collect_once(force_static: bool = False) -> bool:
@@ -365,6 +376,14 @@ def collect_once(force_static: bool = False) -> bool:
                 "static_put_strike": static_put_strike,
                 "selection_mode": selection_mode,
                 "selection_rationale": selection_rationale,
+                "alpha_fsm": init_fsm_state(
+                    call_strike=call_strike,
+                    put_strike=put_strike,
+                    call_buy_price=call_buy_price,
+                    put_buy_price=put_buy_price,
+                    entry_ts=_now_utc_ts(),
+                    composite_score=get_last_composite_score(),
+                ),
             }
 
             # Archives the previous snapshot (if any) before overwriting
@@ -397,6 +416,14 @@ def collect_once(force_static: bool = False) -> bool:
                 "static_put_strike": static_put_strike,
                 "selection_mode": selection_mode,
                 "selection_rationale": selection_rationale,
+                "alpha_fsm": init_fsm_state(
+                    call_strike=call_strike,
+                    put_strike=put_strike,
+                    call_buy_price=call_buy_price,
+                    put_buy_price=put_buy_price,
+                    entry_ts=_now_utc_ts(),
+                    composite_score=get_last_composite_score(),
+                ),
             }
             save_active_snapshot(snapshot)
         else:
@@ -428,6 +455,45 @@ def collect_once(force_static: bool = False) -> bool:
         )
 
     # ------------------------------------------------------------------
+    # Evaluate Decoupled FSM Strategy (Alpha)
+    # ------------------------------------------------------------------
+    curr_active = load_active_snapshot()
+    fsm_state = curr_active.get("alpha_fsm")
+    if not fsm_state:
+        fsm_state = init_fsm_state(
+            call_strike=call_strike,
+            put_strike=put_strike,
+            call_buy_price=call_buy_price,
+            put_buy_price=put_buy_price,
+            entry_ts=_now_utc_ts(),
+        )
+
+    days_to_expiry = max(0.1, (expiry_date - today).days)
+    updated_fsm, fsm_events = evaluate_fsm_tick(
+        fsm_state=fsm_state,
+        current_call_ltp=call_ltp,
+        current_put_ltp=put_ltp,
+        current_ts=_now_utc_ts(),
+        days_to_expiry=days_to_expiry,
+    )
+    if fsm_events:
+        for ev in fsm_events:
+            logger.info("  [ALPHA FSM EVENT] %s", ev)
+    update_active_fsm_state(updated_fsm)
+
+    fsm_data = {
+        "fsm_state": updated_fsm.get("state", "DUAL_LONG"),
+        "fsm_call_status": updated_fsm.get("call_leg", {}).get("status", "ACTIVE"),
+        "fsm_put_status": updated_fsm.get("put_leg", {}).get("status", "ACTIVE"),
+        "fsm_call_exit_price": updated_fsm.get("call_leg", {}).get("exit_price"),
+        "fsm_put_exit_price": updated_fsm.get("put_leg", {}).get("exit_price"),
+        "fsm_realized_pnl": updated_fsm.get("realized_pnl_pts", 0.0),
+        "fsm_unrealized_pnl": updated_fsm.get("unrealized_pnl_pts", 0.0),
+        "fsm_total_gainloss": updated_fsm.get("total_gainloss", 0.0),
+        "fsm_roi_pct": updated_fsm.get("roi_pct", 0.0),
+    }
+
+    # ------------------------------------------------------------------
     # Write the hourly record
     # ------------------------------------------------------------------
     record = _build_record(
@@ -443,6 +509,7 @@ def collect_once(force_static: bool = False) -> bool:
         call_buy_price=call_buy_price,
         put_buy_price=put_buy_price,
         gainloss=gainloss,
+        fsm_data=fsm_data,
     )
     insert_record(db_path, record)
 
@@ -457,7 +524,13 @@ def collect_once(force_static: bool = False) -> bool:
                  call_strike, call_ltp, call_buy_price)
     logger.info("  PUT  %d  LTP=%s  BuyPrice=%s",
                  put_strike, put_ltp, put_buy_price)
-    logger.info("  Gain/Loss: %s", gainloss)
+    logger.info("  [BASE STRATEGY] Strangle Gain/Loss: %s pts", gainloss)
+    logger.info("  [ALPHA STRATEGY] State: %s | Call: %s | Put: %s | P&L: %.2f pts (ROI: %.2f%%)",
+                updated_fsm.get("state"),
+                updated_fsm.get("call_leg", {}).get("status"),
+                updated_fsm.get("put_leg", {}).get("status"),
+                updated_fsm.get("total_gainloss", 0.0),
+                updated_fsm.get("roi_pct", 0.0))
     logger.info("  Expiry: %s  |  DB: %s", expiry_file, db_path)
     logger.info("=" * 50)
 

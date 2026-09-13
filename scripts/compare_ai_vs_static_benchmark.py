@@ -183,36 +183,53 @@ def compare_strategies(
     static_put_pnl = ((latest_static_put_ltp - static_put_buy) / static_put_buy * 100) if (static_put_buy and latest_static_put_ltp) else None
     static_total_pnl = ((latest_static_call_ltp + latest_static_put_ltp - static_total_buy) / static_total_buy * 100) if (static_total_buy and latest_static_call_ltp and latest_static_put_ltp) else None
 
+    # Alpha FSM metrics
+    alpha_snapshot = snapshot.get("alpha_fsm") or {}
+    fsm_state = latest_ai.get("fsm_state") or alpha_snapshot.get("state", "DUAL_LONG")
+    fsm_c_status = latest_ai.get("fsm_call_status") or alpha_snapshot.get("call_leg", {}).get("status", "ACTIVE")
+    fsm_p_status = latest_ai.get("fsm_put_status") or alpha_snapshot.get("put_leg", {}).get("status", "ACTIVE")
+    fsm_realized = float(latest_ai.get("fsm_realized_pnl", 0.0) or alpha_snapshot.get("realized_pnl_pts", 0.0))
+    fsm_total_pts = float(latest_ai.get("fsm_total_gainloss", 0.0) or alpha_snapshot.get("total_gainloss", latest_ai_call_ltp + latest_ai_put_ltp - ai_total_buy))
+    fsm_roi_pct = float(latest_ai.get("fsm_roi_pct", 0.0) or alpha_snapshot.get("roi_pct", ai_total_pnl))
+
     # Print Table
     cycle_id = snapshot.get("cycle_id", "ACTIVE")
     selection_mode = snapshot.get("selection_mode", "AI")
     rationale = snapshot.get("selection_rationale", "N/A")
 
-    print("\n" + "=" * 78)
-    print(f"  WEEKLY OPTION STRATEGY BENCHMARK COMPARISON: {cycle_id}")
-    print("=" * 78)
+    print("\n" + "=" * 90)
+    print(f"  WEEKLY OPTION STRATEGY 3-WAY BENCHMARK COMPARISON: {cycle_id}")
+    print("=" * 90)
     print(f"Selection Mode:      {selection_mode}")
     print(f"AI Selection Reason: {rationale}")
-    print("-" * 78)
-    print(f"{'Metric':<25} | {'AI Strategy (Active)':<22} | {'Static Benchmark (±100)':<22}")
-    print("-" * 78)
-    print(f"{'CALL Strike':<25} | {ai_call_strike:<22} | {static_call_strike:<22}")
-    print(f"{'PUT Strike':<25} | {ai_put_strike:<22} | {static_put_strike:<22}")
-    print(f"{'Entry CALL Buy Price':<25} | ₹{ai_call_buy:<21.2f} | {'₹' + f'{static_call_buy:.2f}' if static_call_buy else 'N/A':<22}")
-    print(f"{'Entry PUT Buy Price':<25} | ₹{ai_put_buy:<21.2f} | {'₹' + f'{static_put_buy:.2f}' if static_put_buy else 'N/A':<22}")
-    print(f"{'Current CALL LTP':<25} | ₹{latest_ai_call_ltp:<21.2f} | {'₹' + f'{latest_static_call_ltp:.2f}' if latest_static_call_ltp else 'N/A':<22}")
-    print(f"{'Current PUT LTP':<25} | ₹{latest_ai_put_ltp:<21.2f} | {'₹' + f'{latest_static_put_ltp:.2f}' if latest_static_put_ltp else 'N/A':<22}")
-    print("-" * 78)
-    print(f"{'CALL Leg P&L %':<25} | {ai_call_pnl:+21.2f}% | {f'{static_call_pnl:+.2f}%' if static_call_pnl is not None else 'N/A':<22}")
-    print(f"{'PUT Leg P&L %':<25} | {ai_put_pnl:+21.2f}% | {f'{static_put_pnl:+.2f}%' if static_put_pnl is not None else 'N/A':<22}")
-    print(f"{'TOTAL STRANGLE P&L %':<25} | {ai_total_pnl:+21.2f}% | {f'{static_total_pnl:+.2f}%' if static_total_pnl is not None else 'N/A':<22}")
-    print("-" * 78)
+    print(f"Alpha FSM State:     {fsm_state}")
+    print("-" * 90)
+    print(f"{'Metric':<24} | {'Static Benchmark':<18} | {'Base (Buy & Hold)':<20} | {'Alpha FSM Strategy':<20}")
+    print("-" * 90)
+    print(f"{'CALL Strike':<24} | {static_call_strike:<18} | {ai_call_strike:<20} | {ai_call_strike:<20}")
+    print(f"{'PUT Strike':<24} | {static_put_strike:<18} | {ai_put_strike:<20} | {ai_put_strike:<20}")
+    print(f"{'Entry CALL Buy Price':<24} | {'₹' + f'{static_call_buy:.2f}' if static_call_buy else 'N/A':<18} | ₹{ai_call_buy:<19.2f} | ₹{ai_call_buy:<19.2f}")
+    print(f"{'Entry PUT Buy Price':<24} | {'₹' + f'{static_put_buy:.2f}' if static_put_buy else 'N/A':<18} | ₹{ai_put_buy:<19.2f} | ₹{ai_put_buy:<19.2f}")
+    print(f"{'Current CALL LTP':<24} | {'₹' + f'{latest_static_call_ltp:.2f}' if latest_static_call_ltp else 'N/A':<18} | ₹{latest_ai_call_ltp:<19.2f} | ₹{latest_ai_call_ltp:<19.2f}")
+    print(f"{'Current PUT LTP':<24} | {'₹' + f'{latest_static_put_ltp:.2f}' if latest_static_put_ltp else 'N/A':<18} | ₹{latest_ai_put_ltp:<19.2f} | ₹{latest_ai_put_ltp:<19.2f}")
+    print(f"{'CALL Leg Status':<24} | {'HELD':<18} | {'HELD':<20} | {fsm_c_status:<20}")
+    print(f"{'PUT Leg Status':<24} | {'HELD':<18} | {'HELD':<20} | {fsm_p_status:<20}")
+    print("-" * 90)
+    print(f"{'CALL Leg P&L %':<24} | {f'{static_call_pnl:+.2f}%' if static_call_pnl is not None else 'N/A':<18} | {ai_call_pnl:+19.2f}% | {ai_call_pnl:+19.2f}%")
+    print(f"{'PUT Leg P&L %':<24} | {f'{static_put_pnl:+.2f}%' if static_put_pnl is not None else 'N/A':<18} | {ai_put_pnl:+19.2f}% | {ai_put_pnl:+19.2f}%")
+    print(f"{'TOTAL STRATEGY P&L %':<24} | {f'{static_total_pnl:+.2f}%' if static_total_pnl is not None else 'N/A':<18} | {ai_total_pnl:+19.2f}% | {fsm_roi_pct:+19.2f}%")
+    print(f"{'Total P&L Points':<24} | {'N/A':<18} | {round(latest_ai_call_ltp + latest_ai_put_ltp - ai_total_buy, 1):+19.1f} pts | {fsm_total_pts:+19.1f} pts")
+    print("-" * 90)
 
     if static_total_pnl is not None:
-        delta_pnl = ai_total_pnl - static_total_pnl
-        badge = "🟢 AI OUTPERFORMING" if delta_pnl > 0 else "🔴 STATIC OUTPERFORMING" if delta_pnl < 0 else "⚪ EQUAL"
-        print(f"OUTPERFORMANCE DELTA: {delta_pnl:+.2f}% ({badge})")
-    print("=" * 78 + "\n")
+        delta_strike = ai_total_pnl - static_total_pnl
+        badge_s = "🟢 AI STRIKES BEATING STATIC" if delta_strike > 0 else "🔴 STATIC OUTPERFORMING" if delta_strike < 0 else "⚪ EQUAL"
+        print(f"STRIKE SELECTION DELTA (Base vs Static): {delta_strike:+.2f}% ({badge_s})")
+
+    delta_alpha = fsm_roi_pct - ai_total_pnl
+    badge_a = "🟢 ALPHA FSM HARVESTING GAINS" if delta_alpha > 0 else "⚪ SIMILAR PERFORMANCE" if delta_alpha == 0 else "🔴 PASSIVE OUTPERFORMING"
+    print(f"ALPHA MANAGEMENT DELTA (FSM vs Base):    {delta_alpha:+.2f}% ({badge_a})")
+    print("=" * 90 + "\n")
 
 
 def main():

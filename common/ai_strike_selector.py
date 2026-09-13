@@ -201,6 +201,86 @@ def load_market_context_for_strikes(
     return context
 
 
+_LAST_COMPOSITE_SCORE: float = 0.0
+
+
+def get_last_composite_score() -> float:
+    """Returns the most recent composite directional score calculated during strike selection."""
+    return _LAST_COMPOSITE_SCORE
+
+
+def compute_composite_directional_score(context: Dict[str, Any]) -> float:
+    """
+    Computes a normalized composite directional score in [-1.0, +1.0]
+    from multi-source technical and market microstructure signals:
+    - NSF Trend label & MACD / RSI
+    - Market Signal PCR & GEX
+    - FII F&O bias
+    """
+    scores = []
+
+    # 1. NSF Trend Label
+    trend = str(context.get("trend_label") or "").upper()
+    if "STRONG BULLISH" in trend:
+        scores.append(0.8)
+    elif "BULLISH" in trend:
+        scores.append(0.4)
+    elif "STRONG BEARISH" in trend:
+        scores.append(-0.8)
+    elif "BEARISH" in trend:
+        scores.append(-0.4)
+    elif trend:
+        scores.append(0.0)
+
+    # 2. RSI 14
+    rsi = context.get("rsi_14")
+    if rsi is not None:
+        try:
+            r_val = float(rsi)
+            if r_val >= 65:
+                scores.append(0.6)
+            elif r_val <= 35:
+                scores.append(-0.6)
+            elif r_val >= 55:
+                scores.append(0.2)
+            elif r_val <= 45:
+                scores.append(-0.2)
+            else:
+                scores.append(0.0)
+        except (ValueError, TypeError):
+            pass
+
+    # 3. PCR
+    pcr = context.get("pcr")
+    if pcr is not None:
+        try:
+            p_val = float(pcr)
+            if p_val >= 1.3:
+                scores.append(0.6)
+            elif p_val <= 0.7:
+                scores.append(-0.6)
+            elif p_val >= 1.1:
+                scores.append(0.2)
+            elif p_val <= 0.9:
+                scores.append(-0.2)
+            else:
+                scores.append(0.0)
+        except (ValueError, TypeError):
+            pass
+
+    # 4. FII Flow Bias
+    fii = context.get("fii_flow") or {}
+    fno_bias = str(fii.get("fno_bias") or "").upper()
+    if "BULLISH" in fno_bias:
+        scores.append(0.5)
+    elif "BEARISH" in fno_bias:
+        scores.append(-0.5)
+
+    if not scores:
+        return 0.0
+    return round(sum(scores) / len(scores), 3)
+
+
 def build_strike_selection_prompt(
     reference_ltp: float,
     context: Dict[str, Any],
@@ -208,6 +288,9 @@ def build_strike_selection_prompt(
     static_call: int
 ) -> Tuple[str, str]:
     """Construct the strike selection prompt for the LLM."""
+    composite_score = compute_composite_directional_score(context)
+    bias_str = "BULLISH" if composite_score >= 0.35 else "BEARISH" if composite_score <= -0.35 else "NEUTRAL"
+
     system_prompt = (
         "You are an expert quantitative NIFTY50 options strategist.\n"
         "Your objective: Select optimal Call & Put strikes for a weekly Long Strangle (+CE / +PE entered on Tuesday 9:30 AM).\n"
@@ -219,7 +302,8 @@ def build_strike_selection_prompt(
         "4. In high volatility (VIX > 16 or ATR > 160), choose wider strikes (+/- 150 to 200 pts) to reduce theta drag.\n"
         "5. In low volatility (VIX < 13 or ATR < 110), choose tighter strikes (+/- 50 to 100 pts) so delta moves into the money.\n"
         "6. If Put IV is heavily skewed (> 1.5 pt over Call IV), push Put strike 50 pts further OTM to equalize premium outlay.\n"
-        "7. Output ONLY a valid JSON object matching the schema."
+        "7. Delta Asymmetry Rule: If directional bias is BULLISH (score >= +0.35), choose asymmetric strikes with CE Delta closer to ATM (~0.40) and PE Delta further OTM (~0.28). If BEARISH (score <= -0.35), choose PE Delta closer to ATM (~-0.40) and CE Delta further OTM (~0.28). If NEUTRAL, keep symmetric Deltas (~0.33-0.35).\n"
+        "8. Output ONLY a valid JSON object matching the schema."
     )
 
     user_data = {
@@ -227,6 +311,10 @@ def build_strike_selection_prompt(
         "static_benchmark_strikes": {
             "static_put_strike": static_put,
             "static_call_strike": static_call
+        },
+        "directional_bias": {
+            "composite_score": composite_score,
+            "regime": bias_str
         },
         "volatility_and_range": {
             "india_vix": context.get("vix", 14.0),
@@ -340,7 +428,9 @@ def select_strikes(
     """
     static_put, static_call = compute_static_strikes(reference_ltp, step=STRIKE_STEP)
 
+    global _LAST_COMPOSITE_SCORE
     if force_static or not os.getenv("OPENROUTER_API_KEY"):
+        _LAST_COMPOSITE_SCORE = 0.0
         return (
             static_put,
             static_call,
@@ -352,6 +442,7 @@ def select_strikes(
 
     # 1. Ingest market context
     context = load_market_context_for_strikes(reference_ltp, sqlite_dir)
+    _LAST_COMPOSITE_SCORE = compute_composite_directional_score(context)
 
     # 2. Build prompt
     sys_p, user_p = build_strike_selection_prompt(reference_ltp, context, static_put, static_call)
