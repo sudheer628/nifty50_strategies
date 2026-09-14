@@ -52,6 +52,22 @@ FALLBACK_MODELS = [
 ]
 
 
+_LAST_COMPOSITE_SCORE = 0.0
+_LAST_DIRECTIONAL_BIAS = "NEUTRAL"
+_LAST_TARGET_CALL_DELTA = 0.35
+_LAST_TARGET_PUT_DELTA = -0.35
+
+
+def get_last_composite_score() -> float:
+    """Return the most recently computed composite directional score."""
+    return float(_LAST_COMPOSITE_SCORE)
+
+
+def get_last_directional_bias() -> str:
+    """Return the most recently computed directional bias (BULLISH/BEARISH/NEUTRAL)."""
+    return str(_LAST_DIRECTIONAL_BIAS)
+
+
 def compute_static_strikes(reference_ltp: float, step: int = 100) -> Tuple[int, int]:
     """
     Compute standard static benchmark strikes: anchor +/- step (default 100 pts).
@@ -410,12 +426,12 @@ def select_strikes(
     reference_ltp: float,
     sqlite_dir: str = DEFAULT_SQLITE_DIR,
     force_static: bool = False
-) -> Tuple[int, int, int, int, str, str]:
+) -> Tuple[int, int, int, int, str, str, float, str, float, float]:
     """
     Master strike selection entry point.
     
     Selects Call and Put strikes using AI volatility & Greeks calibration,
-    with an immediate fail-safe fallback to standard static +/- 100 anchor.
+    with an immediate fail-safe fallback to standard/asymmetric anchor rules.
     
     Args:
         reference_ltp: NIFTY spot LTP at Tuesday 9:30 AM.
@@ -424,25 +440,56 @@ def select_strikes(
         
     Returns:
         Tuple of:
-        (put_strike, call_strike, static_put_strike, static_call_strike, selection_mode, rationale)
+        (put_strike, call_strike, static_put_strike, static_call_strike,
+         selection_mode, rationale, composite_score, directional_bias,
+         target_call_delta, target_put_delta)
     """
     static_put, static_call = compute_static_strikes(reference_ltp, step=STRIKE_STEP)
+    static_anchor = int(reference_ltp / STRIKE_STEP) * STRIKE_STEP
 
-    global _LAST_COMPOSITE_SCORE
-    if force_static or not os.getenv("OPENROUTER_API_KEY"):
-        _LAST_COMPOSITE_SCORE = 0.0
-        return (
-            static_put,
-            static_call,
-            static_put,
-            static_call,
-            "STATIC_RULE" if force_static else "STATIC_FALLBACK",
-            "Selected via static anchor +/- 100 pt rule."
-        )
-
-    # 1. Ingest market context
+    # 1. Ingest market context & directional score
     context = load_market_context_for_strikes(reference_ltp, sqlite_dir)
-    _LAST_COMPOSITE_SCORE = compute_composite_directional_score(context)
+    composite_score = compute_composite_directional_score(context) if not force_static else 0.0
+
+    global _LAST_COMPOSITE_SCORE, _LAST_DIRECTIONAL_BIAS, _LAST_TARGET_CALL_DELTA, _LAST_TARGET_PUT_DELTA
+    _LAST_COMPOSITE_SCORE = composite_score
+
+    if composite_score >= 0.35:
+        directional_bias = "BULLISH"
+        default_call_delta = 0.40
+        default_put_delta = -0.28
+        asym_call = static_anchor + 50
+        asym_put = static_anchor - 150
+    elif composite_score <= -0.35:
+        directional_bias = "BEARISH"
+        default_call_delta = 0.28
+        default_put_delta = -0.40
+        asym_call = static_anchor + 150
+        asym_put = static_anchor - 50
+    else:
+        directional_bias = "NEUTRAL"
+        default_call_delta = 0.33
+        default_put_delta = -0.33
+        asym_call = static_call
+        asym_put = static_put
+
+    _LAST_DIRECTIONAL_BIAS = directional_bias
+    _LAST_TARGET_CALL_DELTA = default_call_delta
+    _LAST_TARGET_PUT_DELTA = default_put_delta
+
+    if force_static or not os.getenv("OPENROUTER_API_KEY"):
+        return (
+            asym_put if not force_static else static_put,
+            asym_call if not force_static else static_call,
+            static_put,
+            static_call,
+            "STATIC_RULE" if force_static else f"STATIC_ASYM_{directional_bias}",
+            f"Selected via static {'anchor +/- 100 pt rule' if force_static else f'directional rule ({directional_bias}, score={composite_score:+.2f})'}.",
+            composite_score,
+            directional_bias,
+            default_call_delta,
+            default_put_delta,
+        )
 
     # 2. Build prompt
     sys_p, user_p = build_strike_selection_prompt(reference_ltp, context, static_put, static_call)
@@ -457,39 +504,55 @@ def select_strikes(
             c_strike = int(parsed_json.get("call_strike", 0))
             p_strike = int(parsed_json.get("put_strike", 0))
             rationale = str(parsed_json.get("selection_rationale", "")).strip()
+            target_call_delta = float(parsed_json.get("target_call_delta") or default_call_delta)
+            target_put_delta = float(parsed_json.get("target_put_delta") or default_put_delta)
 
             # Sanity checks on AI strikes:
             # 1. Must be multiples of 50
             # 2. call_strike >= reference_ltp - 50 and put_strike <= reference_ltp + 50
             # 3. call_strike > put_strike
-            # 4. Reasonably close to spot (within +/- 400 pts)
+            # 4. Reasonably close to spot (within +/- 450 pts)
             if (
                 c_strike % 50 == 0 and p_strike % 50 == 0
                 and c_strike > p_strike
                 and abs(c_strike - reference_ltp) <= 450
                 and abs(p_strike - reference_ltp) <= 450
             ):
-                logger.info(f"AI Strike Selection Approved [{used_model}]: Call={c_strike}, Put={p_strike}")
+                logger.info(
+                    f"AI Strike Selection Approved [{used_model}]: Call={c_strike} (Delta={target_call_delta}), "
+                    f"Put={p_strike} (Delta={target_put_delta}) | Bias={directional_bias} ({composite_score:+.2f})"
+                )
                 return (
                     p_strike,
                     c_strike,
                     static_put,
                     static_call,
                     f"AI_{used_model.split('/')[-1]}",
-                    rationale or f"Selected via AI model {used_model} based on VIX & Greeks."
+                    rationale or f"Selected via AI model {used_model} based on VIX, Greeks, and {directional_bias} bias.",
+                    composite_score,
+                    directional_bias,
+                    target_call_delta,
+                    target_put_delta,
                 )
             else:
-                logger.warning(f"AI returned invalid strikes: Call={c_strike}, Put={p_strike}. Reverting to static fallback.")
+                logger.warning(f"AI returned invalid strikes: Call={c_strike}, Put={p_strike}. Reverting to directional fallback.")
         except Exception as e:
             logger.warning(f"Failed to parse AI strike selection output: {e}")
 
-    # Fallback to static rule
-    logger.info(f"Using Fail-Safe Static Fallback Strikes: Call={static_call}, Put={static_put}")
+    # Fallback to directional asymmetric rule
+    logger.info(
+        f"Using Directional Asymmetric Fallback Strikes: Call={asym_call}, Put={asym_put} "
+        f"(Benchmark: {static_call}/{static_put}, Bias={directional_bias})"
+    )
     return (
+        asym_put,
+        asym_call,
         static_put,
         static_call,
-        static_put,
-        static_call,
-        "STATIC_FALLBACK",
-        f"Fallback to static anchor +/- {STRIKE_STEP} pt rule due to API timeout or invalid strike response."
+        f"ASYM_FALLBACK_{directional_bias}",
+        f"Fallback to directional asymmetric rule ({directional_bias}, score={composite_score:+.2f}) due to API delay.",
+        composite_score,
+        directional_bias,
+        default_call_delta,
+        default_put_delta,
     )

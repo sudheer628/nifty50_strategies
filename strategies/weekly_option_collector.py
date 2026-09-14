@@ -58,6 +58,8 @@ from common.ai_strike_selector import (
     get_last_composite_score,
 )
 
+from common.entry_gate import evaluate_entry_gate
+
 from common.angelone_client import (
     get_nifty_spot,
     get_nifty_option_chain,
@@ -304,15 +306,49 @@ def collect_once(force_static: bool = False) -> bool:
             active_cycle["week_start_date"], put_strike, call_strike, selection_mode
         )
     else:
+        # Smart Entry Gate (Eliminating the blind 09:31 AM IV crush trap)
+        if is_first_run_of_week:
+            gate_res = evaluate_entry_gate(
+                reference_ltp=nifty_ltp,
+                sqlite_dir=SQLITE_DIR,
+                force=force_static
+            )
+            if not gate_res.should_enter:
+                logger.info("=" * 60)
+                logger.info("  [SMART ENTRY GATE DEFERRED] Status: %s", gate_res.status)
+                logger.info("  Reason: %s", gate_res.defer_reason)
+                logger.info(
+                    "  Metrics: IV Slope=%s | VWAP Dist=%s%% | ADX=%s | Range=%s pts",
+                    f"{gate_res.iv_slope:+.2f}" if gate_res.iv_slope is not None else "N/A",
+                    f"{gate_res.vwap_distance:+.3f}" if gate_res.vwap_distance is not None else "N/A",
+                    f"{gate_res.adx_14:.1f}" if gate_res.adx_14 is not None else "N/A",
+                    f"{gate_res.opening_range:.1f}" if gate_res.opening_range is not None else "N/A"
+                )
+                logger.info("  Holding execution until next scheduled collection tick (10:01 / 10:31 IST).")
+                logger.info("=" * 60)
+                return True
+
         # Dynamic AI strike selector (with fail-safe static anchor +/- 100 fallback)
-        put_strike, call_strike, static_put_strike, static_call_strike, selection_mode, selection_rationale = select_strikes(
+        (
+            put_strike,
+            call_strike,
+            static_put_strike,
+            static_call_strike,
+            selection_mode,
+            selection_rationale,
+            composite_score,
+            directional_bias,
+            target_call_delta,
+            target_put_delta,
+        ) = select_strikes(
             reference_ltp=nifty_ltp,
             sqlite_dir=SQLITE_DIR,
             force_static=force_static
         )
         logger.info(
-            "Selected strikes from LTP %.2f [%s]: PUT=%d  CALL=%d (Static Benchmark: PUT=%d CALL=%d)",
-            nifty_ltp, selection_mode, put_strike, call_strike, static_put_strike, static_call_strike
+            "Selected strikes from LTP %.2f [%s]: PUT=%d (Delta=%.2f)  CALL=%d (Delta=%.2f) | Bias=%s (Score=%.2f) (Static Benchmark: PUT=%d CALL=%d)",
+            nifty_ltp, selection_mode, put_strike, target_put_delta, call_strike, target_call_delta,
+            directional_bias, composite_score, static_put_strike, static_call_strike
         )
 
     option_data = get_nifty_option_chain(
@@ -376,13 +412,18 @@ def collect_once(force_static: bool = False) -> bool:
                 "static_put_strike": static_put_strike,
                 "selection_mode": selection_mode,
                 "selection_rationale": selection_rationale,
+                "composite_direction_score": composite_score if 'composite_score' in locals() else get_last_composite_score(),
+                "directional_bias": directional_bias if 'directional_bias' in locals() else "NEUTRAL",
+                "target_call_delta": target_call_delta if 'target_call_delta' in locals() else 0.35,
+                "target_put_delta": target_put_delta if 'target_put_delta' in locals() else -0.35,
+                "smart_gate": gate_res.to_dict() if 'gate_res' in locals() else {},
                 "alpha_fsm": init_fsm_state(
                     call_strike=call_strike,
                     put_strike=put_strike,
                     call_buy_price=call_buy_price,
                     put_buy_price=put_buy_price,
                     entry_ts=_now_utc_ts(),
-                    composite_score=get_last_composite_score(),
+                    composite_score=composite_score if 'composite_score' in locals() else get_last_composite_score(),
                 ),
             }
 

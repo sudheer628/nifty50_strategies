@@ -206,6 +206,26 @@ def init_db(db_path: str) -> None:
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS gamma_sniper_trades (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_timestamp     INTEGER NOT NULL,
+            expiry_date         TEXT    NOT NULL,
+            nifty_spot          REAL    NOT NULL,
+            option_type         TEXT    NOT NULL,
+            strike              INTEGER NOT NULL,
+            entry_price         REAL    NOT NULL,
+            exit_price          REAL,
+            exit_timestamp      INTEGER,
+            pnl_points          REAL,
+            pnl_pct             REAL,
+            pnl_inr             REAL,
+            exit_reason         TEXT,
+            allocated_risk_inr  REAL,
+            status              TEXT    NOT NULL
+        )
+    """)
+
     # Migrate buy snapshot table if columns are missing
     cur.execute("PRAGMA table_info(strategy_buy_snapshots)")
     snapshot_cols = {row[1] for row in cur.fetchall()}
@@ -214,6 +234,10 @@ def init_db(db_path: str) -> None:
         ("static_put_strike", "INTEGER"),
         ("selection_mode", "TEXT"),
         ("selection_rationale", "TEXT"),
+        ("composite_direction_score", "REAL"),
+        ("directional_bias", "TEXT"),
+        ("target_call_delta", "REAL"),
+        ("target_put_delta", "REAL"),
     ]:
         if col_name not in snapshot_cols:
             cur.execute(f"ALTER TABLE strategy_buy_snapshots ADD COLUMN {col_name} {col_type}")
@@ -221,6 +245,40 @@ def init_db(db_path: str) -> None:
     conn.commit()
     conn.close()
     logger.info("Database initialised: %s", db_path)
+
+
+def insert_gamma_sniper_trade(db_path: str, trade: dict) -> None:
+    """Insert a Monday Gamma Sniper trade record into the database."""
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(gamma_sniper_trades)")
+    cols = {row[1] for row in cur.fetchall()}
+    ins = {k: v for k, v in trade.items() if k in cols}
+    col_names = ", ".join(ins.keys())
+    placeholders = ", ".join("?" for _ in ins)
+    cur.execute(
+        f"INSERT INTO gamma_sniper_trades ({col_names}) VALUES ({placeholders})",
+        tuple(ins.values())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_gamma_sniper_trades(db_path: str) -> list:
+    """Retrieve all gamma sniper trade records from a weekly database."""
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM gamma_sniper_trades ORDER BY trade_timestamp ASC")
+        return [dict(r) for r in cur.fetchall()]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
 
 
 def insert_record(db_path: str, record: dict) -> None:
