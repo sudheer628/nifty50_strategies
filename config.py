@@ -45,7 +45,7 @@ STRIKE_STEP = 100                 # 100-point strike grid
 COLLECTION_START_HOUR = 9         # 9:30 AM IST is the first collection
 COLLECTION_START_MINUTE = 30
 COLLECTION_INTERVAL_MINUTES = 60  # Hourly after start
-NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))  # Default Nifty contract lot size
+NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))  # Default Nifty contract lot size (revised to 65 by NSE)
 
 # ---------------------------------------------------------------------------
 # MongoDB Atlas Database Configuration (Derivatives & Predictions)
