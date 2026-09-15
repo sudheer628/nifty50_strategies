@@ -474,3 +474,17 @@ python scripts/sync_to_mongodb.py --status
 # Sync latest weekly strategy DB
 python scripts/sync_to_mongodb.py
 ```
+
+---
+
+## 16. External API Services Utilized
+
+This project interacts with external brokerage, AI, database, and email services:
+
+| Service | Category | Purpose / Where Used | Auth / Environment Variables | Quota / Billing Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Angel One SmartAPI** | Brokerage & Market Data | • `common/angelone_client.py` (NIFTY spot LTP, daily option scrip master, CALL/PUT quotes) | `ANGELONE_API_KEY`<br>*(Prioritizes Redis key `angelone_jwt_feed`)* | Free API access. Rate-limited. Managed at [smartapi.angelbroking.com](https://smartapi.angelbroking.com/) |
+| **OpenRouter** | LLM Gateway | • `common/ai_strike_selector.py` (Dynamic Tuesday strike optimization via DeepSeek/Claude) | `OPENROUTER_API_KEY`<br>*(Reads model list from Redis `finance_llm_models`)* | Prepaid USD credit. Low volume (1 call/week on Tuesday morning). Managed at [openrouter.ai/credits](https://openrouter.ai/credits) |
+| **MongoDB Atlas** | Cloud NoSQL DB | • `scripts/sync_to_mongodb.py` (Persists weekly dossiers in `derivative_strategies` & `derivative_master`) | `MONGODB_URI` | Free M0 cluster (512MB storage). Managed at [cloud.mongodb.com](https://cloud.mongodb.com/) |
+| **Gmail SMTP** | Email Notifications | • `scripts/send_weekly_report.py` (Dispatches Monday weekly performance reports & charts) | `EMAIL_SENDER`, `EMAIL_APP_PASSWORD`<br>`EMAIL_SMTP_SERVER`, `EMAIL_SMTP_PORT` | Daily sending limit (500/day). |
+
