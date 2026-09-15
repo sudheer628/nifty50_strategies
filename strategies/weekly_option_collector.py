@@ -17,10 +17,14 @@ Usage (cron):
     30 4-10 * * 1-5 cd /path/to/nifty50_strategies && python strategies/weekly_option_collector.py
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import sys
 from datetime import datetime, date, time, timedelta
+from typing import Optional, Dict, Any, List, Tuple
+
 
 # Ensure the project root directory is on the Python import path so that
 # ``config`` and ``common.*`` can be imported when the script is invoked
