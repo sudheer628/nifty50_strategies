@@ -18,20 +18,21 @@ This strategy:
 
 ### In scope
 
-- Data collection only
-- One strategy implementation
-- Weekly expiry-based data collection
-- Price collection every 30 minutes from 10:00 AM onward
-- Common data source via Angel One SmartAPI
-- Persistent storage in SQLite for analysis and later strategy review
+- Automated weekly option data collection (NIFTY50 spot + option chains)
+- Tuesday dynamic AI strike selection and static benchmark tracking
+- Price collection every 30 minutes from 09:31 AM to 15:31 PM IST
+- Smart Entry Gate timing (volatility, momentum, and technical filters with counterfactual shadow logging)
+- Decoupled FSM Strategy Engine (trailing stop ladders, profit harvest, salvage stops)
+- Monday Gamma Sniper (intraday simulated scalping with targets, SL, and time-stops)
+- Common data source via Angel One SmartAPI with Redis JWT auth
+- Persistent storage in SQLite (per-cycle DBs) and MongoDB Atlas synchronization
+- Automated post-market weekly close orchestration and HTML/chart reporting
 
 ### Out of scope
 
-- Order placement
-- Trade execution
-- Risk management
-- Live portfolio updates
-- Cross-strategy dependencies
+- Real-money order placement to broker (all execution is simulated / paper / shadow)
+- Real-time order execution engine for external brokerage accounts
+- Live broker margin / funds management
 
 ---
 
@@ -39,7 +40,7 @@ This strategy:
 
 ```
 nifty50_strategies/
-├── .env.example                         # Template for credentials
+├── .env.example                         # Template for credentials & config
 ├── .gitignore
 ├── requirements.txt                     # Runtime dependencies
 ├── config.py                            # Central config, Redis factory, constants
@@ -48,28 +49,49 @@ nifty50_strategies/
 │   ├── angelone_client.py               # SmartAPI auth + market data fetchers
 │   ├── expiry.py                        # Expiry resolution + static strike selector
 │   ├── ai_strike_selector.py            # Dynamic AI strike selector (VIX, ATR, Greeks)
-│   └── storage.py                       # SQLite persistence + JSON snapshot
+│   ├── calendar_utils.py                # Holiday detection via Upstox API & cycle calendar
+│   ├── entry_gate.py                    # Smart Entry Gate (deferral & shadow logging)
+│   ├── fsm_strategy.py                  # Decoupled FSM (harvest, trailing stop, salvage)
+│   └── storage.py                       # SQLite persistence, JSON snapshot & migrations
 ├── strategies/
 │   ├── __init__.py
-│   └── weekly_option_collector.py       # Main strategy entry point
+│   ├── weekly_option_collector.py       # Main strategy entry point (runs :01 & :31)
+│   └── monday_gamma_sniper.py           # Monday afternoon gamma scalper (runs every 10m)
 ├── scripts/
-│   ├── send_weekly_report.py            # Monday HTML email + chart
-│   └── compare_ai_vs_static_benchmark.py # Retrospective side-by-side P&L comparison
+│   ├── run_weekly_close.py              # Unified weekly close orchestrator (runs Mon 15:37)
+│   ├── send_weekly_report.py            # Monday HTML email + chart generator
+│   ├── compare_ai_vs_static_benchmark.py # Retrospective side-by-side P&L comparison
+│   └── sync_to_mongodb.py               # MongoDB Atlas derivatives synchronization CLI
+├── tests/                               # 38 automated pytest unit tests
+│   ├── test_angelone_resolution.py
+│   ├── test_calendar_utils.py
+│   ├── test_entry_gate.py
+│   ├── test_fsm_strategy.py
+│   ├── test_gamma_sniper.py
+│   ├── test_storage.py
+│   ├── test_weekly_collector.py
+│   └── test_weekly_report.py
 └── cron/
-    └── nifty50_weekly_report.cron       # Monday EOD report schedule
+    └── nifty50_weekly_report.cron       # Legacy reference (orchestrated by run_weekly_close)
 ```
 
 ### Module descriptions
 
 | Module | Purpose |
 |---|---|
-| `config.py` | Loads `.env`, Redis client factory, constants (strike step=100, NIFTY token, Angel One base URL, storage paths) |
+| `config.py` | Loads `.env`, Redis client factory, constants (strike step=100, lot size=65, NIFTY token, Angel One base URL, storage paths) |
 | `common/angelone_client.py` | JWT auth from Redis `angelone_jwt_feed`, NIFTY spot LTP, daily instrument-master option lookup, and `get_nifty_option_chain()` for CALL+PUT LTPs |
-| `common/expiry.py` | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()` |
-| `common/ai_strike_selector.py` | Tuesday 9:30 AM AI Strike Selector: optimizes strikes based on VIX, ATR, Greeks ($\Delta \approx 0.35$), and IV skew via OpenRouter with static fallback |
-| `common/storage.py` | `build_db_path()`, `init_db()`, `insert_record()`, `insert_buy_snapshot()`, `save_active_snapshot()`, `load_active_snapshot()`, `generate_cycle_id()` |
-| `strategies/weekly_option_collector.py` | Cron-invoked collector: one cycle per invocation, Tuesday buy-price capture, SQLite + JSON persistence |
+| `common/expiry.py` | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()` (static 100-pt grid) |
+| `common/ai_strike_selector.py` | Tuesday 9:30 AM AI Strike Selector: optimizes strikes on standard 50-pt grid using VIX, ATR, Greeks ($\Delta \approx 0.35$), and IV skew via OpenRouter with asymmetric technical fallback |
+| `common/calendar_utils.py` | NSE holiday calendar resolution via Upstox API with in-process caching, strategy start/closing day detection, and Monday-holiday deferred close handling |
+| `common/entry_gate.py` | Smart Entry Gate: checks trend, ATR, and momentum filters at Tuesday 09:31 AM open to gate entry; writes counterfactual shadow records on deferral |
+| `common/fsm_strategy.py` | Decoupled Finite State Machine trade manager: tracks trailing stop ladders by days-to-expiry, harvest rules (+50% leg profit), and capital salvage stop rules |
+| `common/storage.py` | SQLite persistence layer: `init_db()`, auto-migrations for integer timestamps and FSM columns, trade updating, and active/archive JSON snapshot management |
+| `strategies/weekly_option_collector.py` | Cron-invoked collector (:01 & :31): handles Tuesday cycle initialization, Smart Gate evaluation, option LTP capture, FSM state updates, and counterfactual logging |
+| `strategies/monday_gamma_sniper.py` | Monday afternoon gamma scalper (13:15–15:00 IST): evaluates 5-min VWAP and volume surges ($\ge 1.5\times$) with target (+75%), stop-loss (-35%), and 15:10 IST time-stop |
+| `scripts/run_weekly_close.py` | Unified weekly orchestrator (Mon 15:37 IST / Tue 09:07 deferred): closes active cycle upfront, runs report email, benchmark scoring, SQLite merge, and skill generation |
 | `scripts/compare_ai_vs_static_benchmark.py` | Reconstructs static $\pm 100$ strike LTPs from `signals_data_*.db` `option_chain_surface` to compute side-by-side outperformance delta vs AI strategy |
+| `scripts/sync_to_mongodb.py` | CLI tool to push weekly strategy dossiers (`derivative_strategies`) and recompute the living KPI rollup (`derivative_master`) in MongoDB Atlas |
 
 ---
 
@@ -85,8 +107,8 @@ The original plan (section 4.4) proposed a "double collection" model where the o
 
 ### 4.2 Collection schedule
 
-- Every Tuesday at 9:30 AM IST, a fresh weekly cycle begins targeting the **next** weekly expiry.
-- Data is collected every 30 minutes from 10:00 AM to 3:30 PM IST, Tuesday through Monday.
+- Every Tuesday at 09:31 AM IST, a fresh weekly cycle begins targeting the **next** weekly expiry.
+- Data is collected every 30 minutes from 09:31 AM to 15:31 PM IST, Tuesday through Monday.
 - The cycle ends on Monday; the next Tuesday starts a new cycle.
 
 ### 4.3 Example: Aug 4 through Aug 11
@@ -99,7 +121,7 @@ The original plan (section 4.4) proposed a "double collection" model where the o
 
 ### 4.4 Mid-Tuesday start (Scenario 1)
 
-If the script is started mid-Tuesday (missing the 9:30 AM trigger) with **no** pre-existing `current_week_buy.json`:
+If the script is started mid-Tuesday (missing the 9:31 AM trigger) with **no** pre-existing `current_week_buy.json`:
 
 - The code creates the snapshot automatically using the current option LTPs as buy prices.
 - No manual intervention is required — the script handles it gracefully.
@@ -107,13 +129,13 @@ If the script is started mid-Tuesday (missing the 9:30 AM trigger) with **no** p
 
 ### 4.5 Manual snapshot (Scenario 2)
 
-If `current_week_buy.json` is manually created with correct Tuesday 9:30 AM
+If `current_week_buy.json` is manually created with correct Tuesday 9:31 AM
 prices before the script runs:
 
 - The code detects that the snapshot covers the currently active Tuesday-Monday cycle.
 - It reuses that snapshot's expiry, CALL/PUT strikes, and buy prices instead of
   recalculating them from later daily opens.
-- This is useful when the first few triggers are missed and accurate 9:30 AM prices are known.
+- This is useful when the first few triggers are missed and accurate 9:31 AM prices are known.
 
 For a mid-cycle start on Monday 10 Aug 2026, with the cycle that began Tuesday
 4 Aug and expires Tuesday 11 Aug, the manual snapshot is:
@@ -134,10 +156,10 @@ For a mid-cycle start on Monday 10 Aug 2026, with the cycle that began Tuesday
 
 ### 4.6 Dynamic AI Strike Selection & Retrospective Benchmark (September 2026+)
 
-On Tuesday at 09:30 AM IST, `weekly_option_collector.py` invokes [`common/ai_strike_selector.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/ai_strike_selector.py):
+On Tuesday at 09:31 AM IST, `weekly_option_collector.py` invokes [`common/ai_strike_selector.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/ai_strike_selector.py):
 1. **Dynamic Greeks & Volatility Ingestion**: Ingests live India VIX, ATR(14) daily range, Bollinger Band Width %, and option chain Greeks ($\Delta \approx 0.35, \Theta, \text{IV Skew}$) from SQLite.
-2. **AI Strike Calibration**: Queries OpenRouter LLMs via Redis `finance_llm_models` to select volatility-adaptive strikes (e.g. widening in high VIX, balancing Put IV skew).
-3. **Fail-Safe Fallback**: If OpenRouter times out (>5s) or returns invalid output, it automatically reverts to the standard static `anchor +/- 100` rule.
+2. **AI Strike Calibration**: Queries OpenRouter LLMs via Redis `finance_llm_models` to select volatility-adaptive strikes on a standard 50-point NIFTY strike grid (e.g. widening in high VIX, balancing Put IV skew).
+3. **Fail-Safe Fallback**: If OpenRouter times out (>5s) or returns invalid output, the system falls back to the deterministic **directional asymmetric rule** (`ASYM_FALLBACK_{bias}`: Bullish $\rightarrow$ +50 CE / -150 PE, Bearish $\rightarrow$ +150 CE / -50 PE, Neutral $\rightarrow$ +100 CE / -100 PE). The symmetric static $\pm 100$ strike benchmark is applied only if `--force-static` is specified or when no `OPENROUTER_API_KEY` is present.
 4. **Snapshot Persistence**: Saves both the AI strikes and the static benchmark strikes in `current_week_buy.json`:
    ```json
    {
@@ -153,6 +175,10 @@ On Tuesday at 09:30 AM IST, `weekly_option_collector.py` invokes [`common/ai_str
      "captured_at": 1788244200,
      "static_call_strike": 24600,
      "static_put_strike": 24400,
+     "composite_direction_score": 0.42,
+     "directional_bias": "BULLISH",
+     "target_call_delta": 0.35,
+     "target_put_delta": -0.30,
      "selection_mode": "AI_deepseek-v4-pro",
      "selection_rationale": "VIX at 15.4 with ATR 160; selected +100 CE / -150 PE due to elevated Put IV skew."
    }
@@ -169,26 +195,26 @@ On Tuesday at 09:30 AM IST, `weekly_option_collector.py` invokes [`common/ai_str
 ```
                     WEEKLY LIFECYCLE WITH HOLIDAY RESOLUTION
                     
-  Strategy Start Day     nifty50_strategies picks AI Strikes & enters Strangle
+  Strategy Start Day     nifty50_strategies evaluates Smart Gate & selects AI Strikes
   (Tue 09:31 IST,        • Captures buy prices into current_week_buy.json (status: ongoing)
   or Wed if Tue Hol):    • Evaluated 3 mins later at 09:34 IST by sentinel-hermes
                                           │
                                           ▼
-  Market Trading Days    • Collector (:01 & :31) saves option LTPs to SQLite
-  (Every 30 mins):       • Inference runner (:04 & :34) evaluates P&L and Greeks
+  Market Trading Days    • Collector (:01 & :31) saves option LTPs & updates FSM states
+  (Every 30 mins):       • Inference runner (:04 & :34) evaluates P&L, stops & Greeks
                          • Skips automatically on exchange holidays
                                           │
                                           ▼
   Strategy Closing Day   nifty50_strategies scripts/run_weekly_close.py orchestrates:
-  (Mondays):             1. send_weekly_report.py (PDF & Email weekly report)
-  • Normal Monday:       2. compare_ai_vs_static_benchmark.py (AI vs Static comparison)
-    15:37 IST (10:07 UTC) 3. sentinel-hermes/run_weekly_merge.sh (rebuilds merged SQLite)
-  • Holiday Monday:      4. sentinel-hermes/skill_generator.py (synthesizes skill & Mongo sync)
-    08:45 IST (03:15 UTC)5. Updates current_week_buy.json status: "closed"
+  • Normal Monday:       1. Marks active cycle status: "closed" upfront
+    15:37 IST (10:07 UTC)2. send_weekly_report.py (HTML email & chart report)
+  • Monday Holiday:      3. compare_ai_vs_static_benchmark.py (AI vs Static scoring)
+    Deferred to Tuesday  4. sentinel-hermes/run_weekly_merge.sh (builds merged SQLite)
+    09:07 IST (03:37 UTC)5. sentinel-hermes/skill_generator.py (synthesizes skill & Mongo sync)
                                           │
                                           ▼
-  Dynamic Injection:     inference_runner.py automatically reads the new skill
-                         on the next cycle start, continuously compounding rules!
+  Dynamic Injection:     inference_runner.py automatically reads the newly synthesized
+                         skill on cycle start, continuously compounding learned rules!
 ```
 
 ---
@@ -212,9 +238,10 @@ For each 30-minute interval, the strategy collects:
 
 ### 6.1 Strike grid
 
-100-point strike increments (not 50-point).
+- **AI Strike Selection Mode**: Operates on the standard **50-point NIFTY strike grid** (`ai_strike_selector.py` prompt rule 1), allowing precise Delta centering ($\Delta \approx 0.35$) and IV skew balancing.
+- **Static Benchmark / Fallback Mode**: Uses **100-point strike increments** (`STRIKE_STEP = 100` in `config.py` and `expiry.py`) for the deterministic $\pm 100$ anchor comparison.
 
-### 6.2 Algorithm
+### 6.2 Static Algorithm (Benchmark & Fallback)
 
 ```python
 anchor = floor(first_trigger_ltp / 100) * 100
@@ -224,7 +251,9 @@ call_strike = anchor + 100  # one step above
 
 ### 6.3 Example
 
-First-trigger LTP = 25000 → PUT = 24900, CALL = 25100.
+First-trigger LTP = 25000:
+- Static benchmark: PUT = 24900, CALL = 25100.
+- AI selection (e.g. bullish tilt with high put IV skew): PUT = 24850, CALL = 25150.
 
 ---
 
@@ -276,23 +305,75 @@ Follows the same pattern as the existing `news-analyzer-for-market-sentiment` pr
 | `call_ltp`             | REAL    | CALL option LTP                                       |
 | `call_buy_price`       | REAL    | Tuesday CALL buy price (carried through week)         |
 | `put_buy_price`        | REAL    | Tuesday PUT buy price (carried through week)          |
-| `gainloss`             | REAL    | `(current CALL - CALL buy) + (current PUT - PUT buy)` |
+| `gainloss`             | REAL    | Combined benchmark P&L: `(CALL - buy) + (PUT - buy)`  |
+| `fsm_state`            | TEXT    | FSM state: `ACTIVE`, `CALL_HARVESTED`, `CLOSED`, etc.  |
+| `fsm_call_status`      | TEXT    | CALL leg state: `ACTIVE`, `HARVESTED`, `STOPPED`      |
+| `fsm_put_status`       | TEXT    | PUT leg state: `ACTIVE`, `HARVESTED`, `STOPPED`       |
+| `fsm_call_exit_price`  | REAL    | Locked exit LTP for CALL leg (NULL if active)         |
+| `fsm_put_exit_price`   | REAL    | Locked exit LTP for PUT leg (NULL if active)          |
+| `fsm_realized_pnl`     | REAL    | Realized profit points locked from closed legs        |
+| `fsm_unrealized_pnl`   | REAL    | Floating mark-to-market profit points on active legs  |
+| `fsm_total_gainloss`   | REAL    | Net strategy P&L points: realized + unrealized        |
 | `source`               | TEXT    | Always `"angelone"`                                   |
 | `cycle_id`             | TEXT    | Unique cycle identifier                               |
 
 ### 9.2 Buy snapshot table (`strategy_buy_snapshots`)
 
-| Column            | Type    | Description                               |
-| ----------------- | ------- | ----------------------------------------- |
-| `strategy_name`   | TEXT    | Strategy identifier                       |
-| `cycle_id`        | TEXT    | Unique cycle identifier                   |
-| `week_start_date` | TEXT    | Tuesday date in `YYYYMMDD`                |
-| `expiry_date`     | TEXT    | Expiry date in `YYYYMMDD`                 |
-| `call_strike`     | INTEGER | CALL strike                               |
-| `put_strike`      | INTEGER | PUT strike                                |
-| `call_buy_price`  | REAL    | CALL buy price at capture                 |
-| `put_buy_price`   | REAL    | PUT buy price at capture                  |
-| `captured_at`     | INTEGER | Unix timestamp (seconds since epoch, UTC) |
+| Column                      | Type    | Description                                       |
+| --------------------------- | ------- | ------------------------------------------------- |
+| `strategy_name`             | TEXT    | Strategy identifier                               |
+| `cycle_id`                  | TEXT    | Unique cycle identifier                           |
+| `week_start_date`           | TEXT    | Tuesday date in `YYYYMMDD`                        |
+| `expiry_date`               | TEXT    | Expiry date in `YYYYMMDD`                         |
+| `call_strike`               | INTEGER | CALL strike                                       |
+| `put_strike`                | INTEGER | PUT strike                                        |
+| `call_buy_price`            | REAL    | CALL buy price at capture                         |
+| `put_buy_price`             | REAL    | PUT buy price at capture                          |
+| `captured_at`               | INTEGER | Unix timestamp (seconds since epoch, UTC)         |
+| `composite_direction_score` | REAL    | Directional score from technical/macro indicators |
+| `directional_bias`          | TEXT    | Directional classification: BULLISH, BEARISH, etc.|
+| `target_call_delta`         | REAL    | Target Call Delta calibrated at entry (~0.35)     |
+| `target_put_delta`          | REAL    | Target Put Delta calibrated at entry (~-0.35)    |
+
+### 9.3 Monday Gamma Sniper trades (`gamma_sniper_trades` table)
+
+| Column               | Type    | Description                                             |
+| -------------------- | ------- | ------------------------------------------------------- |
+| `id`                 | INTEGER | Primary key                                             |
+| `trade_timestamp`    | INTEGER | Entry Unix timestamp (seconds since epoch, UTC)         |
+| `expiry_date`        | TEXT    | Expiry date in `YYYYMMDD`                               |
+| `nifty_spot`         | REAL    | NIFTY spot LTP at execution                             |
+| `option_type`        | TEXT    | `CE` or `PE`                                            |
+| `strike`             | INTEGER | Scalp strike price                                      |
+| `entry_price`        | REAL    | Entry option premium LTP                                |
+| `exit_price`         | REAL    | Exit option premium LTP (NULL if open)                  |
+| `exit_timestamp`     | INTEGER | Exit Unix timestamp (NULL if open)                      |
+| `pnl_points`         | REAL    | P&L points per share: `exit_price - entry_price`        |
+| `pnl_pct`            | REAL    | P&L percentage gain/loss                                |
+| `pnl_inr`            | REAL    | Net INR gain/loss: `pnl_points * lot_size`              |
+| `exit_reason`        | TEXT    | Reason: `TARGET_HIT (+75%)`, `STOP_LOSS_HIT (-35%)`, etc|
+| `allocated_risk_inr` | REAL    | House money allocated for trade risk                    |
+| `status`             | TEXT    | Trade status: `OPEN` or `CLOSED`                        |
+
+### 9.4 Smart Gate deferred counterfactuals (`gate_deferred_shadows` table)
+
+| Column                      | Type    | Description                                             |
+| --------------------------- | ------- | ------------------------------------------------------- |
+| `id`                        | INTEGER | Primary key                                             |
+| `collection_timestamp`      | INTEGER | Trigger Unix timestamp (seconds since epoch, UTC)       |
+| `expiry_date`               | TEXT    | Expiry date in `YYYYMMDD`                               |
+| `nifty_ltp`                 | REAL    | NIFTY spot LTP at evaluation                            |
+| `hypothetical_call_strike`  | INTEGER | AI-recommended CALL strike had entry proceeded          |
+| `hypothetical_put_strike`   | INTEGER | AI-recommended PUT strike had entry proceeded           |
+| `call_ltp`                  | REAL    | Live market CALL LTP at evaluation                      |
+| `put_ltp`                   | REAL    | Live market PUT LTP at evaluation                       |
+| `gate_score`                | REAL    | Smart Gate composite evaluation score                   |
+| `gate_reason`               | TEXT    | Deferral rationale (e.g. high ATR expansion)            |
+| `composite_direction_score` | REAL    | Directional score                                       |
+| `directional_bias`          | TEXT    | Bias classification                                     |
+| `target_call_delta`         | REAL    | Target Call Delta                                       |
+| `target_put_delta`          | REAL    | Target Put Delta                                        |
+
 
 ---
 
@@ -375,6 +456,8 @@ cp .env.example .env
 
 ### Running
 
+#### 1. Weekly Option Collector (`strategies/weekly_option_collector.py`)
+
 ```bash
 # Manual single collection
 python strategies/weekly_option_collector.py
@@ -385,11 +468,65 @@ python strategies/weekly_option_collector.py --dry-run
 # Force run outside market hours
 python strategies/weekly_option_collector.py --force
 
-# Cron: Staggered to :01 & :31 past every hour (09:31-15:31 IST = 04:01-10:01 UTC)
+# Force static +/-100 benchmark strikes (bypasses OpenRouter AI selector)
+python strategies/weekly_option_collector.py --force-static
+
+# Force immediate strangle entry (bypasses Smart Entry Gate deferral)
+python strategies/weekly_option_collector.py --force-entry
+```
+
+#### 2. Monday Gamma Sniper (`strategies/monday_gamma_sniper.py`)
+
+```bash
+# Check status and eligibility without trading
+python strategies/monday_gamma_sniper.py --check
+
+# Dry-run evaluation (simulated prices)
+python strategies/monday_gamma_sniper.py --dry-run
+
+# Force execution (bypasses time window and zero-house-money guard)
+python strategies/monday_gamma_sniper.py --force
+```
+
+#### 3. Weekly Close Orchestrator (`scripts/run_weekly_close.py`)
+
+```bash
+# Execute weekly close orchestrator (closes active cycle upfront, then steps 1-4)
+python scripts/run_weekly_close.py
+
+# Dry-run orchestrator (validates steps without closing cycle or modifying DBs)
+python scripts/run_weekly_close.py --dry-run
+
+# Force close outside scheduled closing window
+python scripts/run_weekly_close.py --force
+
+# Target specific cycle by start date
+python scripts/run_weekly_close.py --date 20260908
+```
+
+> [!NOTE]
+> `run_weekly_close.py` steps 3 & 4 invoke `sentinel-hermes/run_weekly_merge.sh` and `sentinel-hermes/skill_generator.py`. This requires `sentinel-hermes` to exist as a sibling checkout at `~/sentinel-hermes` or the `SENTINEL_HERMES_DIR` environment variable to be configured.
+
+### Production Crontab Entries
+
+```cron
+# Every 30 minutes during market hours (:01 and :31 past every hour from 09:31 to 15:31 IST)
 # Reason for stagger: Allows upstream collectors (market_signal_agent & nifty_signal_features)
 # to write their 5-min Greeks and technicals at :00/:30 before strategy prices are captured.
 1 4-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 31 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
+
+# Monday Afternoon Gamma Sniper (Enhancement 4 - Expiry Afternoon Scalp)
+# Runs every 10 min, 12:30–15:20 IST (07:00–09:50 UTC).
+# Script self-gates: entry window 13:15–15:00 IST, time-stop close at 15:10 IST, off-window runs are cheap no-ops.
+*/10 7-9 * * 1 cd ~/nifty50_strategies && .venv/bin/python strategies/monday_gamma_sniper.py >> /home/ubuntu/logs/gamma_sniper_$(date +\%F).log 2>&1
+
+# Post-Market Strategy Weekly Close (Runs Mondays at 10:07 UTC = 15:37 IST; skips if already closed)
+# Orchestrates: 1. send_weekly_report.py -> 2. compare_ai_vs_static_benchmark.py -> 3. run_weekly_merge.sh -> 4. skill_generator.py + MongoDB sync
+7 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
+
+# Tuesday Deferred Close (for Monday exchange holidays; runs Tuesday 09:07 IST = 03:37 UTC before cycle initiation)
+37 3 * * 2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
 ```
 
 ### Weekly Monday email report
@@ -423,16 +560,6 @@ python scripts/send_weekly_report.py
 
 The preview HTML and PNG chart are archived under
 `/home/ubuntu/sqlite/strategies/reports/` by default.
-
-Weekly Close Orchestrator cron entries:
-
-```cron
-# Monday 03:15 UTC (08:45 IST) — Early morning close IF Monday is an NSE holiday (runs before 03:23 UTC shutdown)
-15 3 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py --morning-holiday-check >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
-
-# Post-Market Strategy Weekly Close (Runs Mondays at 10:07 UTC = 15:37 IST; skips if already closed in morning)
-7 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
-```
 
 ---
 
@@ -484,7 +611,8 @@ This project interacts with external brokerage, AI, database, and email services
 | Service | Category | Purpose / Where Used | Auth / Environment Variables | Quota / Billing Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | **Angel One SmartAPI** | Brokerage & Market Data | • `common/angelone_client.py` (NIFTY spot LTP, daily option scrip master, CALL/PUT quotes) | `ANGELONE_API_KEY`<br>*(Prioritizes Redis key `angelone_jwt_feed`)* | Free API access. Rate-limited. Managed at [smartapi.angelbroking.com](https://smartapi.angelbroking.com/) |
-| **OpenRouter** | LLM Gateway | • `common/ai_strike_selector.py` (Dynamic Tuesday strike optimization via DeepSeek/Claude) | `OPENROUTER_API_KEY`<br>*(Reads model list from Redis `finance_llm_models`)* | Prepaid USD credit. Low volume (1 call/week on Tuesday morning). Managed at [openrouter.ai/credits](https://openrouter.ai/credits) |
+| **OpenRouter** | LLM Gateway | • `common/ai_strike_selector.py` (Dynamic Tuesday strike optimization via DeepSeek/Claude) | `OPENROUTER_API_KEY`<br>*(Reads model list from Redis `finance_llm_models`)* | Prepaid USD credit. Volume: ~1–4 calls/week (1 entry call + up to 3 shadow counterfactual calls). Managed at [openrouter.ai/credits](https://openrouter.ai/credits) |
+| **Upstox API** | Market Calendar | • `common/calendar_utils.py` (Fetches live NSE holiday calendar for deferred closes) | None (Public API: `api.upstox.com/v2/market/holidays`) | Free public endpoint. Cached in-process to minimize network calls. |
 | **MongoDB Atlas** | Cloud NoSQL DB | • `scripts/sync_to_mongodb.py` (Persists weekly dossiers in `derivative_strategies` & `derivative_master`) | `MONGODB_URI` | Free M0 cluster (512MB storage). Managed at [cloud.mongodb.com](https://cloud.mongodb.com/) |
 | **Gmail SMTP** | Email Notifications | • `scripts/send_weekly_report.py` (Dispatches Monday weekly performance reports & charts) | `EMAIL_SENDER`, `EMAIL_APP_PASSWORD`<br>`EMAIL_SMTP_SERVER`, `EMAIL_SMTP_PORT` | Daily sending limit (500/day). |
 

@@ -74,9 +74,9 @@ class TestCalendarUtils(unittest.TestCase):
         self.assertFalse(is_strategy_start_day(mon_holiday))
         self.assertEqual(get_strategy_cycle_role(mon_holiday), "HOLIDAY")
 
-        # Tuesday: Start day for the new cycle
+        # Tuesday: Start day for the new cycle (and deferred closing day for prior cycle)
         self.assertFalse(check_nse_holiday(tue_start))
-        self.assertFalse(is_strategy_closing_day(tue_start))
+        self.assertTrue(is_strategy_closing_day(tue_start))
         self.assertTrue(is_strategy_start_day(tue_start))
         self.assertEqual(get_strategy_cycle_role(tue_start), "START_DAY")
 

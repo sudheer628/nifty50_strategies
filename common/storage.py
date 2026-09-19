@@ -226,6 +226,42 @@ def init_db(db_path: str) -> None:
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS gate_deferred_shadows (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp                   INTEGER NOT NULL,
+            trade_date                  TEXT    NOT NULL,
+            nifty_spot                  REAL    NOT NULL,
+            gate_status                 TEXT    NOT NULL,
+            defer_reason                TEXT,
+            iv_slope                    REAL,
+            vwap_distance               REAL,
+            adx_14                      REAL,
+            opening_range               REAL,
+            hypothetical_call_strike    INTEGER NOT NULL,
+            hypothetical_put_strike     INTEGER NOT NULL,
+            hypothetical_call_ltp       REAL,
+            hypothetical_put_ltp        REAL,
+            selection_mode              TEXT,
+            composite_direction_score   REAL,
+            directional_bias            TEXT,
+            target_call_delta           REAL,
+            target_put_delta            REAL
+        )
+    """)
+
+    # Migrate gate_deferred_shadows table if columns are missing
+    cur.execute("PRAGMA table_info(gate_deferred_shadows)")
+    shadow_cols = {row[1] for row in cur.fetchall()}
+    for col_name, col_type in [
+        ("composite_direction_score", "REAL"),
+        ("directional_bias", "TEXT"),
+        ("target_call_delta", "REAL"),
+        ("target_put_delta", "REAL"),
+    ]:
+        if col_name not in shadow_cols:
+            cur.execute(f"ALTER TABLE gate_deferred_shadows ADD COLUMN {col_name} {col_type}")
+
     # Migrate buy snapshot table if columns are missing
     cur.execute("PRAGMA table_info(strategy_buy_snapshots)")
     snapshot_cols = {row[1] for row in cur.fetchall()}
@@ -263,6 +299,44 @@ def insert_gamma_sniper_trade(db_path: str, trade: dict) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def update_gamma_sniper_trade(db_path: str, trade_id: int, update_dict: dict) -> None:
+    """Update an existing gamma sniper trade in SQLite."""
+    if not os.path.exists(db_path):
+        return
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(gamma_sniper_trades)")
+    cols = {row[1] for row in cur.fetchall()}
+    valid_updates = {k: v for k, v in update_dict.items() if k in cols}
+    if not valid_updates:
+        conn.close()
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in valid_updates)
+    vals = list(valid_updates.values()) + [trade_id]
+    cur.execute(f"UPDATE gamma_sniper_trades SET {set_clause} WHERE id = ?", vals)
+    conn.commit()
+    conn.close()
+
+
+def insert_gate_deferred_shadow(db_path: str, shadow_record: dict) -> None:
+    """Insert a counterfactual shadow record when Smart Entry Gate defers execution."""
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(gate_deferred_shadows)")
+    cols = {row[1] for row in cur.fetchall()}
+    ins = {k: v for k, v in shadow_record.items() if k in cols}
+    col_names = ", ".join(ins.keys())
+    placeholders = ", ".join("?" for _ in ins)
+    cur.execute(
+        f"INSERT INTO gate_deferred_shadows ({col_names}) VALUES ({placeholders})",
+        tuple(ins.values())
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Inserted gate deferred shadow record into %s", db_path)
 
 
 def get_gamma_sniper_trades(db_path: str) -> list:

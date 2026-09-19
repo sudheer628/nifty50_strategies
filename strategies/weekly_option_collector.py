@@ -78,11 +78,13 @@ from common.storage import (
     load_active_snapshot,
     update_active_fsm_state,
     generate_cycle_id,
+    insert_gate_deferred_shadow,
 )
 
 from common.fsm_strategy import (
     init_fsm_state,
     evaluate_fsm_tick,
+    estimate_option_delta,
 )
 
 # IST timezone (used for business-logic decisions: market hours,
@@ -241,7 +243,7 @@ def _build_record(
     return record
 
 
-def collect_once(force_static: bool = False) -> bool:
+def collect_once(force_static: bool = False, force_entry: bool = False) -> bool:
     """
     Perform one hourly data collection cycle.
 
@@ -253,6 +255,7 @@ def collect_once(force_static: bool = False) -> bool:
 
     Args:
         force_static: If True, bypass AI strike selector and use static anchor +/- 100 rule.
+        force_entry: If True, bypass Smart Entry Gate deferral and force immediate cycle entry.
 
     Returns True on success, False on failure.
     """
@@ -315,7 +318,7 @@ def collect_once(force_static: bool = False) -> bool:
             gate_res = evaluate_entry_gate(
                 reference_ltp=nifty_ltp,
                 sqlite_dir=SQLITE_DIR,
-                force=force_static
+                force=force_entry
             )
             if not gate_res.should_enter:
                 logger.info("=" * 60)
@@ -330,6 +333,59 @@ def collect_once(force_static: bool = False) -> bool:
                 )
                 logger.info("  Holding execution until next scheduled collection tick (10:01 / 10:31 IST).")
                 logger.info("=" * 60)
+
+                # Counterfactual Shadow Entry: Record hypothetical entry prices for training & benchmarking
+                try:
+                    (
+                        hyp_put,
+                        hyp_call,
+                        hyp_stat_put,
+                        hyp_stat_call,
+                        hyp_mode,
+                        hyp_rationale,
+                        hyp_comp_score,
+                        hyp_dir_bias,
+                        hyp_c_delta,
+                        hyp_p_delta,
+                    ) = select_strikes(
+                        reference_ltp=nifty_ltp,
+                        sqlite_dir=SQLITE_DIR,
+                        force_static=force_static
+                    )
+                    hyp_chain = get_nifty_option_chain(expiry_angelone, hyp_call, hyp_put)
+                    hyp_call_ltp = (hyp_chain.get("call") or {}).get("ltp")
+                    hyp_put_ltp = (hyp_chain.get("put") or {}).get("ltp")
+
+                    shadow_db = _ensure_db(week_start, expiry_date)
+                    shadow_record = {
+                        "timestamp": _now_utc_ts(),
+                        "trade_date": today_str,
+                        "nifty_spot": nifty_ltp,
+                        "gate_status": gate_res.status,
+                        "defer_reason": gate_res.defer_reason,
+                        "iv_slope": gate_res.iv_slope,
+                        "vwap_distance": gate_res.vwap_distance,
+                        "adx_14": gate_res.adx_14,
+                        "opening_range": gate_res.opening_range,
+                        "hypothetical_call_strike": hyp_call,
+                        "hypothetical_put_strike": hyp_put,
+                        "hypothetical_call_ltp": hyp_call_ltp,
+                        "hypothetical_put_ltp": hyp_put_ltp,
+                        "selection_mode": hyp_mode,
+                        "composite_direction_score": hyp_comp_score,
+                        "directional_bias": hyp_dir_bias,
+                        "target_call_delta": hyp_c_delta,
+                        "target_put_delta": hyp_p_delta,
+                    }
+                    insert_gate_deferred_shadow(shadow_db, shadow_record)
+                    logger.info(
+                        "  [COUNTERFACTUAL SHADOW LOGGED] Hyp CALL %d @ ₹%s | PUT %d @ ₹%s",
+                        hyp_call, f"{hyp_call_ltp:.2f}" if hyp_call_ltp else "N/A",
+                        hyp_put, f"{hyp_put_ltp:.2f}" if hyp_put_ltp else "N/A"
+                    )
+                except Exception as shadow_err:
+                    logger.warning("Failed to record counterfactual gate shadow: %s", shadow_err)
+
                 return True
 
         # Dynamic AI strike selector (with fail-safe static anchor +/- 100 fallback)
@@ -461,6 +517,11 @@ def collect_once(force_static: bool = False) -> bool:
                 "static_put_strike": static_put_strike,
                 "selection_mode": selection_mode,
                 "selection_rationale": selection_rationale,
+                "composite_direction_score": get_last_composite_score(),
+                "directional_bias": "NEUTRAL",
+                "target_call_delta": 0.35,
+                "target_put_delta": -0.35,
+                "smart_gate": {"status": "MIDWEEK_FALLBACK", "should_enter": True},
                 "alpha_fsm": init_fsm_state(
                     call_strike=call_strike,
                     put_strike=put_strike,
@@ -514,12 +575,16 @@ def collect_once(force_static: bool = False) -> bool:
         )
 
     days_to_expiry = max(0.1, (expiry_date - today).days)
+    call_delta = estimate_option_delta(nifty_ltp, call_strike, days_to_expiry, is_call=True)
+    put_delta = estimate_option_delta(nifty_ltp, put_strike, days_to_expiry, is_call=False)
     updated_fsm, fsm_events = evaluate_fsm_tick(
         fsm_state=fsm_state,
         current_call_ltp=call_ltp,
         current_put_ltp=put_ltp,
         current_ts=_now_utc_ts(),
         days_to_expiry=days_to_expiry,
+        call_delta=call_delta,
+        put_delta=put_delta,
     )
     if fsm_events:
         for ev in fsm_events:
@@ -605,6 +670,11 @@ def main():
         action="store_true",
         help="Force static anchor +/- 100 pt strike rule instead of AI selector",
     )
+    parser.add_argument(
+        "--force-entry",
+        action="store_true",
+        help="Bypass Smart Entry Gate deferral and force immediate cycle entry",
+    )
     args = parser.parse_args()
 
     if args.dry_run:
@@ -632,7 +702,7 @@ def main():
         logger.info("Outside market hours. Use --force to override.")
         return
 
-    success = collect_once(force_static=args.force_static)
+    success = collect_once(force_static=args.force_static, force_entry=args.force_entry)
     if not success:
         logger.error("Collection cycle failed.")
         sys.exit(1)

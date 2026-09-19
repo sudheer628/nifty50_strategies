@@ -18,10 +18,37 @@ Implements active, independent leg management for weekly NIFTY50 options:
      premium >= ₹15, preventing a complete 100% write-off.
 """
 
+import math
 import logging
 from typing import Dict, Any, Tuple, List, Optional
 
 logger = logging.getLogger("fsm_strategy")
+
+
+def estimate_option_delta(
+    spot: float,
+    strike: float,
+    days_to_expiry: float,
+    is_call: bool,
+    iv: float = 0.14
+) -> float:
+    """
+    Estimate option delta using closed-form Black-Scholes formula.
+    Uses Python's math.erf for standard normal CDF without external dependencies.
+    """
+    if days_to_expiry <= 0.01 or spot <= 0 or strike <= 0:
+        if is_call:
+            return 1.0 if spot > strike else 0.0
+        else:
+            return -1.0 if spot < strike else 0.0
+    t = max(0.001, days_to_expiry / 365.0)
+    vol = max(0.05, iv)
+    try:
+        d1 = (math.log(spot / strike) + (0.5 * vol * vol) * t) / (vol * math.sqrt(t))
+        n_d1 = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+        return round(n_d1 if is_call else (n_d1 - 1.0), 3)
+    except Exception:
+        return 0.5 if is_call else -0.5
 
 
 def init_fsm_state(
@@ -99,12 +126,12 @@ def evaluate_fsm_tick(
     total_cost = state.get("total_initial_cost", 0.0) or (c_leg.get("buy_price", 0.0) + p_leg.get("buy_price", 0.0))
 
     # Time-decaying trailing stop buffer delta(t)
-    if days_to_expiry > 4.0:
-        trail_buffer = 0.25  # 25% buffer on Tue/Wed
+    if days_to_expiry > 5.0:
+        trail_buffer = 0.25  # 25% buffer on Tue/Wed (DTE: 7, 6)
     elif days_to_expiry > 1.5:
-        trail_buffer = 0.18  # 18% buffer on Thu/Fri
+        trail_buffer = 0.18  # 18% buffer on Thu/Fri (DTE: 5, 4)
     else:
-        trail_buffer = 0.10  # 10% tight buffer on Expiry Eve/Monday
+        trail_buffer = 0.10  # 10% tight buffer on Expiry Eve/Monday (DTE: 1, 0)
 
     # ------------------------------------------------------------------
     # 1. Evaluate CALL LEG
@@ -141,7 +168,7 @@ def evaluate_fsm_tick(
             events.append(f"🛡️ CALL TRAILING STOP: Closed at ₹{c_ltp:.2f} to lock peak profits (Peak: ₹{c_peak:.2f}).")
 
         # Rule 1C: Losing Leg Salvage Stop on Call (if market crashed)
-        elif (c_ltp <= c_buy * 0.45) and (call_delta is not None and abs(call_delta) < 0.10) and (c_ltp >= 15.0):
+        elif (c_ltp <= c_buy * 0.45) and (call_delta is not None and abs(call_delta) < 0.10) and (c_ltp >= 5.0):
             c_leg["status"] = "SALVAGED_CLOSED"
             c_leg["exit_price"] = c_ltp
             c_leg["exit_ts"] = current_ts
@@ -184,7 +211,7 @@ def evaluate_fsm_tick(
             events.append(f"🛡️ PUT TRAILING STOP: Closed at ₹{p_ltp:.2f} to lock peak profits (Peak: ₹{p_peak:.2f}).")
 
         # Rule 2C: Losing Leg Salvage Stop on Put (if market rallied)
-        elif (p_ltp <= p_buy * 0.45) and (put_delta is not None and abs(put_delta) < 0.10) and (p_ltp >= 15.0):
+        elif (p_ltp <= p_buy * 0.45) and (put_delta is not None and abs(put_delta) < 0.10) and (p_ltp >= 5.0):
             p_leg["status"] = "SALVAGED_CLOSED"
             p_leg["exit_price"] = p_ltp
             p_leg["exit_ts"] = current_ts

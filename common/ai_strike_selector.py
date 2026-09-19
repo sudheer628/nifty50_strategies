@@ -217,14 +217,6 @@ def load_market_context_for_strikes(
     return context
 
 
-_LAST_COMPOSITE_SCORE: float = 0.0
-
-
-def get_last_composite_score() -> float:
-    """Returns the most recent composite directional score calculated during strike selection."""
-    return _LAST_COMPOSITE_SCORE
-
-
 def compute_composite_directional_score(context: Dict[str, Any]) -> float:
     """
     Computes a normalized composite directional score in [-1.0, +1.0]

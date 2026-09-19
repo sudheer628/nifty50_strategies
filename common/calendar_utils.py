@@ -104,14 +104,23 @@ def is_strategy_closing_day(target_date: Optional[date] = None) -> bool:
     """
     Returns True if target_date is the strategy closing day:
     - Normal week: Monday (if not a holiday).
-    (Holiday Mondays are closed early morning via --morning-holiday-check).
+    - Monday holiday week: Tuesday (deferred close of the previous cycle).
     """
     today = target_date if target_date else date.today()
 
     if check_nse_holiday(today):
         return False
 
-    return today.weekday() == 0
+    if today.weekday() == 0:
+        return True
+
+    # If today is Tuesday and Monday was an exchange holiday, Tuesday closes the prior cycle
+    if today.weekday() == 1:
+        monday = today - timedelta(days=1)
+        if check_nse_holiday(monday):
+            return True
+
+    return False
 
 
 def is_strategy_start_day(target_date: Optional[date] = None) -> bool:
@@ -145,8 +154,8 @@ def get_strategy_cycle_role(target_date: Optional[date] = None) -> str:
     """
     Returns the designated role for target_date in the strategy lifecycle:
     - 'HOLIDAY': Market closed.
-    - 'CLOSING_DAY': Strategy closes today (Monday).
     - 'START_DAY': Strategy begins today (Tuesday, or Wednesday if Tuesday holiday).
+    - 'CLOSING_DAY': Strategy closes today (Monday, or Tuesday deferred if Monday holiday).
     - 'REGULAR_DAY': Mid-cycle holding day.
     """
     today = target_date if target_date else date.today()
@@ -154,10 +163,11 @@ def get_strategy_cycle_role(target_date: Optional[date] = None) -> str:
     if check_nse_holiday(today):
         return "HOLIDAY"
 
-    if is_strategy_closing_day(today):
-        return "CLOSING_DAY"
-
+    # Start day takes precedence on Tuesday so new cycle setup runs during market hours
     if is_strategy_start_day(today):
         return "START_DAY"
+
+    if is_strategy_closing_day(today):
+        return "CLOSING_DAY"
 
     return "REGULAR_DAY"

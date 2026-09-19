@@ -196,6 +196,15 @@ def main() -> int:
     python_bin = sys.executable
     success = True
 
+    # Mark active strategy cycle as closed upfront so downstream inference runners
+    # never evaluate dead trades if downstream email, benchmarks, or merge scripts fail or timeout.
+    if not args.dry_run:
+        try:
+            mark_active_cycle_closed()
+            logger.info("Marked active strategy cycle as CLOSED in active snapshot.")
+        except Exception as e:
+            logger.warning(f"Could not update cycle status in snapshot: {e}")
+
     # -----------------------------------------------------------------
     # Step 1: Send Weekly Strategy Performance Report (PDF / Email)
     # -----------------------------------------------------------------

@@ -19,7 +19,11 @@ load_dotenv()
 # Logging
 # ---------------------------------------------------------------------------
 logger = logging.getLogger("nifty50_strategies")
-logger.setLevel(logging.DEBUG if os.getenv("DEBUG") else logging.INFO)
+_log_level_env = os.getenv("LOG_LEVEL")
+if _log_level_env:
+    logger.setLevel(getattr(logging, _log_level_env.upper(), logging.INFO))
+else:
+    logger.setLevel(logging.DEBUG if os.getenv("DEBUG") else logging.INFO)
 _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter(
     "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

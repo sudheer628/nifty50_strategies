@@ -57,6 +57,7 @@ from common.calendar_utils import is_strategy_closing_day, check_nse_holiday
 from common.storage import (
     load_active_snapshot,
     insert_gamma_sniper_trade,
+    update_gamma_sniper_trade,
     get_gamma_sniper_trades,
     build_db_path,
 )
@@ -90,6 +91,7 @@ def is_sniper_time_window(as_of: Optional[datetime] = None) -> bool:
 def get_active_strategy_pnl(snapshot: Dict[str, Any], db_path: str) -> Tuple[float, float]:
     """
     Calculate the week's net P&L in points and INR.
+    Prioritizes realized profit (house money), falling back to total gainloss if realized is unavailable.
     Returns: (net_pnl_points, net_pnl_inr)
     """
     lot_size = int(os.environ.get("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
@@ -97,7 +99,9 @@ def get_active_strategy_pnl(snapshot: Dict[str, Any], db_path: str) -> Tuple[flo
     # 1. Check FSM realized/total gainloss from snapshot
     fsm = snapshot.get("alpha_fsm") or {}
     if fsm:
-        fsm_pts = float(fsm.get("total_gainloss") or fsm.get("realized_pnl_pts") or 0.0)
+        realized = fsm.get("realized_pnl_pts")
+        total = fsm.get("total_gainloss")
+        fsm_pts = float(realized if realized is not None else (total or 0.0))
         return round(fsm_pts, 2), round(fsm_pts * lot_size, 2)
 
     # 2. Check latest row from weekly database
@@ -106,15 +110,17 @@ def get_active_strategy_pnl(snapshot: Dict[str, Any], db_path: str) -> Tuple[flo
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
-            cur.execute("SELECT gainloss, fsm_total_gainloss FROM strategy_hourly_data ORDER BY collection_timestamp DESC LIMIT 1")
+            cur.execute("SELECT gainloss, fsm_realized_pnl, fsm_total_gainloss FROM strategy_hourly_data ORDER BY collection_timestamp DESC LIMIT 1")
             row = cur.fetchone()
             conn.close()
             if row:
-                gl = row["fsm_total_gainloss"] if row["fsm_total_gainloss"] is not None else row["gainloss"]
+                realized_db = row["fsm_realized_pnl"]
+                total_db = row["fsm_total_gainloss"] if row["fsm_total_gainloss"] is not None else row["gainloss"]
+                gl = realized_db if realized_db is not None else total_db
                 gl_float = float(gl or 0.0)
                 return round(gl_float, 2), round(gl_float * lot_size, 2)
         except Exception as e:
-            sniper_logger.warning("Failed to query latest P&L from %s: %e", db_path, e)
+            sniper_logger.warning("Failed to query latest P&L from %s: %s", db_path, e)
 
     return 0.0, 0.0
 
@@ -163,15 +169,15 @@ def evaluate_gamma_signals(
         cur_vol = float(latest["volume"] or 0.0)
         vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
 
-        # Bullish Gamma Trigger: Spot breaking above VWAP by >= +0.15% with RSI >= 58
-        if vwap_dist >= 0.15 and rsi >= 58:
+        # Bullish Gamma Trigger: Spot breaking above VWAP by >= +0.15% with RSI >= 58 and volume surge >= 1.5x
+        if vwap_dist >= 0.15 and rsi >= 58 and vol_ratio >= 1.5:
             return "CALL", vwap_dist, rsi, f"Bullish gamma breakout: VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}, Vol ratio={vol_ratio:.1f}x"
 
-        # Bearish Gamma Trigger: Spot breaking below VWAP by <= -0.15% with RSI <= 42
-        if vwap_dist <= -0.15 and rsi <= 42:
+        # Bearish Gamma Trigger: Spot breaking below VWAP by <= -0.15% with RSI <= 42 and volume surge >= 1.5x
+        if vwap_dist <= -0.15 and rsi <= 42 and vol_ratio >= 1.5:
             return "PUT", vwap_dist, rsi, f"Bearish gamma breakdown: VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}, Vol ratio={vol_ratio:.1f}x"
 
-        return None, vwap_dist, rsi, f"Market rangebound (VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}); no directional breakout"
+        return None, vwap_dist, rsi, f"Market rangebound (VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}, Vol ratio={vol_ratio:.1f}x); no directional breakout"
 
     except Exception as e:
         sniper_logger.error("Error reading gamma signals: %s", e)
@@ -213,15 +219,116 @@ def run_gamma_sniper(
     start_str = str(snapshot.get("week_start_date", ""))
     db_path = custom_db_path or build_db_path(start_str, expiry_str)
 
-    # 3. Guard: Check if a trade was already executed today
+    # Derive Angel One expiry string from snapshot's active expiry date
+    if expiry_str:
+        try:
+            cycle_expiry_date = datetime.strptime(expiry_str, "%Y%m%d").date()
+        except (ValueError, TypeError):
+            cycle_expiry_date = get_next_weekly_expiry(today)
+    else:
+        cycle_expiry_date = get_next_weekly_expiry(today)
+
+    expiry_angelone = format_expiry_angelone(cycle_expiry_date)
+
+    # 3. Guard & Exit Engine: Check existing trades
     existing_trades = get_gamma_sniper_trades(db_path)
+    open_trades = [t for t in existing_trades if t.get("status") == "OPEN"]
+
+    if open_trades:
+        # Manage open trades: check target (+75%), hard stop (-35%), and time stop (15:10 IST / 45-min hold)
+        sniper_logger.info("Managing %d open Gamma Sniper trade(s)...", len(open_trades))
+        lot_size = int(os.environ.get("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
+        managed_results = []
+        for trade in open_trades:
+            trade_id = trade.get("id")
+            strike = int(trade["strike"])
+            option_type = trade["option_type"]
+            entry_price = float(trade["entry_price"])
+            trade_ts = int(trade.get("trade_timestamp") or _now_utc_ts())
+
+            # Fetch live option LTP using cycle expiry
+            opt_chain = get_nifty_option_chain(
+                expiry_angelone,
+                strike if option_type == "CE" else 0,
+                strike if option_type == "PE" else 0
+            )
+            leg_data = opt_chain.get("call" if option_type == "CE" else "put") or {}
+            curr_ltp = float(leg_data.get("ltp") or 0.0)
+
+            # Fallback if API returned 0 in dry-run/check mode
+            if curr_ltp <= 0 and (dry_run or check_only):
+                curr_ltp = float(trade.get("exit_price") or entry_price)
+
+            pnl_pts = round(curr_ltp - entry_price, 2)
+            pnl_pct = round((pnl_pts / entry_price) * 100.0, 2) if entry_price > 0 else 0.0
+            pnl_inr = round(pnl_pts * lot_size, 2)
+
+            # Exit triggers:
+            # 1. Target 1: +75% harvest
+            # 2. Hard stop: -35% SL
+            # 3. Hard time-stop: 15:10 IST or >= 45 minutes holding time
+            elapsed_sec = _now_utc_ts() - trade_ts
+            hit_target = curr_ltp >= entry_price * 1.75
+            hit_stop = curr_ltp <= entry_price * 0.65
+            hit_time_stop = now.time() >= time(15, 10) or elapsed_sec >= 45 * 60
+
+            if hit_target or hit_stop or hit_time_stop:
+                if hit_target:
+                    reason = f"TARGET_HIT (+75% gain reached @ ₹{curr_ltp:.2f})"
+                elif hit_stop:
+                    reason = f"STOP_LOSS_HIT (-35% loss reached @ ₹{curr_ltp:.2f})"
+                else:
+                    reason = f"TIME_STOP_HIT (Hold time: {elapsed_sec//60}m / 15:10 IST reached @ ₹{curr_ltp:.2f})"
+
+                exit_record = {
+                    "exit_price": curr_ltp,
+                    "exit_timestamp": _now_utc_ts(),
+                    "pnl_points": pnl_pts,
+                    "pnl_pct": pnl_pct,
+                    "pnl_inr": pnl_inr,
+                    "exit_reason": reason,
+                    "status": "CLOSED",
+                }
+                sniper_logger.info(
+                    "🎯 [GAMMA SNIPER EXIT] Closed %d %s @ ₹%.2f (Entry: ₹%.2f, P&L: %+.2f INR | %+.1f%%) — %s",
+                    strike, option_type, curr_ltp, entry_price, pnl_inr, pnl_pct, reason
+                )
+                if not dry_run and not check_only and trade_id:
+                    update_gamma_sniper_trade(db_path, trade_id, exit_record)
+                    # Update JSON dossier
+                    json_path = os.path.join(_PROJECT_ROOT, "strategies", f"gamma_sniper_{format_expiry_file(today)}.json")
+                    try:
+                        trade_full = {**trade, **exit_record}
+                        with open(json_path, "w", encoding="utf-8") as f:
+                            json.dump(trade_full, f, indent=2)
+                    except Exception as e:
+                        sniper_logger.warning("Could not update json dossier: %s", e)
+                managed_results.append({**trade, **exit_record})
+            else:
+                # Still active, update mark-to-market P&L
+                mtm_record = {
+                    "exit_price": curr_ltp,
+                    "pnl_points": pnl_pts,
+                    "pnl_pct": pnl_pct,
+                    "pnl_inr": pnl_inr,
+                }
+                sniper_logger.info(
+                    "👀 [GAMMA SNIPER MONITOR] Holding %d %s @ ₹%.2f (Entry: ₹%.2f, P&L: %+.2f INR | %+.1f%%, Elapsed: %dm)",
+                    strike, option_type, curr_ltp, entry_price, pnl_inr, pnl_pct, elapsed_sec // 60
+                )
+                if not dry_run and not check_only and trade_id:
+                    update_gamma_sniper_trade(db_path, trade_id, mtm_record)
+                managed_results.append({**trade, **mtm_record})
+
+        return {"status": "MANAGED_OPEN_TRADES", "trades": managed_results}
+
     if existing_trades and not force:
-        sniper_logger.info("Gamma sniper already took %d trade(s) this cycle; skipping duplicate execution.", len(existing_trades))
-        return {"status": "ALREADY_EXECUTED", "trades": existing_trades}
+        sniper_logger.info("Gamma sniper already completed %d trade(s) this cycle; skipping duplicate execution.", len(existing_trades))
+        return {"status": "ALREADY_COMPLETED", "trades": existing_trades}
 
     # 4. Zero Principal Risk Safeguard (House Money Only)
     net_pnl_pts, net_pnl_inr = get_active_strategy_pnl(snapshot, db_path)
-    sniper_logger.info("Main Weekly Strategy Status: P&L = %+.2f pts (%+,.2f INR)", net_pnl_pts, net_pnl_inr)
+    sniper_logger.info("Main Weekly Strategy Status: P&L = %+.2f pts (%+.2f INR)", net_pnl_pts, net_pnl_inr)
 
     if net_pnl_pts <= 0 and not force:
         sniper_logger.info(
@@ -276,18 +383,27 @@ def run_gamma_sniper(
         strike = int(anchor - 50)
         option_type = "PE"
 
-    expiry_date_obj = get_next_weekly_expiry(today)
-    expiry_angelone = format_expiry_angelone(expiry_date_obj)
-
-    # Fetch live option LTP
+    # Fetch live option LTP using active cycle expiry
     opt_chain = get_nifty_option_chain(expiry_angelone, strike if option_type == "CE" else 0, strike if option_type == "PE" else 0)
     leg_data = opt_chain.get("call" if option_type == "CE" else "put") or {}
     entry_ltp = float(leg_data.get("ltp") or 0.0)
 
-    # If live API returned 0 or in test/dry-run mode, estimate realistic gamma premium (~₹18-24)
+    # In dry-run or check mode, simulate realistic entry premium (~₹18.5) if market closed
     if entry_ltp <= 0:
-        entry_ltp = min(max_premium, 18.5)
-        sniper_logger.info("Using estimated entry LTP: ₹%.2f", entry_ltp)
+        if dry_run or check_only:
+            entry_ltp = min(max_premium, 18.5)
+            sniper_logger.info("Using simulated entry LTP for test/dry-run: ₹%.2f", entry_ltp)
+        else:
+            sniper_logger.error(
+                "Could not fetch valid live option LTP (got %.2f) for %d %s; aborting entry.",
+                entry_ltp, strike, option_type
+            )
+            return {
+                "status": "ERROR_NO_OPTION_LTP",
+                "strike": strike,
+                "option_type": option_type,
+                "reason": "Live option chain returned 0 LTP during market hours."
+            }
 
     outlay_inr = round(entry_ltp * lot_size, 2)
     stop_loss = round(entry_ltp * 0.65, 2)  # -35% hard stop

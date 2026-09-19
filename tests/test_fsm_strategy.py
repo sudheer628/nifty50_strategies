@@ -92,13 +92,13 @@ class FSMStrategyTests(unittest.TestCase):
             put_buy_price=80.0,
             entry_ts=1700000000,
         )
-        # 1st tick: Call peaks at 180 (gain=80% < 100%, days_to_expiry=5.0 on Tue -> trailing stop set to 180 * (1 - 0.25) = 135)
+        # 1st tick: Call peaks at 180 (gain=80% < 100%, days_to_expiry=6.0 on Tue/Wed -> trailing stop set to 180 * (1 - 0.25) = 135)
         state_t1, _ = evaluate_fsm_tick(
             fsm_state=state,
             current_call_ltp=180.0,
             current_put_ltp=60.0,
             current_ts=1700003600,
-            days_to_expiry=5.0,
+            days_to_expiry=6.0,
             call_delta=0.52,
             put_delta=-0.28,
         )
@@ -111,7 +111,7 @@ class FSMStrategyTests(unittest.TestCase):
             current_call_ltp=130.0,
             current_put_ltp=55.0,
             current_ts=1700007200,
-            days_to_expiry=5.0,
+            days_to_expiry=6.0,
             call_delta=0.44,
             put_delta=-0.25,
         )
@@ -119,6 +119,47 @@ class FSMStrategyTests(unittest.TestCase):
         self.assertEqual(state_t2["call_leg"]["exit_price"], 130.0)
         self.assertEqual(state_t2["call_leg"]["realized_pnl"], 30.0)
         self.assertTrue(any("CALL TRAILING STOP" in e for e in events))
+
+    def test_fsm_trailing_stop_ladder_thresholds(self):
+        """Verify trailing stop ladder: >5.0 DTE (25%), 1.5-5.0 DTE (18%), <=1.5 DTE (10%)."""
+        base_state = init_fsm_state(24600, 24400, 100.0, 80.0, 1700000000)
+
+        # Thursday (DTE = 4.5): 18% buffer -> 200 * (1 - 0.18) = 164.0
+        thu_state, _ = evaluate_fsm_tick(
+            fsm_state=base_state,
+            current_call_ltp=200.0,
+            current_put_ltp=50.0,
+            current_ts=1700003600,
+            days_to_expiry=4.5,
+        )
+        self.assertEqual(thu_state["call_leg"]["trailing_stop"], 164.0)
+
+        # Monday (DTE = 1.0): 10% buffer -> 200 * (1 - 0.10) = 180.0
+        mon_state, _ = evaluate_fsm_tick(
+            fsm_state=base_state,
+            current_call_ltp=200.0,
+            current_put_ltp=50.0,
+            current_ts=1700003600,
+            days_to_expiry=1.0,
+        )
+        self.assertEqual(mon_state["call_leg"]["trailing_stop"], 180.0)
+
+    def test_fsm_salvage_rule_low_premium_option(self):
+        """Verify that an option bought at ₹25 can be salvaged at ₹10 (price >= 5.0)."""
+        state = init_fsm_state(24600, 24400, 25.0, 30.0, 1700000000)
+        # Call bought at 25 drops to 10 (loss = -60% <= -55%), delta = 0.07 (< 0.10), price = 10 >= 5.0
+        updated, events = evaluate_fsm_tick(
+            fsm_state=state,
+            current_call_ltp=10.0,
+            current_put_ltp=50.0,
+            current_ts=1700003600,
+            days_to_expiry=2.0,
+            call_delta=0.07,
+            put_delta=-0.45,
+        )
+        self.assertEqual(updated["call_leg"]["status"], "SALVAGED_CLOSED")
+        self.assertEqual(updated["call_leg"]["exit_price"], 10.0)
+        self.assertEqual(updated["call_leg"]["realized_pnl"], -15.0)
 
     def test_storage_auto_migration_fsm_columns(self):
         with tempfile.TemporaryDirectory() as temp_dir:
