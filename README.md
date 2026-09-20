@@ -52,22 +52,26 @@ nifty50_strategies/
 │   ├── calendar_utils.py                # Holiday detection via Upstox API & cycle calendar
 │   ├── entry_gate.py                    # Smart Entry Gate (deferral & shadow logging)
 │   ├── fsm_strategy.py                  # Decoupled FSM (harvest, trailing stop, salvage)
+│   ├── profit_monitor.py                # Peak-profit alert engine & future broker execution seam
 │   └── storage.py                       # SQLite persistence, JSON snapshot & migrations
 ├── strategies/
 │   ├── __init__.py
 │   ├── weekly_option_collector.py       # Main strategy entry point (runs :01 & :31)
-│   └── monday_gamma_sniper.py           # Monday afternoon gamma scalper (runs every 10m)
+│   ├── monday_gamma_sniper.py           # Monday afternoon gamma scalper (runs every 10m)
+│   └── peak_profit_monitor.py           # Standalone 15-min peak monitor (runs :16 & :46)
 ├── scripts/
 │   ├── run_weekly_close.py              # Unified weekly close orchestrator (runs Mon 15:37)
 │   ├── send_weekly_report.py            # Monday HTML email + chart generator
 │   ├── compare_ai_vs_static_benchmark.py # Retrospective side-by-side P&L comparison
 │   └── sync_to_mongodb.py               # MongoDB Atlas derivatives synchronization CLI
-├── tests/                               # 38 automated pytest unit tests
+├── tests/                               # 61 automated pytest unit tests
 │   ├── test_angelone_resolution.py
 │   ├── test_calendar_utils.py
 │   ├── test_entry_gate.py
 │   ├── test_fsm_strategy.py
 │   ├── test_gamma_sniper.py
+│   ├── test_profit_monitor.py
+│   ├── test_standalone_peak_monitor.py
 │   ├── test_storage.py
 │   ├── test_weekly_collector.py
 │   └── test_weekly_report.py
@@ -390,11 +394,27 @@ Example: `nifty50_weekly_data_20260804_20260811.db`
 - **Active**: `/home/ubuntu/sqlite/strategies/current_week_buy.json`
 - **Archived**: `/home/ubuntu/sqlite/strategies/current_week_buy_{YYYYMMDD}.json` (one per past week)
 
+The active snapshot persists the current cycle's entry buy prices, FSM state (`alpha_fsm`), and the peak profit high-water mark state (`peak_profit`):
+```json
+"peak_profit": {
+  "peak_pnl_pts": 45.2,
+  "peak_pnl_pct": 28.5,
+  "peak_pnl_inr": 2938.0,
+  "peak_timestamp": 1788256800,
+  "last_notified_pts": 45.2,
+  "last_notified_pct": 28.5,
+  "last_notified_timestamp": 1788256800,
+  "alerts_sent_today": 1,
+  "last_alert_date": "2026-09-22"
+}
+```
+
 ### 10.3 Storage rules
 
 - One row per collection interval
 - One database file per weekly cycle
 - SQLite is the authoritative store; the JSON snapshot is a convenience file for the active cycle
+- Zero SQLite schema modifications for peak monitoring: high-water marks persist in-place inside `current_week_buy.json`
 
 ---
 
@@ -560,6 +580,41 @@ python scripts/send_weekly_report.py
 
 The preview HTML and PNG chart are archived under
 `/home/ubuntu/sqlite/strategies/reports/` by default.
+
+### Real-Time Peak-Profit Discord Alerts & Future Broker Execution Seam
+
+The strategy monitors floating strangle profit against the historical high-water mark achieved since Tuesday order locking via [`common/profit_monitor.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/profit_monitor.py):
+
+- **Dual-Runner 15-Minute Cadence**: 
+  - `strategies/weekly_option_collector.py` evaluates peaks at `:01` and `:31` (alongside full SQLite collection).
+  - `strategies/peak_profit_monitor.py` evaluates peaks at `:16` and `:46` (standalone lightweight check).
+  - Together, they form a **flawless, equidistant 15-minute clock** (`09:16`, `09:31`, `09:46`, `10:01`, `10:16`... `15:16`, `15:31` IST) with zero write collisions.
+- **$\ge 20.0\%$ Profit Validation**: Alerts strictly trigger only when profit is $\ge 20.0\%$ (`combined_pnl_pct >= 20.0`). Any minor fluctuations below 20% update the snapshot high-water mark but send **zero alerts**.
+- **Anti-Spam Hysteresis**: Subsequent peak alerts require at least a **$+5.0\%$ jump** or **$+10.0$ points** ($\sim ₹650$/lot) above the last notified peak.
+- **Zero SQLite Changes & Atomic Writes**: All peak state is stored in-place directly in `current_week_buy.json` under `"peak_profit"` via atomic temporary file replacement (`os.replace`). SQLite schema remains 100% untouched.
+- **Future Live Broker Hook**: Qualifying new peaks trigger `common.profit_monitor.on_new_peak(event)`. Currently, this dispatches a high-priority styled Discord alert via Webhook; in future phases, live broker order execution (Angel One / Upstox) can be connected directly into this seam.
+
+```env
+PEAK_ALERT_ENABLED=true
+PEAK_ALERT_MIN_PROFIT_PCT=20.0
+PEAK_ALERT_HYSTERESIS_PCT=5.0
+PEAK_ALERT_HYSTERESIS_PTS=10.0
+DISCORD_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_URL_HERE
+```
+
+#### Standalone Peak Monitor Crontab
+
+```bash
+# Standalone Peak-Profit Monitor (Runs at :16 and :46, alternating with :01 and :31 collector for 15-min cadence)
+# 09:16 to 15:16 IST = 03:46 to 09:46 UTC
+46 3 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
+16,46 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
+```
+
+Smoke check peak monitor state:
+```bash
+python strategies/peak_profit_monitor.py --check
+```
 
 ---
 

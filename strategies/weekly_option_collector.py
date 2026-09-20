@@ -87,6 +87,8 @@ from common.fsm_strategy import (
     estimate_option_delta,
 )
 
+from common.profit_monitor import evaluate_peak_profit
+
 # IST timezone (used for business-logic decisions: market hours,
 # Tuesday detection, expiry resolution).
 IST = pytz.timezone("Asia/Kolkata")
@@ -243,7 +245,7 @@ def _build_record(
     return record
 
 
-def collect_once(force_static: bool = False, force_entry: bool = False) -> bool:
+def collect_once(force_static: bool = False, force_entry: bool = False, dry_run: bool = False) -> bool:
     """
     Perform one hourly data collection cycle.
 
@@ -256,6 +258,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False) -> bool:
     Args:
         force_static: If True, bypass AI strike selector and use static anchor +/- 100 rule.
         force_entry: If True, bypass Smart Entry Gate deferral and force immediate cycle entry.
+        dry_run: If True, bypass external alert delivery while keeping tracking active.
 
     Returns True on success, False on failure.
     """
@@ -624,6 +627,43 @@ def collect_once(force_static: bool = False, force_entry: bool = False) -> bool:
     insert_record(db_path, record)
 
     # ------------------------------------------------------------------
+    # Evaluate Peak-Profit High-Water Mark & Alert Trigger
+    # ------------------------------------------------------------------
+    try:
+        latest_snapshot = load_active_snapshot()
+        is_first_entry_tick = is_first_run_of_week and (
+            active_cycle is None or active_cycle.get("week_start_date") != today_str
+        )
+        peak_state, alert_sent, peak_msg = evaluate_peak_profit(
+            snapshot=latest_snapshot,
+            nifty_ltp=nifty_ltp,
+            call_strike=call_strike,
+            call_ltp=call_ltp,
+            call_buy=call_buy_price,
+            put_strike=put_strike,
+            put_ltp=put_ltp,
+            put_buy=put_buy_price,
+            is_first_tick=is_first_entry_tick,
+            dry_run=dry_run,
+            fsm_state=updated_fsm.get("state"),
+            fsm_total_gainloss=updated_fsm.get("total_gainloss"),
+        )
+        cost = (call_buy_price or 0.0) + (put_buy_price or 0.0)
+        curr_pnl_pts = round((call_ltp - (call_buy_price or call_ltp)) + (put_ltp - (put_buy_price or put_ltp)), 2)
+        curr_pnl_pct = round((curr_pnl_pts / cost) * 100.0, 2) if cost > 0 else 0.0
+        logger.info(
+            "  [PEAK MONITOR] %s (Current: %+0.2f%% / %+0.2f pts | Peak: %+0.2f%% / %+0.2f pts | Alerts Today: %d)",
+            peak_msg,
+            curr_pnl_pct,
+            curr_pnl_pts,
+            peak_state.get("peak_pnl_pct", 0.0),
+            peak_state.get("peak_pnl_pts", 0.0),
+            peak_state.get("alerts_sent_today", 0),
+        )
+    except Exception as peak_err:
+        logger.warning("Failed to evaluate peak profit: %s", peak_err)
+
+    # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
     logger.info("=" * 50)
@@ -675,6 +715,13 @@ def main():
         action="store_true",
         help="Bypass Smart Entry Gate deferral and force immediate cycle entry",
     )
+    parser.add_argument(
+        "--no-alert",
+        "--no-email",
+        dest="no_alert",
+        action="store_true",
+        help="Run collection cycle but skip sending peak Discord alerts (dry_run=True)",
+    )
     args = parser.parse_args()
 
     if args.dry_run:
@@ -694,6 +741,15 @@ def main():
                 active_cycle["call_buy_price"],
                 active_cycle.get("selection_mode", "UNKNOWN"),
             )
+            peak_info = active_cycle.get("peak_profit")
+            if peak_info:
+                logger.info(
+                    "Peak Profit: High-Water Mark=+%.2f%% (+%.2f pts) | Last Notified=%s | Alerts Today=%d",
+                    peak_info.get("peak_pnl_pct", 0.0),
+                    peak_info.get("peak_pnl_pts", 0.0),
+                    f"+{peak_info.get('last_notified_pct', 0.0):.2f}%" if peak_info.get("last_notified_pct") is not None else "None",
+                    peak_info.get("alerts_sent_today", 0),
+                )
         else:
             logger.info("No valid active cycle snapshot for today")
         return
@@ -702,7 +758,11 @@ def main():
         logger.info("Outside market hours. Use --force to override.")
         return
 
-    success = collect_once(force_static=args.force_static, force_entry=args.force_entry)
+    success = collect_once(
+        force_static=args.force_static,
+        force_entry=args.force_entry,
+        dry_run=args.no_alert,
+    )
     if not success:
         logger.error("Collection cycle failed.")
         sys.exit(1)

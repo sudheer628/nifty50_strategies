@@ -52,6 +52,15 @@ COLLECTION_INTERVAL_MINUTES = 60  # Hourly after start
 NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))  # Default Nifty contract lot size (revised to 65 by NSE)
 
 # ---------------------------------------------------------------------------
+# Peak profit alert parameters
+# ---------------------------------------------------------------------------
+PEAK_ALERT_MIN_PROFIT_PCT = float(os.getenv("PEAK_ALERT_MIN_PROFIT_PCT", "20.0"))
+PEAK_ALERT_HYSTERESIS_PCT = float(os.getenv("PEAK_ALERT_HYSTERESIS_PCT", "5.0"))
+PEAK_ALERT_HYSTERESIS_PTS = float(os.getenv("PEAK_ALERT_HYSTERESIS_PTS", "10.0"))
+PEAK_ALERT_ENABLED = os.getenv("PEAK_ALERT_ENABLED", "true").lower() in ("true", "1", "yes")
+DISCORD_URL = os.getenv("DISCORD_URL", "").strip()
+
+# ---------------------------------------------------------------------------
 # MongoDB Atlas Database Configuration (Derivatives & Predictions)
 # ---------------------------------------------------------------------------
 MONGODB_URI = os.getenv("MONGODB_URI", "")

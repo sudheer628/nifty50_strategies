@@ -429,6 +429,28 @@ def insert_buy_snapshot(db_path: str, snapshot: dict) -> None:
 # JSON snapshot helpers (active week convenience file)
 # ---------------------------------------------------------------------------
 
+def _atomic_write_json(file_path: str, data: dict) -> None:
+    """
+    Write JSON data to a unique temporary file and atomically replace the target file.
+
+    Guarantees reader processes (collector, inference runner, peak monitor)
+    never read half-written JSON files during concurrent updates, and each
+    writer process writes to an isolated temp file to prevent collisions.
+    """
+    tmp_path = f"{file_path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp_path, file_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def save_active_snapshot(snapshot: dict) -> None:
     """
     Write the active week's buy prices to the JSON snapshot file.
@@ -457,9 +479,7 @@ def save_active_snapshot(snapshot: dict) -> None:
     if "status" not in snapshot:
         snapshot["status"] = "ongoing"
 
-    with open(ACTIVE_SNAPSHOT_FILE, "w", encoding="utf-8") as fh:
-        json.dump(snapshot, fh, indent=2)
-
+    _atomic_write_json(ACTIVE_SNAPSHOT_FILE, snapshot)
     logger.info("Active buy snapshot saved: %s", ACTIVE_SNAPSHOT_FILE)
 
 
@@ -489,8 +509,7 @@ def mark_active_cycle_closed() -> bool:
         return False
     snapshot["status"] = "closed"
     snapshot["closed_at"] = int(datetime.now(timezone.utc).timestamp())
-    with open(ACTIVE_SNAPSHOT_FILE, "w", encoding="utf-8") as fh:
-        json.dump(snapshot, fh, indent=2)
+    _atomic_write_json(ACTIVE_SNAPSHOT_FILE, snapshot)
     logger.info("Marked active strategy cycle %s as CLOSED", snapshot.get("cycle_id"))
     return True
 
@@ -506,8 +525,33 @@ def update_active_fsm_state(fsm_dict: dict) -> bool:
     if not snapshot:
         return False
     snapshot["alpha_fsm"] = fsm_dict
-    with open(ACTIVE_SNAPSHOT_FILE, "w", encoding="utf-8") as fh:
-        json.dump(snapshot, fh, indent=2)
+    _atomic_write_json(ACTIVE_SNAPSHOT_FILE, snapshot)
+    return True
+
+
+def update_active_peak_state(peak_data: dict) -> bool:
+    """
+    Update the peak_profit section of current_week_buy.json in-place atomically.
+
+    Guarantees that high-water mark metrics, notification timestamps,
+    and daily alert counters persist across 15-minute monitor executions
+    without triggering file archive renaming or altering SQLite schema.
+    """
+    snapshot = load_active_snapshot()
+    if not snapshot:
+        return False
+
+    # Prevent stamping an old cycle's peak onto a new cycle if a rollover occurred
+    expected_cycle = peak_data.get("cycle_id")
+    if expected_cycle and snapshot.get("cycle_id") and snapshot.get("cycle_id") != expected_cycle:
+        logger.warning(
+            "Cycle ID mismatch in update_active_peak_state: snapshot has %s, peak_data has %s. Skipping update.",
+            snapshot.get("cycle_id"), expected_cycle
+        )
+        return False
+
+    snapshot["peak_profit"] = peak_data
+    _atomic_write_json(ACTIVE_SNAPSHOT_FILE, snapshot)
     return True
 
 
