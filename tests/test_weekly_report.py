@@ -18,6 +18,9 @@ from scripts.send_weekly_report import (
     load_report_data,
     render_html,
     send_email,
+    resolve_discord_watchdog_url,
+    send_discord_watchdog,
+    send_weekly_report_discord,
 )
 
 
@@ -113,6 +116,56 @@ class WeeklyReportTests(unittest.TestCase):
             smtp_ssl.assert_called_once_with("smtp.gmail.com", 465, timeout=30)
             smtp.login.assert_called_once_with("sender@gmail.com", "app-password")
             self.assertEqual(smtp.sendmail.call_count, 1)
+
+    def test_resolve_discord_watchdog_url_from_env(self):
+        with patch.dict(os.environ, {"DISCORD_WATCHDOG": "https://discord.com/api/webhooks/test-url"}):
+            self.assertEqual(resolve_discord_watchdog_url(), "https://discord.com/api/webhooks/test-url")
+
+    def test_send_discord_watchdog_missing_url(self):
+        with patch("scripts.send_weekly_report.resolve_discord_watchdog_url", return_value=""):
+            self.assertFalse(send_discord_watchdog("Test message"))
+
+    @patch("scripts.send_weekly_report.urllib.request.urlopen")
+    def test_send_discord_watchdog_success(self, mock_urlopen):
+        from unittest.mock import MagicMock
+        mock_resp = MagicMock()
+        mock_resp.status = 204
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        with patch("scripts.send_weekly_report.resolve_discord_watchdog_url", return_value="https://discord.com/api/webhooks/test"):
+            res = send_discord_watchdog("Test content", embed={"title": "Weekly Report", "fields": []})
+            self.assertTrue(res)
+            self.assertTrue(mock_urlopen.called)
+
+    @patch("scripts.send_weekly_report.send_discord_watchdog")
+    def test_send_weekly_report_discord(self, mock_send):
+        mock_send.return_value = True
+        summary = {
+            "cycle_id": "20260804-test",
+            "latest_gainloss": 16.0,
+            "best_gainloss": 25.0,
+            "worst_gainloss": -10.0,
+            "call_strike": 24700,
+            "put_strike": 24500,
+            "call_buy_price": 92.0,
+            "put_buy_price": 82.0,
+            "nifty_start": 24500.0,
+            "nifty_latest": 24600.0,
+            "nifty_change": 100.0,
+            "start_date": date(2026, 8, 4),
+            "expiry_date": date(2026, 8, 11),
+            "selection_mode": "AI_SELECT",
+            "selection_rationale": "High IV skew favoring OTM strangle",
+            "row_count": 45,
+        }
+        res = send_weekly_report_discord(summary)
+        self.assertTrue(res)
+        self.assertTrue(mock_send.called)
+        headline, embed = mock_send.call_args[0]
+        self.assertIn("20260804-test", headline)
+        self.assertIn("+16.00 pts", headline)
+        self.assertEqual(embed["color"], 0x16a34a)
+        self.assertGreaterEqual(len(embed["fields"]), 5)
 
 
 if __name__ == "__main__":

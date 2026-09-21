@@ -8,18 +8,20 @@ Examples:
 
 import argparse
 import html
+import json
 import logging
 import os
 import re
 import smtplib
 import sqlite3
 import sys
-from datetime import date, datetime
+import urllib.request
+from datetime import date, datetime, timezone
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
@@ -359,6 +361,179 @@ def send_email(subject: str, plain_body: str, html_body: str, chart_path: Path) 
     logger.info("Weekly report sent to %s", ", ".join(recipients))
 
 
+def resolve_discord_watchdog_url() -> str:
+    """Resolve DISCORD_WATCHDOG webhook URL from os.environ or candidate .env files."""
+    env_val = os.getenv("DISCORD_WATCHDOG", "").strip()
+    if env_val:
+        return env_val
+
+    home = os.path.expanduser("~")
+    base_dir = Path(__file__).resolve().parents[1]
+    candidate_paths = [
+        base_dir / ".env",
+        Path(home) / ".env",
+        Path(home) / "nifty50_strategies" / ".env",
+        Path(home) / "sentinel-hermes" / ".env",
+        Path(home) / "market_signal_agent" / ".env",
+        Path(home) / "news-analyzer-for-market-sentiment" / ".env",
+        Path(home) / "mcx_signal_features" / ".env",
+        Path(home) / "nifty_signal_features" / ".env",
+    ]
+    for p in candidate_paths:
+        if p.exists():
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("DISCORD_WATCHDOG="):
+                            val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if val:
+                                return val
+            except Exception:
+                pass
+    return ""
+
+
+def send_discord_watchdog(content: str, embed: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Send an operational notification to the dedicated #watchdog channel.
+    Uses standard library urllib (zero external pip dependencies) and is wrapped
+    in try/except so webhook issues never crash the script.
+    """
+    webhook_url = resolve_discord_watchdog_url()
+    if not webhook_url:
+        logger.warning(
+            "⚠️ [DISCORD_WATCHDOG] Webhook URL not set in environment or .env; alert dropped: %s",
+            content[:120],
+        )
+        return False
+
+    safe_content = content[:1900] + ("..." if len(content) > 1900 else "")
+    payload: Dict[str, Any] = {"content": safe_content}
+
+    if embed:
+        if "fields" in embed:
+            for field in embed["fields"]:
+                if "value" in field and len(str(field["value"])) > 1020:
+                    field["value"] = str(field["value"])[:1020] + "..."
+        payload["embeds"] = [embed]
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Nifty50WeeklyReport-Watchdog/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            success = 200 <= resp.status < 300
+            if success:
+                logger.info("✓ Discord watchdog weekly report dispatched successfully")
+            return success
+    except Exception as exc:
+        logger.warning("Discord watchdog notification delivery failed: %s", exc)
+        return False
+
+
+def send_weekly_report_discord(summary: Dict[str, Any]) -> bool:
+    """Send NIFTY50 weekly strangle close report card to DISCORD_WATCHDOG."""
+    cycle_id = summary.get("cycle_id", "UNKNOWN")
+    latest_gain = summary.get("latest_gainloss")
+    best_gain = summary.get("best_gainloss")
+    worst_gain = summary.get("worst_gainloss")
+    call_strike = summary.get("call_strike", "N/A")
+    put_strike = summary.get("put_strike", "N/A")
+    call_buy = summary.get("call_buy_price", 0.0)
+    put_buy = summary.get("put_buy_price", 0.0)
+    nifty_start = summary.get("nifty_start", 0.0)
+    nifty_latest = summary.get("nifty_latest", 0.0)
+    nifty_change = summary.get("nifty_change", 0.0)
+    start_date = summary.get("start_date")
+    expiry_date = summary.get("expiry_date")
+    selection_mode = summary.get("selection_mode", "STATIC_RULE")
+
+    gain_str = f"{latest_gain:+.2f} pts" if latest_gain is not None else "N/A"
+    inr_gain = f"₹{latest_gain * 75:+,.0f}" if latest_gain is not None else "N/A"
+    is_profitable = (latest_gain or 0.0) >= 0
+    color = 0x16a34a if is_profitable else 0xdc2626
+    status_icon = "🟢" if is_profitable else "🔴"
+
+    headline = (
+        f"📈 **[NIFTY50 Weekly Strategy Close]** Cycle `{cycle_id}` • "
+        f"Final P&L: **{gain_str} ({inr_gain})** {status_icon}"
+    )
+
+    period_str = (
+        f"{start_date.strftime('%d %b %Y') if start_date else 'N/A'} → "
+        f"{expiry_date.strftime('%d %b %Y') if expiry_date else 'N/A'}"
+    )
+
+    fields = [
+        {
+            "name": "📊 Strategy Final P&L",
+            "value": (
+                f"Combined Gain/Loss: **{gain_str}**\n"
+                f"Estimated INR P&L: **{inr_gain}** (1 lot / 75 qty)"
+            ),
+            "inline": True,
+        },
+        {
+            "name": "🌊 Watermark Range",
+            "value": (
+                f"Peak Profit: `{best_gain:+.2f} pts`\n"
+                f"Max Drawdown: `{worst_gain:+.2f} pts`"
+                if best_gain is not None and worst_gain is not None
+                else "N/A"
+            ),
+            "inline": True,
+        },
+        {
+            "name": "🎯 Strangle Positioning",
+            "value": (
+                f"**CALL {call_strike} CE** (Entry: ₹{call_buy:.2f})\n"
+                f"**PUT {put_strike} PE** (Entry: ₹{put_buy:.2f})"
+            ),
+            "inline": False,
+        },
+        {
+            "name": "📍 Underlying NIFTY Index",
+            "value": (
+                f"Open: **{nifty_start:.1f}** → Close: **{nifty_latest:.1f}** "
+                f"({nifty_change:+.1f} pts)"
+            ),
+            "inline": True,
+        },
+        {
+            "name": "🗓️ Execution Window",
+            "value": f"{period_str}\nRecorded Points: **{summary.get('row_count', 0)}**",
+            "inline": True,
+        },
+    ]
+
+    if summary.get("selection_rationale"):
+        fields.append({
+            "name": f"🧠 Strategy Mode: `{selection_mode}`",
+            "value": str(summary["selection_rationale"])[:1000],
+            "inline": False,
+        })
+
+    embed = {
+        "title": f"📈 NIFTY50 Weekly Strangle Lifecycle Report [{cycle_id}]",
+        "color": color,
+        "description": f"Weekly cycle performance closed. Status: **{'PROFITABLE' if is_profitable else 'LOSS'}**",
+        "fields": fields,
+        "footer": {
+            "text": "NIFTY50 Weekly Options Automated Strategy • Monday Close"
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return send_discord_watchdog(headline, embed)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send NIFTY50 weekly report")
     parser.add_argument("--dry-run", action="store_true", help="Generate preview only")
@@ -413,6 +588,14 @@ def main() -> int:
             render_html(rows, summary, "cid:nifty-chart"),
             chart_path,
         )
+
+        # Dispatch to DISCORD_WATCHDOG channel
+        try:
+            logger.info("Dispatching weekly report card to DISCORD_WATCHDOG...")
+            send_weekly_report_discord(summary)
+        except Exception as discord_err:
+            logger.warning("Discord watchdog delivery skipped: %s", discord_err)
+
         return 0
     except Exception as exc:
         logger.error("Weekly report failed: %s", exc, exc_info=True)
