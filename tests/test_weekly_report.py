@@ -89,33 +89,18 @@ class WeeklyReportTests(unittest.TestCase):
             self.assertIn("CALL 24700", report_html)
             self.assertIn("+16.00", report_html)
 
-    @patch("scripts.send_weekly_report.smtplib.SMTP_SSL")
-    def test_email_uses_legacy_gmail_environment_variables(self, smtp_ssl):
+    def test_email_retired_noop(self):
+        """send_email should safely log and return without error since email is retired."""
         with tempfile.TemporaryDirectory() as temp_dir:
             chart_path = Path(temp_dir) / "chart.png"
             chart_path.write_bytes(b"test-png-content")
-            smtp = smtp_ssl.return_value.__enter__.return_value
-            with patch.dict(
-                os.environ,
-                {
-                    "EMAIL_SENDER": "sender@gmail.com",
-                    "EMAIL_APP_PASSWORD": "app-password",
-                    "EMAIL_RECIPIENT": "recipient@example.com",
-                    "EMAIL_SMTP_SERVER": "smtp.gmail.com",
-                    "EMAIL_SMTP_PORT": "465",
-                },
-                clear=False,
-            ):
-                send_email(
-                    "Weekly report",
-                    "Plain body",
-                    '<html><img src="cid:nifty-chart"></html>',
-                    chart_path,
-                )
-
-            smtp_ssl.assert_called_once_with("smtp.gmail.com", 465, timeout=30)
-            smtp.login.assert_called_once_with("sender@gmail.com", "app-password")
-            self.assertEqual(smtp.sendmail.call_count, 1)
+            # Should safely execute without error even if email credentials are absent
+            send_email(
+                "Weekly report",
+                "Plain body",
+                '<html><img src="cid:nifty-chart"></html>',
+                chart_path,
+            )
 
     def test_resolve_discord_watchdog_url_from_env(self):
         with patch.dict(os.environ, {"DISCORD_WATCHDOG": "https://discord.com/api/webhooks/test-url"}):

@@ -12,14 +12,10 @@ import json
 import logging
 import os
 import re
-import smtplib
 import sqlite3
 import sys
 import urllib.request
 from datetime import date, datetime, timezone
-from email.mime.image import MIMEImage
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -327,38 +323,11 @@ def render_plain_text(summary: Dict) -> str:
 
 
 def send_email(subject: str, plain_body: str, html_body: str, chart_path: Path) -> None:
-    """Send the weekly report via Gmail-compatible SMTP SSL."""
-    sender = os.getenv("EMAIL_SENDER", "").strip()
-    password = os.getenv("EMAIL_APP_PASSWORD", "").strip()
-    recipients = [
-        item.strip() for item in os.getenv("EMAIL_RECIPIENT", "").split(",")
-        if item.strip()
-    ]
-    server_name = os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com")
-    server_port = int(os.getenv("EMAIL_SMTP_PORT", "465"))
-    if not sender or not password or not recipients:
-        raise ValueError(
-            "Set EMAIL_SENDER, EMAIL_APP_PASSWORD, and EMAIL_RECIPIENT in .env"
-        )
-
-    message = MIMEMultipart("related")
-    message["From"] = sender
-    message["To"] = ", ".join(recipients)
-    message["Subject"] = subject
-    alternatives = MIMEMultipart("alternative")
-    alternatives.attach(MIMEText(plain_body, "plain", "utf-8"))
-    alternatives.attach(MIMEText(html_body, "html", "utf-8"))
-    message.attach(alternatives)
-    with chart_path.open("rb") as chart_file:
-        chart = MIMEImage(chart_file.read(), _subtype="png")
-    chart.add_header("Content-ID", "<nifty-chart>")
-    chart.add_header("Content-Disposition", "inline", filename=chart_path.name)
-    message.attach(chart)
-
-    with smtplib.SMTP_SSL(server_name, server_port, timeout=30) as smtp:
-        smtp.login(sender, password)
-        smtp.sendmail(sender, recipients, message.as_string())
-    logger.info("Weekly report sent to %s", ", ".join(recipients))
+    """
+    Deprecated: Email notifications have been retired in favor of DISCORD_WATCHDOG.
+    Logs notification and returns.
+    """
+    logger.info("Email notifications are disabled. Weekly report cards route to DISCORD_WATCHDOG.")
 
 
 def resolve_discord_watchdog_url() -> str:
@@ -574,27 +543,19 @@ def main() -> int:
         logger.info("Report preview written: %s", preview_path)
 
         if args.dry_run:
-            logger.info("Dry run complete; email not sent")
+            logger.info("Dry run complete; report card not sent")
             return 0
-
-        latest_gain = _gain_style(summary["latest_gainloss"])[1]
-        subject = (
-            f"NIFTY50 Weekly Report | {summary['expiry_date'].strftime('%d %b %Y')} "
-            f"| G/L {latest_gain} pts"
-        )
-        send_email(
-            subject,
-            render_plain_text(summary),
-            render_html(rows, summary, "cid:nifty-chart"),
-            chart_path,
-        )
 
         # Dispatch to DISCORD_WATCHDOG channel
         try:
             logger.info("Dispatching weekly report card to DISCORD_WATCHDOG...")
-            send_weekly_report_discord(summary)
+            success = send_weekly_report_discord(summary)
+            if success:
+                logger.info("✓ Discord watchdog weekly report dispatched successfully")
+            else:
+                logger.warning("⚠ Discord watchdog delivery skipped or webhook not set")
         except Exception as discord_err:
-            logger.warning("Discord watchdog delivery skipped: %s", discord_err)
+            logger.warning("Discord watchdog delivery failed: %s", discord_err)
 
         return 0
     except Exception as exc:
