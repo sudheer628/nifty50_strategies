@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-from config import SQLITE_DIR, STRATEGY_NAME
+from config import SQLITE_DIR, STRATEGY_NAME, NIFTY_LOT_SIZE
 
 
 logger = logging.getLogger("nifty50_weekly_report")
@@ -45,9 +45,13 @@ logging.basicConfig(
 
 IST = pytz.timezone("Asia/Kolkata")
 UTC = pytz.UTC
-DB_NAME_PATTERN = re.compile(
+DB_NAME_PATTERN_WEEKLY = re.compile(
     r"nifty50_weekly_data_(?P<start>\d{8})_(?P<expiry>\d{8})\.db$"
 )
+DB_NAME_PATTERN_THURSDAY = re.compile(
+    r"nifty50_thursday_data_(?P<start>\d{8})_(?P<expiry>\d{8})\.db$"
+)
+DB_NAME_PATTERN = DB_NAME_PATTERN_WEEKLY
 
 
 def _parse_yyyymmdd(value: str) -> date:
@@ -68,17 +72,21 @@ def _parse_timestamp(value) -> datetime:
     return dt.astimezone(IST)
 
 
-def find_weekly_db(report_date: date, explicit_path: Optional[str] = None) -> Path:
-    """Find the weekly DB whose Tuesday-expiry window covers report_date."""
+def find_weekly_db(report_date: date, explicit_path: Optional[str] = None, track: str = "weekly") -> Path:
+    """Find the strategy DB whose cycle window covers report_date."""
     if explicit_path:
         path = Path(explicit_path).expanduser().resolve()
         if not path.is_file():
-            raise FileNotFoundError(f"Weekly database not found: {path}")
+            raise FileNotFoundError(f"Strategy database not found: {path}")
         return path
 
+    is_thu = track.lower() == "thursday"
+    pattern = DB_NAME_PATTERN_THURSDAY if is_thu else DB_NAME_PATTERN_WEEKLY
+    glob_str = "nifty50_thursday_data_*_*.db" if is_thu else "nifty50_weekly_data_*_*.db"
+
     candidates: List[Tuple[date, date, Path]] = []
-    for path in Path(SQLITE_DIR).glob("nifty50_weekly_data_*_*.db"):
-        match = DB_NAME_PATTERN.match(path.name)
+    for path in Path(SQLITE_DIR).glob(glob_str):
+        match = pattern.match(path.name)
         if not match:
             continue
         start = _parse_yyyymmdd(match.group("start"))
@@ -88,7 +96,7 @@ def find_weekly_db(report_date: date, explicit_path: Optional[str] = None) -> Pa
 
     if not candidates:
         raise FileNotFoundError(
-            f"No weekly database in {SQLITE_DIR} covers {report_date.isoformat()}"
+            f"No {track} strategy database in {SQLITE_DIR} covers {report_date.isoformat()}"
         )
     return max(candidates, key=lambda item: item[0])[2]
 
@@ -407,7 +415,7 @@ def send_discord_watchdog(content: str, embed: Optional[Dict[str, Any]] = None) 
         return False
 
 
-def send_weekly_report_discord(summary: Dict[str, Any]) -> bool:
+def send_weekly_report_discord(summary: Dict[str, Any], track: str = "weekly") -> bool:
     """Send NIFTY50 weekly strangle close report card to DISCORD_WATCHDOG."""
     cycle_id = summary.get("cycle_id", "UNKNOWN")
     latest_gain = summary.get("latest_gainloss")
@@ -424,14 +432,16 @@ def send_weekly_report_discord(summary: Dict[str, Any]) -> bool:
     expiry_date = summary.get("expiry_date")
     selection_mode = summary.get("selection_mode", "STATIC_RULE")
 
+    track_resolved = summary.get("track") or track or "weekly"
+    track_label = "3-Day Thursday Strategy" if str(track_resolved).lower() == "thursday" else "Weekly Strategy"
     gain_str = f"{latest_gain:+.2f} pts" if latest_gain is not None else "N/A"
-    inr_gain = f"₹{latest_gain * 75:+,.0f}" if latest_gain is not None else "N/A"
+    inr_gain = f"₹{latest_gain * NIFTY_LOT_SIZE:+,.0f}" if latest_gain is not None else "N/A"
     is_profitable = (latest_gain or 0.0) >= 0
     color = 0x16a34a if is_profitable else 0xdc2626
     status_icon = "🟢" if is_profitable else "🔴"
 
     headline = (
-        f"📈 **[NIFTY50 Weekly Strategy Close]** Cycle `{cycle_id}` • "
+        f"📈 **[NIFTY50 {track_label} Close]** Cycle `{cycle_id}` • "
         f"Final P&L: **{gain_str} ({inr_gain})** {status_icon}"
     )
 
@@ -445,7 +455,7 @@ def send_weekly_report_discord(summary: Dict[str, Any]) -> bool:
             "name": "📊 Strategy Final P&L",
             "value": (
                 f"Combined Gain/Loss: **{gain_str}**\n"
-                f"Estimated INR P&L: **{inr_gain}** (1 lot / 75 qty)"
+                f"Estimated INR P&L: **{inr_gain}** (1 lot / {NIFTY_LOT_SIZE} qty)"
             ),
             "inline": True,
         },
@@ -490,12 +500,12 @@ def send_weekly_report_discord(summary: Dict[str, Any]) -> bool:
         })
 
     embed = {
-        "title": f"📈 NIFTY50 Weekly Strangle Lifecycle Report [{cycle_id}]",
+        "title": f"📈 NIFTY50 {track_label} Lifecycle Report [{cycle_id}]",
         "color": color,
-        "description": f"Weekly cycle performance closed. Status: **{'PROFITABLE' if is_profitable else 'LOSS'}**",
+        "description": f"{track_label} cycle performance closed. Status: **{'PROFITABLE' if is_profitable else 'LOSS'}**",
         "fields": fields,
         "footer": {
-            "text": "NIFTY50 Weekly Options Automated Strategy • Monday Close"
+            "text": f"NIFTY50 {track_label} Automated Strategy • Monday Close"
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -504,9 +514,15 @@ def send_weekly_report_discord(summary: Dict[str, Any]) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Send NIFTY50 weekly report")
+    parser = argparse.ArgumentParser(description="Send NIFTY50 strategy report")
     parser.add_argument("--dry-run", action="store_true", help="Generate preview only")
-    parser.add_argument("--db", help="Explicit weekly SQLite database path")
+    parser.add_argument("--db", help="Explicit SQLite database path")
+    parser.add_argument(
+        "--track",
+        choices=["weekly", "thursday"],
+        default="weekly",
+        help="Strategy track to report on (default: weekly)",
+    )
     parser.add_argument(
         "--report-date",
         "--date",
@@ -526,16 +542,17 @@ def main() -> int:
             report_date = datetime.strptime(clean_date, "%Y%m%d").date()
         else:
             report_date = datetime.now(IST).date()
-        db_path = find_weekly_db(report_date, args.db)
-        logger.info("Using weekly database: %s", db_path)
+        db_path = find_weekly_db(report_date, args.db, track=args.track)
+        logger.info("Using strategy database: %s", db_path)
         rows, snapshot = load_report_data(db_path)
         summary = calculate_summary(rows, snapshot, db_path)
 
         output_dir = Path(args.output_dir).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         stamp = summary["start_date"].strftime("%Y%m%d") if summary["start_date"] else report_date.strftime("%Y%m%d")
-        chart_path = output_dir / f"nifty50_weekly_{stamp}.png"
-        preview_path = output_dir / f"nifty50_weekly_{stamp}.html"
+        prefix = "nifty50_thursday" if args.track.lower() == "thursday" else "nifty50_weekly"
+        chart_path = output_dir / f"{prefix}_{stamp}.png"
+        preview_path = output_dir / f"{prefix}_{stamp}.html"
         create_chart(rows, chart_path)
         preview_path.write_text(
             render_html(rows, summary, chart_path.name), encoding="utf-8"
@@ -548,10 +565,10 @@ def main() -> int:
 
         # Dispatch to DISCORD_WATCHDOG channel
         try:
-            logger.info("Dispatching weekly report card to DISCORD_WATCHDOG...")
-            success = send_weekly_report_discord(summary)
+            logger.info("Dispatching %s report card to DISCORD_WATCHDOG...", args.track)
+            success = send_weekly_report_discord(summary, track=args.track)
             if success:
-                logger.info("✓ Discord watchdog weekly report dispatched successfully")
+                logger.info("✓ Discord watchdog report dispatched successfully")
             else:
                 logger.warning("⚠ Discord watchdog delivery skipped or webhook not set")
         except Exception as discord_err:
@@ -559,7 +576,7 @@ def main() -> int:
 
         return 0
     except Exception as exc:
-        logger.error("Weekly report failed: %s", exc, exc_info=True)
+        logger.error("Report failed: %s", exc, exc_info=True)
         return 1
 
 

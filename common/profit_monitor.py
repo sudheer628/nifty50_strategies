@@ -89,6 +89,8 @@ def evaluate_peak_profit(
     current_ts: Optional[int] = None,
     fsm_state: Optional[str] = None,
     fsm_total_gainloss: Optional[float] = None,
+    snapshot_filepath: Optional[str] = None,
+    track_label: str = "Weekly Strangle",
 ) -> Tuple[Dict[str, Any], bool, str]:
     """
     Evaluate current strangle profit against the cycle's high-water mark.
@@ -124,6 +126,9 @@ def evaluate_peak_profit(
     peak_state = snapshot.get("peak_profit")
     cycle_id = snapshot.get("cycle_id")
 
+    def _persist_peak(state_to_save: dict) -> None:
+        update_active_peak_state(state_to_save, filepath=snapshot_filepath)
+
     # Baseline initialization on first run or when peak_profit not yet recorded
     if not peak_state:
         peak_state = {
@@ -138,7 +143,7 @@ def evaluate_peak_profit(
             "alerts_sent_today": 0,
             "last_alert_date": today_ist,
         }
-        update_active_peak_state(peak_state)
+        _persist_peak(peak_state)
         return peak_state, False, "Baseline established at cycle order lock"
 
     if cycle_id and "cycle_id" not in peak_state:
@@ -148,7 +153,7 @@ def evaluate_peak_profit(
     if peak_state.get("last_alert_date") != today_ist:
         peak_state["alerts_sent_today"] = 0
         peak_state["last_alert_date"] = today_ist
-        update_active_peak_state(peak_state)
+        _persist_peak(peak_state)
 
     if is_first_tick:
         # First tick of cycle lock establishes initial baseline
@@ -156,7 +161,7 @@ def evaluate_peak_profit(
         peak_state["peak_pnl_pct"] = combined_pnl_pct
         peak_state["peak_pnl_inr"] = combined_pnl_inr
         peak_state["peak_timestamp"] = current_ts
-        update_active_peak_state(peak_state)
+        _persist_peak(peak_state)
         return peak_state, False, "Baseline updated at initial cycle tick"
 
     # Check if a new profit peak has been reached or an unnotified qualifying peak is being retried
@@ -184,12 +189,12 @@ def evaluate_peak_profit(
 
     # Feature flag check
     if not PEAK_ALERT_ENABLED:
-        update_active_peak_state(peak_state)
+        _persist_peak(peak_state)
         return peak_state, False, "Peak profit alert disabled in configuration"
 
     # Validation: Profit must be >= 20.0%
     if combined_pnl_pct < PEAK_ALERT_MIN_PROFIT_PCT:
-        update_active_peak_state(peak_state)
+        _persist_peak(peak_state)
         return (
             peak_state,
             False,
@@ -207,7 +212,7 @@ def evaluate_peak_profit(
         pct_diff = combined_pnl_pct - last_notified_pct
 
         if pts_diff < PEAK_ALERT_HYSTERESIS_PTS and pct_diff < PEAK_ALERT_HYSTERESIS_PCT:
-            update_active_peak_state(peak_state)
+            _persist_peak(peak_state)
             return (
                 peak_state,
                 False,
@@ -226,7 +231,7 @@ def evaluate_peak_profit(
     peak_state["alerts_sent_today"] = alerts_today + 1
     peak_state["last_alert_date"] = today_ist
 
-    update_active_peak_state(peak_state)
+    _persist_peak(peak_state)
 
     event = {
         "cycle_id": snapshot.get("cycle_id", "UNKNOWN"),
@@ -250,6 +255,7 @@ def evaluate_peak_profit(
         "fsm_state": fsm_state,
         "fsm_total_gainloss": fsm_total_gainloss,
         "dry_run": dry_run,
+        "track_label": track_label,
     }
 
     dispatch_ok = on_new_peak(event)
@@ -260,7 +266,7 @@ def evaluate_peak_profit(
         peak_state["last_notified_pct"] = prev_notified_pct
         peak_state["last_notified_timestamp"] = prev_notified_ts
         peak_state["alerts_sent_today"] = prev_alerts_today
-        update_active_peak_state(peak_state)
+        _persist_peak(peak_state)
         return (
             peak_state,
             False,
@@ -329,9 +335,17 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     call_pnl_sign = "+" if event.get("call_pnl_pts", 0.0) >= 0 else ""
     put_pnl_sign = "+" if event.get("put_pnl_pts", 0.0) >= 0 else ""
     comb_pnl_sign = "+" if event.get("combined_pnl_pts", 0.0) >= 0 else ""
+    track_label = event.get("track_label", "Weekly Strangle")
+
+    if track_label and track_label != "Weekly Strangle":
+        headline_label = f" [{track_label}]"
+        title_label = f" [{track_label}]"
+    else:
+        headline_label = ""
+        title_label = " Weekly Strangle"
 
     headline = (
-        f"🎯 **NIFTY Strangle NEW PEAK PROFIT: {comb_pnl_sign}{event['combined_pnl_pct']:.1f}% "
+        f"🎯 **NIFTY{headline_label} NEW PEAK PROFIT: {comb_pnl_sign}{event['combined_pnl_pct']:.1f}% "
         f"({comb_pnl_sign}{event['combined_pnl_pts']:.1f} pts / ₹{event['combined_pnl_inr']:,.0f})** | NIFTY: {event['nifty_ltp']:.2f}"
     )
 
@@ -350,7 +364,7 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     put_ltp_str = f"₹{put_ltp:.2f}" if put_ltp is not None else "N/A"
 
     embed = {
-        "title": "🎯 NIFTY Weekly Strangle High-Water Mark",
+        "title": f"🎯 NIFTY{title_label} High-Water Mark",
         "description": f"New peak profit achieved for active cycle `{event.get('cycle_id', 'UNKNOWN')}`{fsm_str}",
         "color": 0x10B981,  # Emerald green
         "fields": [

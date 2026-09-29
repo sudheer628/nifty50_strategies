@@ -20,8 +20,8 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from config import logger
-from common.calendar_utils import check_nse_holiday
+from config import logger, ACTIVE_SNAPSHOT_FILE, THURSDAY_SNAPSHOT_FILE
+from common.calendar_utils import check_nse_holiday, is_thursday_strategy_active_day
 from common.expiry import format_expiry_angelone
 from common.storage import load_active_snapshot
 from common.angelone_client import get_nifty_spot, get_nifty_option_chain
@@ -50,7 +50,7 @@ def _is_market_time() -> bool:
     return MARKET_OPEN <= now.time() <= MARKET_CLOSE
 
 
-def monitor_once(force: bool = False, no_alert: bool = False, no_email: bool = False) -> bool:
+def monitor_once(force: bool = False, no_alert: bool = False, no_email: bool = False, track: str = "weekly") -> bool:
     """
     Perform one standalone 15-minute peak profit check.
 
@@ -59,32 +59,41 @@ def monitor_once(force: bool = False, no_alert: bool = False, no_email: bool = F
     """
     dry_run = no_alert or no_email
     today = _today_ist()
+    is_thursday_track = (track.lower() == "thursday")
+    track_label = "3-Day Thursday Strategy" if is_thursday_track else "Weekly Strangle"
+    snapshot_file = THURSDAY_SNAPSHOT_FILE if is_thursday_track else ACTIVE_SNAPSHOT_FILE
+    log_prefix = f"[PEAK MONITOR - {track_label}]"
 
     # 1. Holiday guard
     if check_nse_holiday(today):
-        logger.info("[PEAK MONITOR] Today (%s) is an NSE market holiday or weekend. Skipping.", today)
+        logger.info("%s Today (%s) is an NSE market holiday or weekend. Skipping.", log_prefix, today)
+        return True
+
+    # 1b. Thursday track active day guard
+    if is_thursday_track and not is_thursday_strategy_active_day(today):
+        logger.info("%s Today (%s) is not an active trading day for Thursday track. Skipping.", log_prefix, today)
         return True
 
     # 2. Market hours guard
     if not force and not _is_market_time():
-        logger.info("[PEAK MONITOR] Outside market hours (%s IST). Use --force to override.", _now_ist().strftime("%H:%M"))
+        logger.info("%s Outside market hours (%s IST). Use --force to override.", log_prefix, _now_ist().strftime("%H:%M"))
         return True
 
     # 3. Snapshot existence and status guard
-    snapshot = load_active_snapshot()
+    snapshot = load_active_snapshot(filepath=snapshot_file)
     if not snapshot:
-        logger.info("[PEAK MONITOR] No active weekly cycle snapshot found. Skipping.")
+        logger.info("%s No active cycle snapshot found at %s. Skipping.", log_prefix, snapshot_file)
         return True
 
     if snapshot.get("status") == "closed":
-        logger.info("[PEAK MONITOR] Active weekly cycle %s is marked closed. Skipping.", snapshot.get("cycle_id"))
+        logger.info("%s Active cycle %s is marked closed. Skipping.", log_prefix, snapshot.get("cycle_id"))
         return True
 
     # 4. Buy prices locked guard
     call_buy = snapshot.get("call_buy_price")
     put_buy = snapshot.get("put_buy_price")
     if call_buy is None or put_buy is None:
-        logger.info("[PEAK MONITOR] Order buy prices not yet locked in snapshot. Skipping.")
+        logger.info("%s Order buy prices not yet locked in snapshot. Skipping.", log_prefix)
         return True
 
     call_strike = snapshot.get("call_strike")
@@ -132,27 +141,33 @@ def monitor_once(force: bool = False, no_alert: bool = False, no_email: bool = F
 
     # 7. Evaluate peak profit
     try:
-        peak_state, alert_triggered, peak_msg = evaluate_peak_profit(
-            snapshot=snapshot,
-            nifty_ltp=nifty_ltp,
-            call_strike=call_strike,
-            call_ltp=call_ltp,
-            call_buy=call_buy,
-            put_strike=put_strike,
-            put_ltp=put_ltp,
-            put_buy=put_buy,
-            is_first_tick=False,
-            dry_run=dry_run,
-            fsm_state=fsm_state,
-            fsm_total_gainloss=fsm_total_gainloss,
-        )
+        eval_kwargs = {
+            "snapshot": snapshot,
+            "nifty_ltp": nifty_ltp,
+            "call_strike": call_strike,
+            "call_ltp": call_ltp,
+            "call_buy": call_buy,
+            "put_strike": put_strike,
+            "put_ltp": put_ltp,
+            "put_buy": put_buy,
+            "is_first_tick": False,
+            "dry_run": dry_run,
+            "fsm_state": fsm_state,
+            "fsm_total_gainloss": fsm_total_gainloss,
+        }
+        if track.lower() == "thursday":
+            eval_kwargs["snapshot_filepath"] = snapshot_file
+            eval_kwargs["track_label"] = track_label
+
+        peak_state, alert_triggered, peak_msg = evaluate_peak_profit(**eval_kwargs)
 
         total_cost = call_buy + put_buy
         curr_pnl_pts = round((call_ltp - call_buy) + (put_ltp - put_buy), 2)
         curr_pnl_pct = round((curr_pnl_pts / total_cost) * 100.0, 2) if total_cost > 0 else 0.0
 
         logger.info(
-            "[STANDALONE PEAK MONITOR] %s (Current: %+0.2f%% / %+0.2f pts | Peak: %+0.2f%% / %+0.2f pts | Alerts Today: %d)",
+            "%s %s (Current: %+0.2f%% / %+0.2f pts | Peak: %+0.2f%% / %+0.2f pts | Alerts Today: %d)",
+            log_prefix,
             peak_msg,
             curr_pnl_pct,
             curr_pnl_pts,
@@ -162,13 +177,19 @@ def monitor_once(force: bool = False, no_alert: bool = False, no_email: bool = F
         )
         return True
     except Exception as eval_err:
-        logger.error("[PEAK MONITOR] Error evaluating peak profit: %s", eval_err)
+        logger.error("%s Error evaluating peak profit: %s", log_prefix, eval_err)
         return False
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="NIFTY Weekly Option Standalone Peak-Profit Monitor (15-min cadence)"
+    )
+    parser.add_argument(
+        "--track",
+        choices=["weekly", "thursday"],
+        default="weekly",
+        help="Strategy track to monitor (default: weekly)",
     )
     parser.add_argument(
         "--force",
@@ -189,12 +210,15 @@ def main():
     )
     args = parser.parse_args()
 
+    snapshot_file = THURSDAY_SNAPSHOT_FILE if args.track.lower() == "thursday" else ACTIVE_SNAPSHOT_FILE
+
     if args.check:
-        snapshot = load_active_snapshot()
+        snapshot = load_active_snapshot(filepath=snapshot_file)
         if not snapshot:
-            logger.info("No active snapshot found.")
+            logger.info("No active snapshot found at %s.", snapshot_file)
             return
         peak_info = snapshot.get("peak_profit") or {}
+        logger.info("Track:            %s", args.track)
         logger.info("Cycle ID:         %s", snapshot.get("cycle_id"))
         logger.info("Status:           %s", snapshot.get("status"))
         logger.info("Expiry:           %s", snapshot.get("expiry_date"))
@@ -209,10 +233,11 @@ def main():
         logger.info("Alerts Today:     %d", peak_info.get("alerts_sent_today", 0))
         return
 
-    success = monitor_once(force=args.force, no_alert=args.no_alert)
+    success = monitor_once(force=args.force, no_alert=args.no_alert, track=args.track)
     if not success:
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+

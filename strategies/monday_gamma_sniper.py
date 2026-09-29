@@ -411,7 +411,7 @@ def run_gamma_sniper(
 
     trade_record = {
         "trade_timestamp": _now_utc_ts(),
-        "expiry_date": expiry_str or format_expiry_file(expiry_date_obj),
+        "expiry_date": expiry_str or format_expiry_file(cycle_expiry_date),
         "nifty_spot": spot_ltp,
         "option_type": option_type,
         "strike": strike,

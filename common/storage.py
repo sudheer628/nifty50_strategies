@@ -13,6 +13,7 @@ import sqlite3
 import json
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 from config import (
     logger,
@@ -52,6 +53,25 @@ def build_db_path(start_date_str: str, expiry_date_str: str) -> str:
     return os.path.join(
         SQLITE_DIR,
         f"nifty50_weekly_data_{start_date_str}_{expiry_date_str}.db"
+    )
+
+
+def build_thursday_db_path(start_date_str: str, expiry_date_str: str) -> str:
+    """
+    Construct the SQLite database file path for a 3-day Thursday strategy cycle.
+
+    Args:
+        start_date_str:   Cycle start date as "YYYYMMDD".
+        expiry_date_str:  Expiry date as "YYYYMMDD".
+
+    Returns:
+        Full path e.g.
+        /home/ubuntu/sqlite/strategies/nifty50_thursday_data_20261001_20261006.db
+    """
+    _ensure_dir(SQLITE_DIR)
+    return os.path.join(
+        SQLITE_DIR,
+        f"nifty50_thursday_data_{start_date_str}_{expiry_date_str}.db"
     )
 
 
@@ -451,7 +471,7 @@ def _atomic_write_json(file_path: str, data: dict) -> None:
         raise
 
 
-def save_active_snapshot(snapshot: dict) -> None:
+def save_active_snapshot(snapshot: dict, filepath: Optional[str] = None) -> None:
     """
     Write the active week's buy prices to the JSON snapshot file.
 
@@ -459,19 +479,20 @@ def save_active_snapshot(snapshot: dict) -> None:
     after the **old** week's start date (so the archive name
     reflects the week it came from, not the new week).
     """
-    _ensure_dir(SNAPSHOT_DIR)
+    target_file = filepath or ACTIVE_SNAPSHOT_FILE
+    _ensure_dir(os.path.dirname(target_file))
 
     # Archive the existing snapshot before overwriting, using the
     # OLD snapshot's week_start_date so the name is meaningful.
-    if os.path.exists(ACTIVE_SNAPSHOT_FILE):
+    if os.path.exists(target_file):
         try:
-            old_snapshot = load_active_snapshot()
+            old_snapshot = load_active_snapshot(filepath=target_file)
             suffix = old_snapshot.get("week_start_date", "old")
         except (json.JSONDecodeError, OSError):
             suffix = "old"
-        archive_name = ACTIVE_SNAPSHOT_FILE.replace(".json", f"_{suffix}.json")
+        archive_name = target_file.replace(".json", f"_{suffix}.json")
         try:
-            os.rename(ACTIVE_SNAPSHOT_FILE, archive_name)
+            os.rename(target_file, archive_name)
             logger.info("Archived previous snapshot to %s", archive_name)
         except OSError as exc:
             logger.warning("Failed to archive snapshot: %s", exc)
@@ -479,65 +500,69 @@ def save_active_snapshot(snapshot: dict) -> None:
     if "status" not in snapshot:
         snapshot["status"] = "ongoing"
 
-    _atomic_write_json(ACTIVE_SNAPSHOT_FILE, snapshot)
-    logger.info("Active buy snapshot saved: %s", ACTIVE_SNAPSHOT_FILE)
+    _atomic_write_json(target_file, snapshot)
+    logger.info("Active buy snapshot saved: %s", target_file)
 
 
-def load_active_snapshot() -> dict:
+def load_active_snapshot(filepath: Optional[str] = None) -> dict:
     """
     Load the currently active week's buy-price JSON snapshot.
 
     Returns:
         Snapshot dict or empty dict if the file does not exist.
     """
-    if not os.path.exists(ACTIVE_SNAPSHOT_FILE):
-        logger.info("No active snapshot found at %s", ACTIVE_SNAPSHOT_FILE)
+    target_file = filepath or ACTIVE_SNAPSHOT_FILE
+    if not os.path.exists(target_file):
+        logger.info("No active snapshot found at %s", target_file)
         return {}
-    with open(ACTIVE_SNAPSHOT_FILE, "r", encoding="utf-8") as fh:
+    with open(target_file, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
-def mark_active_cycle_closed() -> bool:
+def mark_active_cycle_closed(filepath: Optional[str] = None) -> bool:
     """
-    Mark the active cycle in current_week_buy.json as 'closed'.
+    Mark the active cycle in current_week_buy.json (or specified snapshot file) as 'closed'.
     
     Provides an explicit lifecycle flag so downstream inference runners
     and health validators know the weekly strategy has concluded.
     """
-    snapshot = load_active_snapshot()
+    target_file = filepath or ACTIVE_SNAPSHOT_FILE
+    snapshot = load_active_snapshot(filepath=target_file)
     if not snapshot:
         return False
     snapshot["status"] = "closed"
     snapshot["closed_at"] = int(datetime.now(timezone.utc).timestamp())
-    _atomic_write_json(ACTIVE_SNAPSHOT_FILE, snapshot)
-    logger.info("Marked active strategy cycle %s as CLOSED", snapshot.get("cycle_id"))
+    _atomic_write_json(target_file, snapshot)
+    logger.info("Marked active strategy cycle %s as CLOSED in %s", snapshot.get("cycle_id"), target_file)
     return True
 
 
-def update_active_fsm_state(fsm_dict: dict) -> bool:
+def update_active_fsm_state(fsm_dict: dict, filepath: Optional[str] = None) -> bool:
     """
-    Update or initialize the alpha_fsm section of current_week_buy.json in-place.
+    Update or initialize the alpha_fsm section of current_week_buy.json (or specified snapshot file) in-place.
     
     Guarantees that Decoupled Leg state, trailing stops, and realized gains
     persist across 30-minute cron executions without disturbing base snapshot fields.
     """
-    snapshot = load_active_snapshot()
+    target_file = filepath or ACTIVE_SNAPSHOT_FILE
+    snapshot = load_active_snapshot(filepath=target_file)
     if not snapshot:
         return False
     snapshot["alpha_fsm"] = fsm_dict
-    _atomic_write_json(ACTIVE_SNAPSHOT_FILE, snapshot)
+    _atomic_write_json(target_file, snapshot)
     return True
 
 
-def update_active_peak_state(peak_data: dict) -> bool:
+def update_active_peak_state(peak_data: dict, filepath: Optional[str] = None) -> bool:
     """
-    Update the peak_profit section of current_week_buy.json in-place atomically.
+    Update the peak_profit section of current_week_buy.json (or specified snapshot file) in-place atomically.
 
     Guarantees that high-water mark metrics, notification timestamps,
     and daily alert counters persist across 15-minute monitor executions
     without triggering file archive renaming or altering SQLite schema.
     """
-    snapshot = load_active_snapshot()
+    target_file = filepath or ACTIVE_SNAPSHOT_FILE
+    snapshot = load_active_snapshot(filepath=target_file)
     if not snapshot:
         return False
 
@@ -551,7 +576,7 @@ def update_active_peak_state(peak_data: dict) -> bool:
         return False
 
     snapshot["peak_profit"] = peak_data
-    _atomic_write_json(ACTIVE_SNAPSHOT_FILE, snapshot)
+    _atomic_write_json(target_file, snapshot)
     return True
 
 

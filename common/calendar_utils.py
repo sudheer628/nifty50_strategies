@@ -171,3 +171,86 @@ def get_strategy_cycle_role(target_date: Optional[date] = None) -> str:
         return "CLOSING_DAY"
 
     return "REGULAR_DAY"
+
+
+def is_thursday_strategy_start_day(target_date: Optional[date] = None) -> bool:
+    """
+    Returns True if target_date is the start day for the 3-day Thursday strategy track:
+    - Normal week: Thursday (if open).
+    - Thursday holiday week: Friday (if open and Thursday was an NSE holiday).
+    """
+    today = target_date if target_date else date.today()
+
+    if check_nse_holiday(today):
+        return False
+
+    weekday = today.weekday()
+
+    # Thursday open is standard start day
+    if weekday == 3:
+        return True
+
+    # Friday open is deferred start day ONLY IF Thursday was an exchange holiday
+    if weekday == 4:
+        thursday = today - timedelta(days=1)
+        if check_nse_holiday(thursday):
+            logger.info(f"Thursday was an NSE holiday. Friday ({today}) is active 3-Day Strategy Start Day.")
+            return True
+
+    return False
+
+
+def is_thursday_strategy_active_day(target_date: Optional[date] = None) -> bool:
+    """
+    Returns True if target_date is an active operating day for the Thursday 3-day track.
+    Active days: Thursday (3), Friday (4), and Monday (0) [or deferred Tuesday (1) if Monday holiday].
+    Returns False on normal Tuesdays (1) and Wednesdays (2), weekends, or holidays.
+    """
+    today = target_date if target_date else date.today()
+
+    if check_nse_holiday(today):
+        return False
+
+    weekday = today.weekday()
+    # Thursday (3) or Friday (4)
+    if weekday in (3, 4):
+        return True
+
+    # Monday (0) is closing day
+    if weekday == 0:
+        return True
+
+    # Tuesday (1) is only active if Monday was an exchange holiday (deferred close)
+    if weekday == 1:
+        monday = today - timedelta(days=1)
+        if check_nse_holiday(monday):
+            return True
+
+    return False
+
+
+def get_thursday_strategy_cycle_role(target_date: Optional[date] = None) -> str:
+    """
+    Returns designated role for target_date in the 3-day Thursday strategy lifecycle:
+    - 'HOLIDAY': Market closed.
+    - 'START_DAY': Thursday (or Friday if Thursday was a holiday).
+    - 'CLOSING_DAY': Monday (or Tuesday if Monday was a holiday).
+    - 'REGULAR_DAY': Friday (holding day when Thursday was start day).
+    - 'OFF_CYCLE': Tuesday/Wednesday (reserved for master Tuesday strategy).
+    """
+    today = target_date if target_date else date.today()
+
+    if check_nse_holiday(today):
+        return "HOLIDAY"
+
+    if is_thursday_strategy_start_day(today):
+        return "START_DAY"
+
+    if is_strategy_closing_day(today):
+        return "CLOSING_DAY"
+
+    if today.weekday() == 4:
+        return "REGULAR_DAY"
+
+    return "OFF_CYCLE"
+

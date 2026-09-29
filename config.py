@@ -40,6 +40,7 @@ for _lib in ("redis", "urllib3", "requests"):
 # Strategy identity
 # ---------------------------------------------------------------------------
 STRATEGY_NAME = "nifty50_weekly_option_collector"
+STRATEGY_NAME_THURSDAY = "nifty50_thursday_3day_collector"
 
 
 # ---------------------------------------------------------------------------
@@ -88,9 +89,14 @@ SNAPSHOT_DIR = os.getenv(
     "/home/ubuntu/sqlite/strategies/"
 )
 
-# Active week buy-price snapshot JSON file
+# Active week buy-price snapshot JSON file (Master Tuesday track)
 ACTIVE_SNAPSHOT_FILE = os.path.join(
     SNAPSHOT_DIR, "current_week_buy.json"
+)
+
+# Active 3-day buy-price snapshot JSON file (Parallel Thursday track)
+THURSDAY_SNAPSHOT_FILE = os.path.join(
+    SNAPSHOT_DIR, "current_thursday_buy.json"
 )
 
 

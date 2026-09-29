@@ -36,7 +36,8 @@ from config import (
 
 def main():
     parser = argparse.ArgumentParser(description="Sync NIFTY50 weekly option strategy to MongoDB Atlas")
-    parser.add_argument("--db", help="Path to weekly strategy database (defaults to latest)")
+    parser.add_argument("--db", help="Path to strategy database (defaults to latest)")
+    parser.add_argument("--track", default=None, choices=["weekly", "thursday"], help="Strategy track (weekly or thursday)")
     parser.add_argument("--status", action="store_true", help="Check MongoDB Atlas connection and collection counts")
     args = parser.parse_args()
 
@@ -67,17 +68,22 @@ def main():
 
     # Push from strategy DB
     target_db = args.db
+    track = args.track
     if not target_db:
         # Find latest weekly DB
         import glob
-        db_files = glob.glob(os.path.join(SQLITE_DIR, "nifty50_weekly_data_*.db"))
+        pattern = "nifty50_thursday_data_*.db" if track == "thursday" else "nifty50_weekly_data_*.db"
+        db_files = glob.glob(os.path.join(SQLITE_DIR, pattern))
         if not db_files:
-            logger.error(f"No weekly strategy databases found in {SQLITE_DIR}")
+            logger.error(f"No strategy databases found in {SQLITE_DIR} with pattern {pattern}")
             sys.exit(1)
         target_db = max(db_files, key=os.path.getmtime)
 
-    logger.info(f"Syncing strategy DB: {target_db}")
-    success = push_weekly_derivatives_to_mongodb(merged_db_path=target_db, lot_size=NIFTY_LOT_SIZE)
+    if not track:
+        track = "thursday" if "thursday" in os.path.basename(target_db).lower() else "weekly"
+
+    logger.info(f"Syncing strategy DB: {target_db} (track={track})")
+    success = push_weekly_derivatives_to_mongodb(merged_db_path=target_db, lot_size=NIFTY_LOT_SIZE, track=track)
     sys.exit(0 if success else 1)
 
 
