@@ -20,6 +20,7 @@ This strategy:
 
 - Automated weekly option data collection (NIFTY50 spot + option chains)
 - Tuesday dynamic AI strike selection and static benchmark tracking
+- Parallel 3-Day Thursday Strategy Track (Thursday–Monday cycle tracking fresh strikes locked on Thursday open, running alongside the Tuesday master cycle)
 - Price collection every 30 minutes from 09:31 AM to 15:31 PM IST
 - Smart Entry Gate timing (volatility, momentum, and technical filters with counterfactual shadow logging)
 - Decoupled FSM Strategy Engine (trailing stop ladders, profit harvest, salvage stops)
@@ -56,15 +57,17 @@ nifty50_strategies/
 │   └── storage.py                       # SQLite persistence, JSON snapshot & migrations
 ├── strategies/
 │   ├── __init__.py
-│   ├── weekly_option_collector.py       # Main strategy entry point (runs :01 & :31)
+│   ├── weekly_option_collector.py       # Master weekly strategy entry point (runs :01 & :31)
+│   ├── thursday_option_collector.py     # Standalone Thursday-to-Monday collector (runs :02 & :32)
 │   ├── monday_gamma_sniper.py           # Monday afternoon gamma scalper (runs every 10m)
-│   └── peak_profit_monitor.py           # Standalone 15-min peak monitor (runs :16 & :46)
+│   └── peak_profit_monitor.py           # Standalone 15-min peak monitor (runs :16/:46 & :17/:47)
 ├── scripts/
-│   ├── run_weekly_close.py              # Unified weekly close orchestrator (runs Mon 15:37)
-│   ├── send_weekly_report.py            # Monday HTML email + chart generator
+│   ├── run_weekly_close.py              # Master weekly close orchestrator (runs Mon 15:37)
+│   ├── run_thursday_close.py            # Thursday cycle close orchestrator (runs Mon 15:38)
+│   ├── send_weekly_report.py            # Monday HTML email + chart generator (supports --track)
 │   ├── compare_ai_vs_static_benchmark.py # Retrospective side-by-side P&L comparison
-│   └── sync_to_mongodb.py               # MongoDB Atlas derivatives synchronization CLI
-├── tests/                               # 61 automated pytest unit tests
+│   └── sync_to_mongodb.py               # MongoDB Atlas derivatives synchronization CLI (supports --track)
+├── tests/                               # 74 automated pytest unit tests
 │   ├── test_angelone_resolution.py
 │   ├── test_calendar_utils.py
 │   ├── test_entry_gate.py
@@ -73,6 +76,7 @@ nifty50_strategies/
 │   ├── test_profit_monitor.py
 │   ├── test_standalone_peak_monitor.py
 │   ├── test_storage.py
+│   ├── test_thursday_strategy.py
 │   ├── test_weekly_collector.py
 │   └── test_weekly_report.py
 └── cron/
@@ -83,19 +87,24 @@ nifty50_strategies/
 
 | Module | Purpose |
 |---|---|
-| `config.py` | Loads `.env`, Redis client factory, constants (strike step=100, lot size=65, NIFTY token, Angel One base URL, storage paths) |
+| `config.py` | Loads `.env`, Redis client factory, constants (strike step=100, lot size=65, NIFTY token, Angel One base URL, storage paths, Thursday strategy constants) |
 | `common/angelone_client.py` | JWT auth from Redis `angelone_jwt_feed`, NIFTY spot LTP, daily instrument-master option lookup, and `get_nifty_option_chain()` for CALL+PUT LTPs |
 | `common/expiry.py` | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()` (static 100-pt grid) |
-| `common/ai_strike_selector.py` | Tuesday 9:30 AM AI Strike Selector: optimizes strikes on standard 50-pt grid using VIX, ATR, Greeks ($\Delta \approx 0.35$), and IV skew via OpenRouter with asymmetric technical fallback |
-| `common/calendar_utils.py` | NSE holiday calendar resolution via Upstox API with in-process caching, strategy start/closing day detection, and Monday-holiday deferred close handling |
-| `common/entry_gate.py` | Smart Entry Gate: checks trend, ATR, and momentum filters at Tuesday 09:31 AM open to gate entry; writes counterfactual shadow records on deferral |
-| `common/fsm_strategy.py` | Decoupled Finite State Machine trade manager: tracks trailing stop ladders by days-to-expiry, harvest rules (+50% leg profit), and capital salvage stop rules |
-| `common/storage.py` | SQLite persistence layer: `init_db()`, auto-migrations for integer timestamps and FSM columns, trade updating, and active/archive JSON snapshot management |
-| `strategies/weekly_option_collector.py` | Cron-invoked collector (:01 & :31): handles Tuesday cycle initialization, Smart Gate evaluation, option LTP capture, FSM state updates, and counterfactual logging |
+| `common/ai_strike_selector.py` | AI Strike Selector: optimizes strikes on standard 50-pt grid using VIX, ATR, Greeks ($\Delta \approx 0.35$), and IV skew via OpenRouter with asymmetric technical fallback |
+| `common/calendar_utils.py` | NSE holiday calendar resolution via Upstox API with in-process caching, strategy start/closing day detection (Tuesday master & Thursday 3-day), and Monday-holiday deferred close handling |
+| `common/entry_gate.py` | Smart Entry Gate: checks trend, ATR, and momentum filters at cycle open to gate entry; writes counterfactual shadow records on deferral |
+| `common/fsm_strategy.py` | Decoupled Finite State Machine trade manager: tracks trailing stop ladders by days-to-expiry (25% buffer for >5 DTE, 18% for 1.5–5 DTE), harvest rules (+50% leg profit), and capital salvage stop rules |
+| `common/profit_monitor.py` | Peak-profit alert engine & future broker execution seam; parameterized with `snapshot_filepath` and `track_label` for track-isolated high-water marks |
+| `common/storage.py` | SQLite persistence layer: `init_db()`, `build_thursday_db_path()`, auto-migrations for integer timestamps and FSM columns, trade updating, and active/archive JSON snapshot management (`filepath` parameterized) |
+| `strategies/weekly_option_collector.py` | Cron-invoked master collector (:01 & :31): handles Tuesday cycle initialization, Smart Gate evaluation, option LTP capture, FSM state updates, and counterfactual logging |
+| `strategies/thursday_option_collector.py` | Cron-invoked standalone Thursday collector (:02 & :32): manages parallel 3-day strangle (Thu–Mon), evaluates Smart Gate, selects strikes, updates 18% trailing stop FSM, and logs to `current_thursday_buy.json` |
 | `strategies/monday_gamma_sniper.py` | Monday afternoon gamma scalper (13:15–15:00 IST): evaluates 5-min VWAP and volume surges ($\ge 1.5\times$) with target (+75%), stop-loss (-35%), and 15:10 IST time-stop |
-| `scripts/run_weekly_close.py` | Unified weekly orchestrator (Mon 15:37 IST / Tue 09:07 deferred): closes active cycle upfront, runs report email, benchmark scoring, SQLite merge, and skill generation |
+| `strategies/peak_profit_monitor.py` | Standalone 15-minute peak monitor (runs :16 & :46 for weekly; :17 & :47 for thursday via `--track thursday`): checks floating strangle profits against high-water marks |
+| `scripts/run_weekly_close.py` | Unified master weekly orchestrator (Mon 15:37 IST / Tue 09:07 deferred): closes active cycle upfront, runs report email, benchmark scoring, SQLite merge, and skill generation |
+| `scripts/run_thursday_close.py` | Dedicated Thursday cycle close orchestrator (Mon 15:38 IST / Tue 09:08 deferred): marks Thursday snapshot closed, sends Thursday report email, and syncs to MongoDB Atlas (skips LLM skill generation) |
 | `scripts/compare_ai_vs_static_benchmark.py` | Reconstructs static $\pm 100$ strike LTPs from `signals_data_*.db` `option_chain_surface` to compute side-by-side outperformance delta vs AI strategy |
-| `scripts/sync_to_mongodb.py` | CLI tool to push weekly strategy dossiers (`derivative_strategies`) and recompute the living KPI rollup (`derivative_master`) in MongoDB Atlas |
+| `scripts/send_weekly_report.py` | Monday HTML email + chart generator; parameterized with `--track weekly|thursday` (uses fixed 65-share lot size) |
+| `scripts/sync_to_mongodb.py` | CLI tool to push weekly strategy dossiers (`derivative_strategies`) and recompute the living KPI rollup (`derivative_master`) in MongoDB Atlas; supports `--track` and auto-detection |
 
 ---
 
@@ -221,6 +230,58 @@ On Tuesday at 09:31 AM IST, `weekly_option_collector.py` invokes [`common/ai_str
                          skill on cycle start, continuously compounding learned rules!
 ```
 
+### 4.8 Parallel 3-Day Thursday Strategy Track (September 2026+)
+
+Running concurrently with the 5-day Tuesday-to-Monday master cycle, the project includes a standalone **Parallel 3-Day Thursday Strategy Track** (`strategies/thursday_option_collector.py`):
+
+#### 1. Strategic Thesis & Rationale
+- **Targeting Shorter Expiry Horizon**: Initiating long strangles on Thursday morning (~5.0 Days to Expiry, DTE) targets accelerated theta decay and explosive gamma convexity heading into Monday afternoon.
+- **Fresh Strike Calibration**: Striking decisions on Thursday morning use the updated Thursday spot LTP rather than holding strikes locked on Tuesday morning. This prevents the position from becoming deeply out-of-the-money if the market made a large trending move on Tuesday or Wednesday.
+- **Zero Disturbance to Master Track**: The Thursday strategy runs completely independently from the master Tuesday strategy with segregated databases, dedicated JSON snapshots, isolated FSM state, and dedicated report dispatchers.
+
+#### 2. Thursday Closed-Loop Lifecycle
+
+```
+                    PARALLEL 3-DAY THURSDAY LIFECYCLE
+                    
+  Thursday 09:31 IST     thursday_option_collector.py evaluates Smart Gate & selects Strikes
+  (or Fri if Thu Hol):   • Captures buy prices into current_thursday_buy.json (status: ongoing)
+                         • Evaluated 3 mins later at 09:35 IST by sentinel-hermes (--track thursday)
+                                           │
+                                           ▼
+  Active Trading Days    • Collector (:02 & :32) saves option LTPs & updates 18% FSM states
+  (Thu, Fri, Mon):       • Standalone peak monitor (:17 & :47) checks high-water mark profits
+                         • Inference runner (:05 & :35) evaluates P&L, stops & Greeks
+                         • Skips automatically on exchange holidays
+                                           │
+                                           ▼
+  Cycle Closing Day      nifty50_strategies scripts/run_thursday_close.py orchestrates:
+  • Normal Monday:       1. Marks active cycle status: "closed" in current_thursday_buy.json
+    15:38 IST (10:08 UTC)2. send_weekly_report.py --track thursday (HTML email & chart report)
+  • Monday Holiday:      3. sync_to_mongodb.py --track thursday (MongoDB Atlas sync)
+    Deferred to Tuesday  4. Intentionally skips LLM skill generation (per design specification)
+    09:08 IST (03:38 UTC)
+```
+
+#### 3. Core Isolation Guarantees
+
+| Component | Master Weekly Track (Tuesday Start) | Parallel 3-Day Track (Thursday Start) |
+|---|---|---|
+| **Strategy Identifier** | `nifty50_weekly_option_collector` | `nifty50_thursday_3day_collector` |
+| **Active Cycle Snapshot** | `current_week_buy.json` | `current_thursday_buy.json` |
+| **Archived Snapshot** | `current_week_buy_{YYYYMMDD}.json` | `current_thursday_buy_{YYYYMMDD}.json` |
+| **SQLite Database** | `nifty50_weekly_data_{start}_{expiry}.db` | `nifty50_thursday_data_{start}_{expiry}.db` |
+| **Collection Collector** | `strategies/weekly_option_collector.py` (:01, :31) | `strategies/thursday_option_collector.py` (:02, :32) |
+| **Peak-Profit Monitor** | `strategies/peak_profit_monitor.py` (:16, :46) | `strategies/peak_profit_monitor.py --track thursday` (:17, :47) |
+| **Cycle Close Script** | `scripts/run_weekly_close.py` (Mon 15:37 IST) | `scripts/run_thursday_close.py` (Mon 15:38 IST) |
+| **Email Report Dispatch** | `scripts/send_weekly_report.py` | `scripts/send_weekly_report.py --track thursday` |
+| **MongoDB Atlas Document**| `_id: NIFTY50_{start}_{expiry}` | `_id: NIFTY50_THU_{start}_{expiry}` |
+| **MongoDB Master Rollup** | Updates `derivative_master` living KPIs | **Excluded** from updating `derivative_master` |
+| **LLM Skill Generation** | Generates `skills/skill_*.md` via Claude Sonnet | **Skipped** (bypasses skill generation) |
+
+#### 4. Decoupled FSM Trailing Stop Adaptation
+Because the Thursday strangle begins at $\approx 5.0$ DTE, [`common/fsm_strategy.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/fsm_strategy.py) automatically places entry directly into the **18% trailing buffer bracket** (covering 1.5–5.0 DTE). This tighter buffer is economically optimized for shorter-duration options experiencing rapid theta decay, compared to the looser 25% buffer applied to Tuesday entries (>5 DTE).
+
 ---
 
 ## 5. Data Collected
@@ -263,19 +324,29 @@ First-trigger LTP = 25000:
 
 ## 7. Collection Frequency
 
-- **Start time**: 09:31 AM IST (04:01 UTC)
+### 7.1 Master Weekly Track (Tuesday to Monday)
+- **Start time**: 09:31 AM IST (04:01 UTC) on Tuesday
 - **Interval**: Every 30 minutes (:01 and :31 past every hour)
 - **Duration**: Tuesday through Monday during market hours (09:31 AM - 15:31 PM IST)
 
-### Cron entry
-
 ```bash
-# Every 30 minutes during market hours (:01 and :31 past every hour from 09:31 to 15:31 IST)
+# Master Weekly Collector (:01 and :31 past every hour from 09:31 to 15:31 IST)
 1 4-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 31 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 ```
 
 (Fires at 04:01, 04:31, 05:01, ..., 09:31, 10:01 UTC = every 30 min from 09:31 to 15:31 IST, followed 3 minutes later by `sentinel-hermes` inference runner.)
+
+### 7.2 Parallel 3-Day Track (Thursday to Monday)
+- **Start time**: 09:32 AM IST (04:02 UTC) on Thursday
+- **Interval**: Every 30 minutes (:02 and :32 past every hour)
+- **Duration**: Thursday, Friday, and Monday during market hours (09:32 AM - 15:32 PM IST)
+- **Stagger**: Runs +1 minute after the master weekly collector (:01/:31) to eliminate resource/network contention.
+
+```bash
+# Thursday 3-Day Collector (:02 and :32 past every hour from 09:32 to 15:32 IST on Mon, Thu, Fri)
+2,32 4-10 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/thursday_option_collector.py >> /home/ubuntu/logs/thursday_strategy_$(date +\%F).log 2>&1
+```
 
 **Timestamp format:** All timestamps in SQLite are stored as Unix integers (seconds since epoch, UTC) matching the format used in `market_signal_agent` for cross-project joins and consistent querying. The storage layer (`storage.init_db()`) automatically migrates any legacy TEXT (ISO 8601) timestamps to integers on startup.
 
@@ -383,16 +454,23 @@ Follows the same pattern as the existing `news-analyzer-for-market-sentiment` pr
 
 ## 10. Storage Plan
 
-### 10.1 SQLite databases (per weekly cycle)
+### 10.1 SQLite databases
 
-Path: `/home/ubuntu/sqlite/strategies/nifty50_weekly_data_{YYYYMMDD}_{expiry}.db`
-
-Example: `nifty50_weekly_data_20260804_20260811.db`
+- **Master Weekly Cycle (Tuesday Start)**:
+  - Path: `/home/ubuntu/sqlite/strategies/nifty50_weekly_data_{YYYYMMDD}_{expiry}.db`
+  - Example: `nifty50_weekly_data_20260901_20260908.db`
+- **Parallel 3-Day Cycle (Thursday Start)**:
+  - Path: `/home/ubuntu/sqlite/strategies/nifty50_thursday_data_{YYYYMMDD}_{expiry}.db`
+  - Example: `nifty50_thursday_data_20260903_20260908.db`
 
 ### 10.2 JSON snapshots
 
-- **Active**: `/home/ubuntu/sqlite/strategies/current_week_buy.json`
-- **Archived**: `/home/ubuntu/sqlite/strategies/current_week_buy_{YYYYMMDD}.json` (one per past week)
+- **Master Weekly Cycle**:
+  - Active: `/home/ubuntu/sqlite/strategies/current_week_buy.json`
+  - Archived: `/home/ubuntu/sqlite/strategies/current_week_buy_{YYYYMMDD}.json` (one per past week)
+- **Parallel 3-Day Thursday Cycle**:
+  - Active: `/home/ubuntu/sqlite/strategies/current_thursday_buy.json`
+  - Archived: `/home/ubuntu/sqlite/strategies/current_thursday_buy_{YYYYMMDD}.json` (one per past week)
 
 The active snapshot persists the current cycle's entry buy prices, FSM state (`alpha_fsm`), and the peak profit high-water mark state (`peak_profit`):
 ```json
@@ -412,9 +490,10 @@ The active snapshot persists the current cycle's entry buy prices, FSM state (`a
 ### 10.3 Storage rules
 
 - One row per collection interval
-- One database file per weekly cycle
+- One database file per strategy cycle
+- Complete physical isolation between Tuesday master and Thursday 3-day databases
 - SQLite is the authoritative store; the JSON snapshot is a convenience file for the active cycle
-- Zero SQLite schema modifications for peak monitoring: high-water marks persist in-place inside `current_week_buy.json`
+- Zero SQLite schema modifications for peak monitoring: high-water marks persist in-place inside `current_week_buy.json` (weekly) or `current_thursday_buy.json` (thursday)
 
 ---
 
@@ -476,7 +555,7 @@ cp .env.example .env
 
 ### Running
 
-#### 1. Weekly Option Collector (`strategies/weekly_option_collector.py`)
+#### 1. Master Weekly Option Collector (`strategies/weekly_option_collector.py`)
 
 ```bash
 # Manual single collection
@@ -495,7 +574,26 @@ python strategies/weekly_option_collector.py --force-static
 python strategies/weekly_option_collector.py --force-entry
 ```
 
-#### 2. Monday Gamma Sniper (`strategies/monday_gamma_sniper.py`)
+#### 2. Parallel 3-Day Thursday Option Collector (`strategies/thursday_option_collector.py`)
+
+```bash
+# Manual single collection (Thursday to Monday cycle)
+python strategies/thursday_option_collector.py
+
+# Dry run (simulates collection with mock quotes)
+python strategies/thursday_option_collector.py --dry-run
+
+# Force run outside Thursday-Monday market hours
+python strategies/thursday_option_collector.py --force
+
+# Force static +/-100 benchmark strikes
+python strategies/thursday_option_collector.py --force-static
+
+# Force immediate strangle entry (bypasses Smart Entry Gate deferral)
+python strategies/thursday_option_collector.py --force-entry
+```
+
+#### 3. Monday Gamma Sniper (`strategies/monday_gamma_sniper.py`)
 
 ```bash
 # Check status and eligibility without trading
@@ -508,7 +606,7 @@ python strategies/monday_gamma_sniper.py --dry-run
 python strategies/monday_gamma_sniper.py --force
 ```
 
-#### 3. Weekly Close Orchestrator (`scripts/run_weekly_close.py`)
+#### 4. Master Weekly Close Orchestrator (`scripts/run_weekly_close.py`)
 
 ```bash
 # Execute weekly close orchestrator (closes active cycle upfront, then steps 1-4)
@@ -527,26 +625,67 @@ python scripts/run_weekly_close.py --date 20260908
 > [!NOTE]
 > `run_weekly_close.py` steps 3 & 4 invoke `sentinel-hermes/run_weekly_merge.sh` and `sentinel-hermes/skill_generator.py`. This requires `sentinel-hermes` to exist as a sibling checkout at `~/sentinel-hermes` or the `SENTINEL_HERMES_DIR` environment variable to be configured.
 
+#### 5. Thursday Strategy Close Orchestrator (`scripts/run_thursday_close.py`)
+
+```bash
+# Execute Thursday close orchestrator (closes snapshot, sends email, syncs to MongoDB Atlas)
+python scripts/run_thursday_close.py
+
+# Dry-run orchestrator (validates steps without closing cycle or sending email)
+python scripts/run_thursday_close.py --dry-run
+
+# Force close outside Monday 15:30-16:30 IST window
+python scripts/run_thursday_close.py --force
+
+# Tuesday morning deferred holiday check (runs Tuesday 09:08 IST if Monday was holiday)
+python scripts/run_thursday_close.py --morning-holiday-check
+```
+
 ### Production Crontab Entries
 
+All production crontab schedules execute in **UTC** on AWS EC2:
+
 ```cron
-# Every 30 minutes during market hours (:01 and :31 past every hour from 09:31 to 15:31 IST)
-# Reason for stagger: Allows upstream collectors (market_signal_agent & nifty_signal_features)
-# to write their 5-min Greeks and technicals at :00/:30 before strategy prices are captured.
+# ============================================================================
+# MASTER WEEKLY STRATEGY TRACK (Tuesday - Monday)
+# ============================================================================
+# Collector: Every 30 minutes during market hours (:01 and :31 past every hour from 09:31 to 15:31 IST)
+# Stagger: Allows upstream collectors (market_signal_agent & nifty_signal_features) to commit :00/:30 data.
 1 4-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 31 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
 
-# Monday Afternoon Gamma Sniper (Enhancement 4 - Expiry Afternoon Scalp)
-# Runs every 10 min, 12:30–15:20 IST (07:00–09:50 UTC).
-# Script self-gates: entry window 13:15–15:00 IST, time-stop close at 15:10 IST, off-window runs are cheap no-ops.
+# Standalone Peak-Profit Monitor (Runs :16 and :46, alternating with :01 and :31 collector for 15-min cadence)
+# 09:16 to 15:16 IST = 03:46 to 09:46 UTC
+46 3 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
+16,46 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
+
+# Monday Afternoon Gamma Sniper (Expiry Afternoon Scalp: runs every 10 min, 12:30–15:20 IST = 07:00–09:50 UTC)
 */10 7-9 * * 1 cd ~/nifty50_strategies && .venv/bin/python strategies/monday_gamma_sniper.py >> /home/ubuntu/logs/gamma_sniper_$(date +\%F).log 2>&1
 
-# Post-Market Strategy Weekly Close (Runs Mondays at 10:07 UTC = 15:37 IST; skips if already closed)
-# Orchestrates: 1. send_weekly_report.py -> 2. compare_ai_vs_static_benchmark.py -> 3. run_weekly_merge.sh -> 4. skill_generator.py + MongoDB sync
+# Master Weekly Close Orchestrator (Runs Mondays at 10:07 UTC = 15:37 IST; skips if already closed)
+# Steps: 1. send_weekly_report.py -> 2. compare_ai_vs_static_benchmark.py -> 3. run_weekly_merge.sh -> 4. skill_generator.py + Mongo sync
 7 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
 
-# Tuesday Deferred Close (for Monday exchange holidays; runs Tuesday 09:07 IST = 03:37 UTC before cycle initiation)
+# Tuesday Deferred Close for Master Track (Runs Tuesday 09:07 IST = 03:37 UTC if Monday was an exchange holiday)
 37 3 * * 2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
+
+# ============================================================================
+# PARALLEL 3-DAY THURSDAY STRATEGY TRACK (Thursday - Monday)
+# ============================================================================
+# Thursday Collector: Runs :02 and :32 past every hour (09:32 to 15:32 IST = 04:02 to 10:02 UTC on Mon, Thu, Fri)
+# Stagger: +1 min after weekly collector (:01/:31) for clean lock and API separation.
+2,32 4-10 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/thursday_option_collector.py >> /home/ubuntu/logs/thursday_strategy_$(date +\%F).log 2>&1
+
+# Thursday Peak-Profit Monitor: Runs :17 and :47 (09:17 to 15:17 IST = 03:47 to 09:47 UTC on Mon, Thu, Fri)
+47 3 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/thursday_peak_monitor_$(date +\%F).log 2>&1
+17,47 4-9 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/thursday_peak_monitor_$(date +\%F).log 2>&1
+
+# Thursday Strategy Close Orchestrator (Runs Mondays at 10:08 UTC = 15:38 IST; +1m after master close)
+# Steps: 1. Closes current_thursday_buy.json -> 2. send_weekly_report.py --track thursday -> 3. sync_to_mongodb.py --track thursday
+8 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_thursday_close.py >> /home/ubuntu/logs/thursday_close_$(date +\%F).log 2>&1
+
+# Tuesday Deferred Close for Thursday Track (Runs Tuesday 09:08 IST = 03:38 UTC if Monday was an exchange holiday)
+38 3 * * 2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_thursday_close.py --morning-holiday-check >> /home/ubuntu/logs/thursday_close_$(date +\%F).log 2>&1
 ```
 
 ### Weekly Monday email report
@@ -569,29 +708,36 @@ EMAIL_SMTP_PORT=465
 Generate a preview without sending email:
 
 ```bash
+# Master weekly preview (reads latest nifty50_weekly_data_*.db)
 python scripts/send_weekly_report.py --dry-run
+
+# Thursday 3-day preview (reads latest nifty50_thursday_data_*.db)
+python scripts/send_weekly_report.py --track thursday --dry-run
 ```
 
 Send immediately:
 
 ```bash
+# Send master weekly report
 python scripts/send_weekly_report.py
+
+# Send Thursday 3-day report
+python scripts/send_weekly_report.py --track thursday
 ```
 
 The preview HTML and PNG chart are archived under
-`/home/ubuntu/sqlite/strategies/reports/` by default.
+`/home/ubuntu/sqlite/strategies/reports/` by default (`nifty50_report_*` for weekly, `nifty50_thursday_report_*` for Thursday).
 
 ### Real-Time Peak-Profit Discord Alerts & Future Broker Execution Seam
 
-The strategy monitors floating strangle profit against the historical high-water mark achieved since Tuesday order locking via [`common/profit_monitor.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/profit_monitor.py):
+The strategy monitors floating strangle profit against the historical high-water mark achieved since entry order locking via [`common/profit_monitor.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/profit_monitor.py):
 
-- **Dual-Runner 15-Minute Cadence**: 
-  - `strategies/weekly_option_collector.py` evaluates peaks at `:01` and `:31` (alongside full SQLite collection).
-  - `strategies/peak_profit_monitor.py` evaluates peaks at `:16` and `:46` (standalone lightweight check).
-  - Together, they form a **flawless, equidistant 15-minute clock** (`09:16`, `09:31`, `09:46`, `10:01`, `10:16`... `15:16`, `15:31` IST) with zero write collisions.
+- **Dual-Track & Dual-Runner 15-Minute Cadence**: 
+  - **Master Weekly**: `weekly_option_collector.py` evaluates peaks at `:01` and `:31`; `peak_profit_monitor.py` evaluates at `:16` and `:46` using `current_week_buy.json`.
+  - **Thursday 3-Day Track**: `thursday_option_collector.py` evaluates peaks at `:02` and `:32`; `peak_profit_monitor.py --track thursday` evaluates at `:17` and `:47` using `current_thursday_buy.json`.
 - **$\ge 20.0\%$ Profit Validation**: Alerts strictly trigger only when profit is $\ge 20.0\%$ (`combined_pnl_pct >= 20.0`). Any minor fluctuations below 20% update the snapshot high-water mark but send **zero alerts**.
 - **Anti-Spam Hysteresis**: Subsequent peak alerts require at least a **$+5.0\%$ jump** or **$+10.0$ points** ($\sim ₹650$/lot) above the last notified peak.
-- **Zero SQLite Changes & Atomic Writes**: All peak state is stored in-place directly in `current_week_buy.json` under `"peak_profit"` via atomic temporary file replacement (`os.replace`). SQLite schema remains 100% untouched.
+- **Zero SQLite Changes & Atomic Writes**: Peak state is stored in-place directly in `current_week_buy.json` (weekly) or `current_thursday_buy.json` (thursday) under `"peak_profit"` via atomic temporary file replacement (`os.replace`). SQLite schema remains 100% untouched.
 - **Future Live Broker Hook**: Qualifying new peaks trigger `common.profit_monitor.on_new_peak(event)`. Currently, this dispatches a high-priority styled Discord alert via Webhook; in future phases, live broker order execution (Angel One / Upstox) can be connected directly into this seam.
 
 ```env
@@ -605,15 +751,22 @@ DISCORD_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_URL_HERE
 #### Standalone Peak Monitor Crontab
 
 ```bash
-# Standalone Peak-Profit Monitor (Runs at :16 and :46, alternating with :01 and :31 collector for 15-min cadence)
-# 09:16 to 15:16 IST = 03:46 to 09:46 UTC
+# Master Weekly Peak Monitor (Runs at :16 and :46; 09:16 to 15:16 IST = 03:46 to 09:46 UTC on Mon-Fri)
 46 3 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
 16,46 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
+
+# Thursday 3-Day Peak Monitor (Runs at :17 and :47; 09:17 to 15:17 IST = 03:47 to 09:47 UTC on Mon, Thu, Fri)
+47 3 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/thursday_peak_monitor_$(date +\%F).log 2>&1
+17,47 4-9 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/thursday_peak_monitor_$(date +\%F).log 2>&1
 ```
 
 Smoke check peak monitor state:
 ```bash
+# Check master weekly snapshot peak state
 python strategies/peak_profit_monitor.py --check
+
+# Check Thursday snapshot peak state
+python strategies/peak_profit_monitor.py --track thursday --check
 ```
 
 ---
@@ -644,8 +797,18 @@ python strategies/peak_profit_monitor.py --check
 ## 15. MongoDB Atlas Derivatives Synchronization
 
 Strategy results and weekly prices can be persisted directly to MongoDB Atlas (`stock_recommendations` database) in the collections:
-- `derivative_strategies`: Full weekly cycle performance dossier
-- `derivative_master`: Living rollup KPI for NIFTY50 options
+- `derivative_strategies`: Full strategy cycle performance dossier
+- `derivative_master`: Living rollup KPI for NIFTY50 options (maintained exclusively by the master 5-day cycle)
+
+### Track Isolation & Schema Contract
+
+| Field | Master Weekly Track | Parallel 3-Day Track |
+|---|---|---|
+| **Document ID (`_id`)** | `NIFTY50_{start_date}_{expiry_date}` | `NIFTY50_THU_{start_date}_{expiry_date}` |
+| **Cycle ID (`cycle_id`)** | `CYCLE-NIFTY50-{start_date}-{expiry_date}` | `CYCLE-THU-{start_date}` |
+| **Strategy Name** | `nifty50_weekly_option_collector` | `nifty50_thursday_3day_collector` |
+| **Active Snapshot Source** | `current_week_buy.json` | `current_thursday_buy.json` |
+| **`derivative_master` Rollup** | Recomputed with cycle stats | **Preserved intact** (Thursday cycles are excluded from master KPI rollups) |
 
 ### CLI Usage
 
@@ -653,8 +816,16 @@ Strategy results and weekly prices can be persisted directly to MongoDB Atlas (`
 # Check collection status and document counts
 python scripts/sync_to_mongodb.py --status
 
-# Sync latest weekly strategy DB
+# Sync latest master weekly strategy DB
 python scripts/sync_to_mongodb.py
+
+# Sync latest Thursday strategy DB (or pass DB path directly)
+python scripts/sync_to_mongodb.py --track thursday
+python scripts/sync_to_mongodb.py --db-path /home/ubuntu/sqlite/strategies/nifty50_thursday_data_20260903_20260908.db
+
+# Auto-detection: sync_to_mongodb.py automatically infers track from DB filename prefix:
+# nifty50_thursday_data_*.db -> track='thursday'
+# nifty50_weekly_data_*.db   -> track='weekly'
 ```
 
 ---
