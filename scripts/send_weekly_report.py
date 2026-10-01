@@ -433,7 +433,7 @@ def send_weekly_report_discord(summary: Dict[str, Any], track: str = "weekly") -
     selection_mode = summary.get("selection_mode", "STATIC_RULE")
 
     track_resolved = summary.get("track") or track or "weekly"
-    track_label = "3-Day Thursday Strategy" if str(track_resolved).lower() == "thursday" else "Weekly Strategy"
+    track_label = "3-Day Thursday Strategy" if str(track_resolved).lower() == "thursday" else "5-Day Tuesday Strategy"
     gain_str = f"{latest_gain:+.2f} pts" if latest_gain is not None else "N/A"
     inr_gain = f"₹{latest_gain * NIFTY_LOT_SIZE:+,.0f}" if latest_gain is not None else "N/A"
     is_profitable = (latest_gain or 0.0) >= 0

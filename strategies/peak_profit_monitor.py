@@ -60,7 +60,7 @@ def monitor_once(force: bool = False, no_alert: bool = False, no_email: bool = F
     dry_run = no_alert or no_email
     today = _today_ist()
     is_thursday_track = (track.lower() == "thursday")
-    track_label = "3-Day Thursday Strategy" if is_thursday_track else "Weekly Strangle"
+    track_label = "3-Day Thursday Strategy" if is_thursday_track else "5-Day Tuesday Strategy"
     snapshot_file = THURSDAY_SNAPSHOT_FILE if is_thursday_track else ACTIVE_SNAPSHOT_FILE
     log_prefix = f"[PEAK MONITOR - {track_label}]"
 

@@ -90,7 +90,7 @@ def evaluate_peak_profit(
     fsm_state: Optional[str] = None,
     fsm_total_gainloss: Optional[float] = None,
     snapshot_filepath: Optional[str] = None,
-    track_label: str = "Weekly Strangle",
+    track_label: str = "5-Day Tuesday Strategy",
 ) -> Tuple[Dict[str, Any], bool, str]:
     """
     Evaluate current strangle profit against the cycle's high-water mark.
@@ -335,14 +335,12 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     call_pnl_sign = "+" if event.get("call_pnl_pts", 0.0) >= 0 else ""
     put_pnl_sign = "+" if event.get("put_pnl_pts", 0.0) >= 0 else ""
     comb_pnl_sign = "+" if event.get("combined_pnl_pts", 0.0) >= 0 else ""
-    track_label = event.get("track_label", "Weekly Strangle")
+    track_label = event.get("track_label", "5-Day Tuesday Strategy")
+    if not track_label or track_label == "Weekly Strangle":
+        track_label = "5-Day Tuesday Strategy"
 
-    if track_label and track_label != "Weekly Strangle":
-        headline_label = f" [{track_label}]"
-        title_label = f" [{track_label}]"
-    else:
-        headline_label = ""
-        title_label = " Weekly Strangle"
+    headline_label = f" [{track_label}]"
+    title_label = f" [{track_label}]"
 
     headline = (
         f"🎯 **NIFTY{headline_label} NEW PEAK PROFIT: {comb_pnl_sign}{event['combined_pnl_pct']:.1f}% "
