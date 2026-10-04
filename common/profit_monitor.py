@@ -171,10 +171,17 @@ def evaluate_peak_profit(
 
     is_higher_peak = combined_pnl_pts > previous_peak_pts
     is_unnotified_peak = (last_notified_pts is None) or (combined_pnl_pts > last_notified_pts)
+    moneyness = str(snapshot.get("moneyness") or ("ITM" if put_strike > call_strike else "OTM")).upper()
+    total_extrinsic = float(snapshot.get("total_extrinsic") or 0.0)
+    extrinsic_pnl_pct = round((combined_pnl_pts / total_extrinsic) * 100.0, 2) if total_extrinsic > 0 else 0.0
+    profit_meets_min = (combined_pnl_pct >= PEAK_ALERT_MIN_PROFIT_PCT) or (
+        moneyness == "ITM" and total_extrinsic > 0 and extrinsic_pnl_pct >= PEAK_ALERT_MIN_PROFIT_PCT
+    )
+
     is_retry_at_peak = (
         combined_pnl_pts >= previous_peak_pts
         and is_unnotified_peak
-        and combined_pnl_pct >= PEAK_ALERT_MIN_PROFIT_PCT
+        and profit_meets_min
     )
 
     if is_higher_peak:
@@ -182,6 +189,8 @@ def evaluate_peak_profit(
         peak_state["peak_pnl_pct"] = combined_pnl_pct
         peak_state["peak_pnl_inr"] = combined_pnl_inr
         peak_state["peak_timestamp"] = current_ts
+        if total_extrinsic > 0:
+            peak_state["peak_extrinsic_pnl_pct"] = extrinsic_pnl_pct
 
     # Determine alert eligibility
     if not is_higher_peak and not is_retry_at_peak:
@@ -192,13 +201,14 @@ def evaluate_peak_profit(
         _persist_peak(peak_state)
         return peak_state, False, "Peak profit alert disabled in configuration"
 
-    # Validation: Profit must be >= 20.0%
-    if combined_pnl_pct < PEAK_ALERT_MIN_PROFIT_PCT:
+    # Validation: Profit must be >= 20.0% (total premium basis, or extrinsic risk basis for ITM)
+    if not profit_meets_min:
         _persist_peak(peak_state)
+        ext_note = f" (Extrinsic: +{extrinsic_pnl_pct:.1f}%)" if moneyness == "ITM" and total_extrinsic > 0 else ""
         return (
             peak_state,
             False,
-            f"New peak (+{combined_pnl_pct:.1f}% / +{combined_pnl_pts:.1f} pts) is below minimum {PEAK_ALERT_MIN_PROFIT_PCT:.1f}% threshold",
+            f"New peak (+{combined_pnl_pct:.1f}%{ext_note} / +{combined_pnl_pts:.1f} pts) is below minimum {PEAK_ALERT_MIN_PROFIT_PCT:.1f}% threshold",
         )
 
     alerts_today = peak_state.get("alerts_sent_today", 0)
@@ -250,6 +260,8 @@ def evaluate_peak_profit(
         "combined_pnl_pts": combined_pnl_pts,
         "combined_pnl_pct": combined_pnl_pct,
         "combined_pnl_inr": combined_pnl_inr,
+        "moneyness": moneyness,
+        "extrinsic_pnl_pct": extrinsic_pnl_pct if total_extrinsic > 0 else None,
         "lot_size": NIFTY_LOT_SIZE,
         "alerts_sent_today": peak_state["alerts_sent_today"],
         "fsm_state": fsm_state,

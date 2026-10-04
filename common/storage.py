@@ -217,11 +217,20 @@ def init_db(db_path: str) -> None:
             put_strike      INTEGER,
             call_buy_price  REAL,
             put_buy_price   REAL,
+            entry_spot      REAL,
             captured_at     INTEGER NOT NULL,
             static_call_strike INTEGER,
             static_put_strike  INTEGER,
             selection_mode  TEXT,
             selection_rationale TEXT,
+            moneyness       TEXT    DEFAULT 'OTM',
+            spread_width    INTEGER DEFAULT 0,
+            call_intrinsic  REAL    DEFAULT 0.0,
+            call_extrinsic  REAL    DEFAULT 0.0,
+            put_intrinsic   REAL    DEFAULT 0.0,
+            put_extrinsic   REAL    DEFAULT 0.0,
+            total_intrinsic REAL    DEFAULT 0.0,
+            total_extrinsic REAL    DEFAULT 0.0,
             PRIMARY KEY (strategy_name, cycle_id)
         )
     """)
@@ -266,7 +275,9 @@ def init_db(db_path: str) -> None:
             composite_direction_score   REAL,
             directional_bias            TEXT,
             target_call_delta           REAL,
-            target_put_delta            REAL
+            target_put_delta            REAL,
+            atm_straddle_ratio          REAL,
+            overnight_gap_pct           REAL
         )
     """)
 
@@ -278,6 +289,8 @@ def init_db(db_path: str) -> None:
         ("directional_bias", "TEXT"),
         ("target_call_delta", "REAL"),
         ("target_put_delta", "REAL"),
+        ("atm_straddle_ratio", "REAL"),
+        ("overnight_gap_pct", "REAL"),
     ]:
         if col_name not in shadow_cols:
             cur.execute(f"ALTER TABLE gate_deferred_shadows ADD COLUMN {col_name} {col_type}")
@@ -294,9 +307,38 @@ def init_db(db_path: str) -> None:
         ("directional_bias", "TEXT"),
         ("target_call_delta", "REAL"),
         ("target_put_delta", "REAL"),
+        ("entry_spot", "REAL"),
+        ("moneyness", "TEXT DEFAULT 'OTM'"),
+        ("spread_width", "INTEGER DEFAULT 0"),
+        ("call_intrinsic", "REAL DEFAULT 0.0"),
+        ("call_extrinsic", "REAL DEFAULT 0.0"),
+        ("put_intrinsic", "REAL DEFAULT 0.0"),
+        ("put_extrinsic", "REAL DEFAULT 0.0"),
+        ("total_intrinsic", "REAL DEFAULT 0.0"),
+        ("total_extrinsic", "REAL DEFAULT 0.0"),
     ]:
         if col_name not in snapshot_cols:
             cur.execute(f"ALTER TABLE strategy_buy_snapshots ADD COLUMN {col_name} {col_type}")
+
+    # Backfill moneyness by actual strike geometry for existing rows (idempotent across ITM, ATM, OTM)
+    cur.execute("""
+        UPDATE strategy_buy_snapshots 
+        SET moneyness = CASE 
+            WHEN put_strike = call_strike THEN 'ATM'
+            WHEN put_strike > call_strike THEN 'ITM'
+            ELSE 'OTM'
+        END
+        WHERE put_strike IS NOT NULL AND call_strike IS NOT NULL
+          AND (
+            moneyness IS NULL 
+            OR moneyness = '' 
+            OR moneyness != CASE 
+                WHEN put_strike = call_strike THEN 'ATM'
+                WHEN put_strike > call_strike THEN 'ITM'
+                ELSE 'OTM'
+            END
+          )
+    """)
 
     conn.commit()
     conn.close()
@@ -407,42 +449,28 @@ def insert_buy_snapshot(db_path: str, snapshot: dict) -> None:
     Persist a Tuesday buy-price snapshot to the historical SQLite table.
 
     Uses ``INSERT OR REPLACE`` so re-running on the same Tuesday is idempotent.
+    Dynamically maps available columns to persist all base, moneyness, and Greek attributes.
     """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO strategy_buy_snapshots (
-            strategy_name,
-            cycle_id,
-            week_start_date,
-            expiry_date,
-            call_strike,
-            put_strike,
-            call_buy_price,
-            put_buy_price,
-            captured_at,
-            static_call_strike,
-            static_put_strike,
-            selection_mode,
-            selection_rationale
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        snapshot.get("strategy_name", STRATEGY_NAME),
-        snapshot.get("cycle_id", ""),
-        snapshot.get("week_start_date", ""),
-        snapshot.get("expiry_date", ""),
-        snapshot.get("call_strike"),
-        snapshot.get("put_strike"),
-        snapshot.get("call_buy_price"),
-        snapshot.get("put_buy_price"),
-        snapshot.get("captured_at", int(datetime.now(timezone.utc).timestamp())),
-        snapshot.get("static_call_strike"),
-        snapshot.get("static_put_strike"),
-        snapshot.get("selection_mode"),
-        snapshot.get("selection_rationale"),
-    ))
+    cur.execute("PRAGMA table_info(strategy_buy_snapshots)")
+    table_cols = [row[1] for row in cur.fetchall()]
+
+    data = dict(snapshot)
+    if "strategy_name" not in data:
+        data["strategy_name"] = STRATEGY_NAME
+    if "captured_at" not in data:
+        data["captured_at"] = int(datetime.now(timezone.utc).timestamp())
+
+    insert_cols = [col for col in table_cols if col in data]
+    placeholders = ["?"] * len(insert_cols)
+    values = [data[col] for col in insert_cols]
+
+    query = f"INSERT OR REPLACE INTO strategy_buy_snapshots ({', '.join(insert_cols)}) VALUES ({', '.join(placeholders)})"
+    cur.execute(query, values)
     conn.commit()
     conn.close()
+
 
 
 # ---------------------------------------------------------------------------

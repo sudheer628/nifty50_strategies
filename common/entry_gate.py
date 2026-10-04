@@ -43,6 +43,8 @@ class EntryGateResult:
     adx_14: Optional[float]
     opening_range: Optional[float]
     evaluated_at_ist: str
+    atm_straddle_ratio: Optional[float] = None
+    overnight_gap_pct: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -189,22 +191,71 @@ def evaluate_entry_gate(
     reference_ltp: float,
     sqlite_dir: str = DEFAULT_SQLITE_DIR,
     current_time_ist: Optional[datetime] = None,
-    force: bool = False
+    force: bool = False,
+    nifty_open: Optional[float] = None,
+    nifty_prev_close: Optional[float] = None,
+    atm_straddle_price: Optional[float] = None,
 ) -> EntryGateResult:
     """
-    Evaluates all Smart Entry Gate filters.
+    Evaluates all Smart Entry Gate filters and records regime telemetry (shadow-first).
 
     Args:
         reference_ltp: Current Nifty spot LTP.
         sqlite_dir: Path to sqlite databases directory.
         current_time_ist: Optional datetime in IST (defaults to now).
         force: If True, bypasses all filters.
+        nifty_open: Opening price of Nifty today (optional, for overnight gap shadow).
+        nifty_prev_close: Previous day close price of Nifty (optional, for overnight gap shadow).
+        atm_straddle_price: Price of ATM Call + Put straddle (optional, for straddle ratio shadow).
 
     Returns:
         EntryGateResult with should_enter flag and metrics.
     """
     now = current_time_ist or _now_ist()
     eval_str = now.strftime("%Y-%m-%d %H:%M:%S IST")
+
+    # Shadow metric 1: Overnight gap percentage
+    overnight_gap_pct: Optional[float] = None
+    if nifty_open is not None and nifty_prev_close is not None and float(nifty_prev_close) > 0:
+        overnight_gap_pct = round(abs(float(nifty_open) - float(nifty_prev_close)) / float(nifty_prev_close) * 100, 3)
+
+    # Shadow metric 2: ATM Straddle ratio (Straddle / Spot)
+    atm_straddle_ratio: Optional[float] = None
+    if atm_straddle_price is not None and reference_ltp > 0:
+        atm_straddle_ratio = round((float(atm_straddle_price) / float(reference_ltp)) * 100, 3)
+    elif reference_ltp > 0:
+        try:
+            signals_db = _get_signals_db_path(sqlite_dir, now)
+            if os.path.exists(signals_db):
+                atm_strike = int(round(reference_ltp / 50.0) * 50)
+                conn = sqlite3.connect(signals_db)
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT data FROM market_data WHERE pk = 'INDEX#NIFTY50' ORDER BY ts DESC LIMIT 1"
+                )
+                r = cur.fetchone()
+                conn.close()
+                if r and r["data"]:
+                    d = json.loads(r["data"])
+                    surface = d.get("option_chain_surface") or {}
+                    if isinstance(surface, str):
+                        surface = json.loads(surface)
+                    atm_data = surface.get(str(atm_strike), {})
+                    c_ltp = (atm_data.get("CALL") or {}).get("ltp")
+                    p_ltp = (atm_data.get("PUT") or {}).get("ltp")
+                    if c_ltp and p_ltp and float(c_ltp) > 0 and float(p_ltp) > 0:
+                        straddle_px = float(c_ltp) + float(p_ltp)
+                        atm_straddle_ratio = round((straddle_px / float(reference_ltp)) * 100, 3)
+        except Exception as e:
+            logger.debug("Could not compute atm_straddle_ratio from signals DB: %s", e)
+
+    if overnight_gap_pct is not None or atm_straddle_ratio is not None:
+        logger.info(
+            "[SHADOW REGIME TELEMETRY] Overnight Gap=%s | ATM Straddle Ratio=%s",
+            f"{overnight_gap_pct:.2f}%" if overnight_gap_pct is not None else "N/A",
+            f"{atm_straddle_ratio:.2f}%" if atm_straddle_ratio is not None else "N/A",
+        )
 
     if force:
         logger.info("[SMART ENTRY GATE] Force flag enabled; gate bypassed.")
@@ -217,7 +268,9 @@ def evaluate_entry_gate(
             vwap_distance=None,
             adx_14=None,
             opening_range=None,
-            evaluated_at_ist=eval_str
+            evaluated_at_ist=eval_str,
+            atm_straddle_ratio=atm_straddle_ratio,
+            overnight_gap_pct=overnight_gap_pct,
         )
 
     # 1. Hard Fail-Safe Timeout Cutoff (>= 11:00 AM IST forces entry)
@@ -232,7 +285,9 @@ def evaluate_entry_gate(
             vwap_distance=None,
             adx_14=None,
             opening_range=None,
-            evaluated_at_ist=eval_str
+            evaluated_at_ist=eval_str,
+            atm_straddle_ratio=atm_straddle_ratio,
+            overnight_gap_pct=overnight_gap_pct,
         )
 
     # 2. Filter 1: IV Stability Gate
@@ -248,7 +303,9 @@ def evaluate_entry_gate(
             vwap_distance=None,
             adx_14=None,
             opening_range=None,
-            evaluated_at_ist=eval_str
+            evaluated_at_ist=eval_str,
+            atm_straddle_ratio=atm_straddle_ratio,
+            overnight_gap_pct=overnight_gap_pct,
         )
 
     # 3. Filter 2 & 3: ORB, VWAP & ADX Gate
@@ -264,7 +321,9 @@ def evaluate_entry_gate(
             vwap_distance=vwap_dist,
             adx_14=adx,
             opening_range=op_range,
-            evaluated_at_ist=eval_str
+            evaluated_at_ist=eval_str,
+            atm_straddle_ratio=atm_straddle_ratio,
+            overnight_gap_pct=overnight_gap_pct,
         )
 
     # All filters cleared
@@ -279,5 +338,7 @@ def evaluate_entry_gate(
         vwap_distance=vwap_dist,
         adx_14=adx,
         opening_range=op_range,
-        evaluated_at_ist=eval_str
+        evaluated_at_ist=eval_str,
+        atm_straddle_ratio=atm_straddle_ratio,
+        overnight_gap_pct=overnight_gap_pct,
     )

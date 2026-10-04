@@ -1,17 +1,24 @@
 """
 ai_strike_selector.py - Dynamic AI Strike & Expiry Selector for NIFTY50 Weekly Option Strategy
 
-Runs on Tuesday 9:30 AM IST during weekly cycle entry.
+Runs on Tuesday 9:30 AM IST during weekly cycle entry (and Thursday 9:31 AM for Thursday track).
 Selects volatility-adaptive, Greeks-calibrated Call and Put strikes using OpenRouter LLMs
 (via Redis 'finance_llm_models' fallback chain) and SQLite microstructure & technical indicators.
 
-Always provides an immediate fail-safe fallback to the standard static anchor +/- 100 rule
+Supports:
+- ITM mode (default per 6-year empirical backtesting data): targets |Delta| ~ 0.65 - 0.70 with
+  intrinsic floor protection (Long Gut).
+- OTM mode (legacy): targets |Delta| ~ 0.30 - 0.38 (Long Strangle).
+- ATM mode: targets |Delta| ~ 0.50 (Long Straddle).
+
+Always provides an immediate fail-safe fallback to delta-scanned / asymmetric anchor rules
 if the API, network, or data has any delay or error.
 """
 
 import os
 import sys
 import json
+import math
 import sqlite3
 import logging
 import datetime
@@ -33,11 +40,19 @@ load_dotenv()
 
 # Shared logger
 try:
-    from config import logger, get_redis_client, STRIKE_STEP
+    from config import (
+        logger,
+        get_redis_client,
+        STRIKE_STEP,
+        STRIKE_MONEYNESS_MODE,
+        TARGET_ITM_DELTA,
+    )
 except ImportError:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("ai_strike_selector")
     STRIKE_STEP = 100
+    STRIKE_MONEYNESS_MODE = "ITM"
+    TARGET_ITM_DELTA = 0.68
     def get_redis_client():
         return None
 
@@ -54,8 +69,8 @@ FALLBACK_MODELS = [
 
 _LAST_COMPOSITE_SCORE = 0.0
 _LAST_DIRECTIONAL_BIAS = "NEUTRAL"
-_LAST_TARGET_CALL_DELTA = 0.35
-_LAST_TARGET_PUT_DELTA = -0.35
+_LAST_TARGET_CALL_DELTA = 0.68
+_LAST_TARGET_PUT_DELTA = -0.68
 
 
 def get_last_composite_score() -> float:
@@ -68,15 +83,54 @@ def get_last_directional_bias() -> str:
     return str(_LAST_DIRECTIONAL_BIAS)
 
 
-def compute_static_strikes(reference_ltp: float, step: int = 100) -> Tuple[int, int]:
+def find_strike_by_delta(
+    reference_ltp: float,
+    target_delta: float,
+    is_call: bool,
+    days_to_expiry: float = 6.0,
+    iv: float = 0.14,
+    step: int = 50,
+) -> int:
     """
-    Compute standard static benchmark strikes: anchor +/- step (default 100 pts).
+    Scan candidate strikes on standard grid (default 50-pt) to find the strike
+    closest to the target delta.
+    """
+    from common.fsm_strategy import estimate_option_delta
+    atm_anchor = int(math.floor(reference_ltp / step)) * step
+    best_strike = atm_anchor
+    best_diff = 999.0
+    for offset in range(-500, 550, step):
+        cand_strike = atm_anchor + offset
+        cand_delta = estimate_option_delta(reference_ltp, cand_strike, days_to_expiry, is_call, iv)
+        diff = abs(cand_delta - target_delta)
+        if diff < best_diff:
+            best_diff = diff
+            best_strike = cand_strike
+    return best_strike
+
+
+def compute_static_strikes(
+    reference_ltp: float,
+    step: int = 100,
+    mode: str = None
+) -> Tuple[int, int]:
+    """
+    Compute static benchmark strikes according to moneyness mode:
+    - ITM: Put = anchor + step, Call = anchor - step (Long Gut, delta ~ 0.65-0.70)
+    - ATM: Put = anchor, Call = anchor
+    - OTM: Put = anchor - step, Call = anchor + step (Legacy strangle)
     
     Returns:
         (static_put_strike, static_call_strike)
     """
-    anchor = int(reference_ltp / step) * step
-    return anchor - step, anchor + step
+    effective_mode = (mode or STRIKE_MONEYNESS_MODE).upper()
+    anchor = int(math.floor(reference_ltp / step)) * step
+    if effective_mode == "ITM":
+        return anchor + step, anchor - step
+    elif effective_mode == "ATM":
+        return anchor, anchor
+    else:  # OTM
+        return anchor - step, anchor + step
 
 
 def fetch_redis_models() -> List[str]:
@@ -102,7 +156,7 @@ def load_market_context_for_strikes(
 ) -> Dict[str, Any]:
     """
     Ingest latest VIX, ATR, Greeks surface, IV skew, PCR, and FII positioning
-    from SQLite databases for Tuesday strike selection.
+    from SQLite databases for strike selection.
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     yyyy_mm = now_utc.strftime("%Y_%m")
@@ -173,8 +227,10 @@ def load_market_context_for_strikes(
                 # Extract candidate strikes around reference_ltp (+/- 250 pts in 50-pt steps)
                 surface = sig_data.get("option_chain_surface", {})
                 if isinstance(surface, str):
-                    try: surface = json.loads(surface)
-                    except Exception: surface = {}
+                    try:
+                        surface = json.loads(surface)
+                    except Exception:
+                        surface = {}
 
                 atm_anchor = int(round(reference_ltp / 50.0)) * 50
                 candidates = []
@@ -293,29 +349,49 @@ def build_strike_selection_prompt(
     reference_ltp: float,
     context: Dict[str, Any],
     static_put: int,
-    static_call: int
+    static_call: int,
+    moneyness_mode: str = "ITM",
 ) -> Tuple[str, str]:
     """Construct the strike selection prompt for the LLM."""
     composite_score = compute_composite_directional_score(context)
     bias_str = "BULLISH" if composite_score >= 0.35 else "BEARISH" if composite_score <= -0.35 else "NEUTRAL"
 
-    system_prompt = (
-        "You are an expert quantitative NIFTY50 options strategist.\n"
-        "Your objective: Select optimal Call & Put strikes for a weekly Long Strangle (+CE / +PE entered on Tuesday 9:30 AM).\n"
-        "You must optimize strike selection based on India VIX, ATR daily range, Option Greeks (Delta ~0.30-0.38), IV Skew, and Technical trend.\n"
-        "Rules:\n"
-        "1. All strikes MUST be valid NIFTY 50-point increments (multiples of 50: e.g. 24450, 24500, 24550, 24600).\n"
-        "2. call_strike MUST be >= reference_ltp.\n"
-        "3. put_strike MUST be <= reference_ltp.\n"
-        "4. In high volatility (VIX > 16 or ATR > 160), choose wider strikes (+/- 150 to 200 pts) to reduce theta drag.\n"
-        "5. In low volatility (VIX < 13 or ATR < 110), choose tighter strikes (+/- 50 to 100 pts) so delta moves into the money.\n"
-        "6. If Put IV is heavily skewed (> 1.5 pt over Call IV), push Put strike 50 pts further OTM to equalize premium outlay.\n"
-        "7. Delta Asymmetry Rule: If directional bias is BULLISH (score >= +0.35), choose asymmetric strikes with CE Delta closer to ATM (~0.40) and PE Delta further OTM (~0.28). If BEARISH (score <= -0.35), choose PE Delta closer to ATM (~-0.40) and CE Delta further OTM (~0.28). If NEUTRAL, keep symmetric Deltas (~0.33-0.35).\n"
-        "8. Output ONLY a valid JSON object matching the schema."
-    )
+    if moneyness_mode == "ITM":
+        system_prompt = (
+            "You are an expert quantitative NIFTY50 options strategist.\n"
+            "Your objective: Select optimal In-The-Money (ITM) Call & Put strikes for a weekly Long Gut position (+CE / +PE entered on cycle open).\n"
+            "By choosing ITM options, the trade secures an intrinsic value floor (W = Put Strike - Call Strike), protecting capital against theta decay on flat or modest moves.\n"
+            "Optimize strike selection based on India VIX, ATR daily range, Option Greeks (Target |Delta| ~ 0.65-0.70), IV Skew, and Technical trend.\n"
+            "Rules:\n"
+            "1. All strikes MUST be valid NIFTY 50-point increments (multiples of 50: e.g. 24450, 24500, 24550, 24600).\n"
+            "2. call_strike MUST be <= reference_ltp (In-The-Money Call, delta ~ +0.65 to +0.70).\n"
+            "3. put_strike MUST be >= reference_ltp (In-The-Money Put, delta ~ -0.65 to -0.70).\n"
+            "4. put_strike MUST be >= call_strike (forming an ITM Long Gut spread).\n"
+            "5. In high volatility (VIX > 16 or ATR > 160), select deeper ITM strikes (Delta ~ 0.72-0.75) to maximize intrinsic capital cushioning.\n"
+            "6. In low volatility (VIX < 13 or ATR < 110), choose closer to ATM ITM strikes (Delta ~ 0.60-0.65) to balance delta velocity.\n"
+            "7. Put IV Expansion Asymmetry: Sharp market selloffs trigger IV spikes boosting Put premium; if Put IV skew is elevated, calibrate PE strike to capture this asymmetric convexity.\n"
+            "8. Delta Asymmetry Rule: If directional bias is BULLISH (score >= +0.35), choose deeper ITM Call (~0.75 Delta) and closer-to-ATM Put (~-0.60 Delta). If BEARISH (score <= -0.35), choose deeper ITM Put (~-0.75 Delta) and closer-to-ATM Call (~0.60 Delta). If NEUTRAL, keep balanced Deltas (~0.65-0.70).\n"
+            "9. Output ONLY a valid JSON object matching the schema."
+        )
+    else:
+        system_prompt = (
+            "You are an expert quantitative NIFTY50 options strategist.\n"
+            "Your objective: Select optimal Out-Of-The-Money (OTM) Call & Put strikes for a weekly Long Strangle (+CE / +PE entered on cycle open).\n"
+            "You must optimize strike selection based on India VIX, ATR daily range, Option Greeks (Delta ~0.30-0.38), IV Skew, and Technical trend.\n"
+            "Rules:\n"
+            "1. All strikes MUST be valid NIFTY 50-point increments (multiples of 50: e.g. 24450, 24500, 24550, 24600).\n"
+            "2. call_strike MUST be >= reference_ltp.\n"
+            "3. put_strike MUST be <= reference_ltp.\n"
+            "4. In high volatility (VIX > 16 or ATR > 160), choose wider strikes (+/- 150 to 200 pts) to reduce theta drag.\n"
+            "5. In low volatility (VIX < 13 or ATR < 110), choose tighter strikes (+/- 50 to 100 pts) so delta moves into the money.\n"
+            "6. If Put IV is heavily skewed (> 1.5 pt over Call IV), push Put strike 50 pts further OTM to equalize premium outlay.\n"
+            "7. Delta Asymmetry Rule: If directional bias is BULLISH (score >= +0.35), choose asymmetric strikes with CE Delta closer to ATM (~0.40) and PE Delta further OTM (~0.28). If BEARISH (score <= -0.35), choose PE Delta closer to ATM (~-0.40) and CE Delta further OTM (~0.28). If NEUTRAL, keep symmetric Deltas (~0.33-0.35).\n"
+            "8. Output ONLY a valid JSON object matching the schema."
+        )
 
     user_data = {
         "nifty_spot_ltp": reference_ltp,
+        "moneyness_mode": moneyness_mode,
         "static_benchmark_strikes": {
             "static_put_strike": static_put,
             "static_call_strike": static_call
@@ -343,16 +419,30 @@ def build_strike_selection_prompt(
         "candidate_strikes_greeks": context.get("candidate_strikes", [])
     }
 
+    anchor = int(math.floor(reference_ltp / 50.0) * 50)
+    if moneyness_mode == "ITM":
+        example_call = static_call
+        example_put = static_put
+        target_d = 0.68
+    elif moneyness_mode == "ATM":
+        example_call = anchor
+        example_put = anchor
+        target_d = 0.50
+    else:  # OTM
+        example_call = anchor + 100
+        example_put = anchor - 100
+        target_d = 0.35
+
     user_prompt = (
-        "## Current Market State for Strike Selection (Tuesday 9:30 AM IST)\n"
+        f"## Current Market State for Strike Selection ({moneyness_mode} Mode)\n"
         f"{json.dumps(user_data, indent=2)}\n\n"
         "## Required Output Format (JSON)\n"
         "```json\n"
         "{\n"
-        '  "call_strike": 24600,\n'
-        '  "put_strike": 24350,\n'
-        '  "target_call_delta": 0.35,\n'
-        '  "target_put_delta": -0.35,\n'
+        f'  "call_strike": {example_call},\n'
+        f'  "put_strike": {example_put},\n'
+        f'  "target_call_delta": {target_d},\n'
+        f'  "target_put_delta": {-target_d},\n'
         '  "selection_rationale": "Clear 2-sentence rationale citing VIX/ATR, Delta targets, and IV skew."\n'
         "}\n"
         "```"
@@ -417,18 +507,22 @@ def call_openrouter_strike_selector(
 def select_strikes(
     reference_ltp: float,
     sqlite_dir: str = DEFAULT_SQLITE_DIR,
-    force_static: bool = False
+    force_static: bool = False,
+    moneyness_mode: str = None,
+    days_to_expiry: float = 6.0,
 ) -> Tuple[int, int, int, int, str, str, float, str, float, float]:
     """
     Master strike selection entry point.
     
     Selects Call and Put strikes using AI volatility & Greeks calibration,
-    with an immediate fail-safe fallback to standard/asymmetric anchor rules.
+    with an immediate fail-safe fallback to delta-scanned / asymmetric anchor rules.
     
     Args:
-        reference_ltp: NIFTY spot LTP at Tuesday 9:30 AM.
+        reference_ltp: NIFTY spot LTP at cycle start.
         sqlite_dir: Path to directory containing SQLite databases.
         force_static: If True, bypass AI and use static benchmark.
+        moneyness_mode: 'ITM' (default), 'ATM', or 'OTM'.
+        days_to_expiry: Estimated days to expiry for Delta calculations.
         
     Returns:
         Tuple of:
@@ -436,8 +530,9 @@ def select_strikes(
          selection_mode, rationale, composite_score, directional_bias,
          target_call_delta, target_put_delta)
     """
-    static_put, static_call = compute_static_strikes(reference_ltp, step=STRIKE_STEP)
-    static_anchor = int(reference_ltp / STRIKE_STEP) * STRIKE_STEP
+    effective_mode = (moneyness_mode or STRIKE_MONEYNESS_MODE).upper()
+    static_put, static_call = compute_static_strikes(reference_ltp, step=STRIKE_STEP, mode=effective_mode)
+    static_anchor = int(math.floor(reference_ltp / STRIKE_STEP)) * STRIKE_STEP
 
     # 1. Ingest market context & directional score
     context = load_market_context_for_strikes(reference_ltp, sqlite_dir)
@@ -446,24 +541,65 @@ def select_strikes(
     global _LAST_COMPOSITE_SCORE, _LAST_DIRECTIONAL_BIAS, _LAST_TARGET_CALL_DELTA, _LAST_TARGET_PUT_DELTA
     _LAST_COMPOSITE_SCORE = composite_score
 
-    if composite_score >= 0.35:
-        directional_bias = "BULLISH"
-        default_call_delta = 0.40
-        default_put_delta = -0.28
-        asym_call = static_anchor + 50
-        asym_put = static_anchor - 150
-    elif composite_score <= -0.35:
-        directional_bias = "BEARISH"
-        default_call_delta = 0.28
-        default_put_delta = -0.40
-        asym_call = static_anchor + 150
-        asym_put = static_anchor - 50
-    else:
-        directional_bias = "NEUTRAL"
-        default_call_delta = 0.33
-        default_put_delta = -0.33
-        asym_call = static_call
-        asym_put = static_put
+    current_vix = float(context.get("vix") or 14.0)
+    current_iv = current_vix / 100.0
+
+    if effective_mode == "ITM":
+        if composite_score >= 0.35:
+            directional_bias = "BULLISH"
+            default_call_delta = 0.75
+            default_put_delta = -0.60
+            asym_call = static_anchor - 150
+            asym_put = static_anchor + 50
+        elif composite_score <= -0.35:
+            directional_bias = "BEARISH"
+            default_call_delta = 0.60
+            default_put_delta = -0.75
+            asym_call = static_anchor - 50
+            asym_put = static_anchor + 150
+        else:
+            directional_bias = "NEUTRAL"
+            default_call_delta = TARGET_ITM_DELTA
+            default_put_delta = -TARGET_ITM_DELTA
+            asym_call = static_call
+            asym_put = static_put
+
+        # Fine-tune fallback using Black-Scholes delta scanning
+        try:
+            delta_call_strike = find_strike_by_delta(reference_ltp, default_call_delta, is_call=True, days_to_expiry=days_to_expiry, iv=current_iv)
+            delta_put_strike = find_strike_by_delta(reference_ltp, default_put_delta, is_call=False, days_to_expiry=days_to_expiry, iv=current_iv)
+            if delta_put_strike >= delta_call_strike:
+                asym_call = delta_call_strike
+                asym_put = delta_put_strike
+        except Exception as e:
+            logger.debug(f"Delta scanning fallback: {e}")
+
+    elif effective_mode == "ATM":
+        directional_bias = "BULLISH" if composite_score >= 0.35 else "BEARISH" if composite_score <= -0.35 else "NEUTRAL"
+        default_call_delta = 0.50
+        default_put_delta = -0.50
+        asym_call = static_anchor
+        asym_put = static_anchor
+
+    else:  # OTM legacy
+        if composite_score >= 0.35:
+            directional_bias = "BULLISH"
+            default_call_delta = 0.40
+            default_put_delta = -0.28
+            asym_call = static_anchor + 50
+            asym_put = static_anchor - 150
+        elif composite_score <= -0.35:
+            directional_bias = "BEARISH"
+            default_call_delta = 0.28
+            default_put_delta = -0.40
+            asym_call = static_anchor + 150
+            asym_put = static_anchor - 50
+        else:
+            directional_bias = "NEUTRAL"
+            default_call_delta = 0.33
+            default_put_delta = -0.33
+            asym_call = static_call
+            asym_put = static_put
 
     _LAST_DIRECTIONAL_BIAS = directional_bias
     _LAST_TARGET_CALL_DELTA = default_call_delta
@@ -475,8 +611,8 @@ def select_strikes(
             asym_call if not force_static else static_call,
             static_put,
             static_call,
-            "STATIC_RULE" if force_static else f"STATIC_ASYM_{directional_bias}",
-            f"Selected via static {'anchor +/- 100 pt rule' if force_static else f'directional rule ({directional_bias}, score={composite_score:+.2f})'}.",
+            f"STATIC_{effective_mode}_RULE" if force_static else f"STATIC_ASYM_{effective_mode}_{directional_bias}",
+            f"Selected via static {effective_mode} {'anchor rule' if force_static else f'directional rule ({directional_bias}, score={composite_score:+.2f})'}.",
             composite_score,
             directional_bias,
             default_call_delta,
@@ -484,7 +620,13 @@ def select_strikes(
         )
 
     # 2. Build prompt
-    sys_p, user_p = build_strike_selection_prompt(reference_ltp, context, static_put, static_call)
+    sys_p, user_p = build_strike_selection_prompt(
+        reference_ltp,
+        context,
+        static_put,
+        static_call,
+        moneyness_mode=effective_mode
+    )
 
     # 3. Fetch model chain & query OpenRouter
     models = fetch_redis_models()
@@ -501,18 +643,37 @@ def select_strikes(
 
             # Sanity checks on AI strikes:
             # 1. Must be multiples of 50
-            # 2. call_strike >= reference_ltp - 50 and put_strike <= reference_ltp + 50
-            # 3. call_strike > put_strike
-            # 4. Reasonably close to spot (within +/- 450 pts)
-            if (
+            # 2. Reasonably close to spot (within +/- 450 pts)
+            # 3. Mode-specific moneyness geometry
+            is_valid = (
                 c_strike % 50 == 0 and p_strike % 50 == 0
-                and c_strike > p_strike
                 and abs(c_strike - reference_ltp) <= 450
                 and abs(p_strike - reference_ltp) <= 450
-            ):
+            )
+
+            if effective_mode == "ITM":
+                # In Long Gut: Call is <= spot + 50, Put is >= spot - 50, and Put >= Call
+                is_valid = (
+                    is_valid
+                    and p_strike >= c_strike
+                    and c_strike <= reference_ltp + 50
+                    and p_strike >= reference_ltp - 50
+                )
+            elif effective_mode == "OTM":
+                # In Long Strangle: Call is >= spot - 50, Put is <= spot + 50, and Call >= Put
+                is_valid = (
+                    is_valid
+                    and c_strike >= p_strike
+                    and c_strike >= reference_ltp - 50
+                    and p_strike <= reference_ltp + 50
+                )
+            elif effective_mode == "ATM":
+                is_valid = is_valid and (abs(c_strike - reference_ltp) <= 150) and (abs(p_strike - reference_ltp) <= 150)
+
+            if is_valid:
                 logger.info(
                     f"AI Strike Selection Approved [{used_model}]: Call={c_strike} (Delta={target_call_delta}), "
-                    f"Put={p_strike} (Delta={target_put_delta}) | Bias={directional_bias} ({composite_score:+.2f})"
+                    f"Put={p_strike} (Delta={target_put_delta}) | Mode={effective_mode} Bias={directional_bias} ({composite_score:+.2f})"
                 )
                 return (
                     p_strike,
@@ -520,20 +681,22 @@ def select_strikes(
                     static_put,
                     static_call,
                     f"AI_{used_model.split('/')[-1]}",
-                    rationale or f"Selected via AI model {used_model} based on VIX, Greeks, and {directional_bias} bias.",
+                    rationale or f"Selected via AI model {used_model} based on VIX, Greeks, and {directional_bias} bias in {effective_mode} mode.",
                     composite_score,
                     directional_bias,
                     target_call_delta,
                     target_put_delta,
                 )
             else:
-                logger.warning(f"AI returned invalid strikes: Call={c_strike}, Put={p_strike}. Reverting to directional fallback.")
+                logger.warning(
+                    f"AI returned invalid strikes for {effective_mode} mode: Call={c_strike}, Put={p_strike}. Reverting to fallback."
+                )
         except Exception as e:
             logger.warning(f"Failed to parse AI strike selection output: {e}")
 
     # Fallback to directional asymmetric rule
     logger.info(
-        f"Using Directional Asymmetric Fallback Strikes: Call={asym_call}, Put={asym_put} "
+        f"Using Directional Asymmetric Fallback Strikes ({effective_mode}): Call={asym_call}, Put={asym_put} "
         f"(Benchmark: {static_call}/{static_put}, Bias={directional_bias})"
     )
     return (
@@ -541,8 +704,8 @@ def select_strikes(
         asym_call,
         static_put,
         static_call,
-        f"ASYM_FALLBACK_{directional_bias}",
-        f"Fallback to directional asymmetric rule ({directional_bias}, score={composite_score:+.2f}) due to API delay.",
+        f"ASYM_FALLBACK_{effective_mode}_{directional_bias}",
+        f"Fallback to directional asymmetric rule ({directional_bias}, score={composite_score:+.2f}) in {effective_mode} mode.",
         composite_score,
         directional_bias,
         default_call_delta,

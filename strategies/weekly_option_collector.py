@@ -39,6 +39,7 @@ from config import (
     logger,
     STRATEGY_NAME,
     SQLITE_DIR,
+    STRIKE_MONEYNESS_MODE,
 )
 
 from common.expiry import (
@@ -47,7 +48,9 @@ from common.expiry import (
     format_expiry_angelone,
     format_expiry_file,
     strike_selector,
+    compute_intrinsic_extrinsic,
 )
+
 
 from common.calendar_utils import (
     check_nse_holiday,
@@ -85,6 +88,7 @@ from common.fsm_strategy import (
     init_fsm_state,
     evaluate_fsm_tick,
     estimate_option_delta,
+    fetch_option_surface_iv,
 )
 
 from common.profit_monitor import evaluate_peak_profit
@@ -316,12 +320,16 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             active_cycle["week_start_date"], put_strike, call_strike, selection_mode
         )
     else:
+        d_to_exp = max(0.1, float((expiry_date - today).days))
+
         # Smart Entry Gate (Eliminating the blind 09:31 AM IV crush trap)
         if is_first_run_of_week:
             gate_res = evaluate_entry_gate(
                 reference_ltp=nifty_ltp,
                 sqlite_dir=SQLITE_DIR,
-                force=force_entry
+                force=force_entry,
+                nifty_open=nifty_open,
+                nifty_prev_close=nifty_prev_close,
             )
             if not gate_res.should_enter:
                 logger.info("=" * 60)
@@ -353,7 +361,9 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     ) = select_strikes(
                         reference_ltp=nifty_ltp,
                         sqlite_dir=SQLITE_DIR,
-                        force_static=force_static
+                        force_static=force_static,
+                        moneyness_mode=STRIKE_MONEYNESS_MODE,
+                        days_to_expiry=d_to_exp,
                     )
                     hyp_chain = get_nifty_option_chain(expiry_angelone, hyp_call, hyp_put)
                     hyp_call_ltp = (hyp_chain.get("call") or {}).get("ltp")
@@ -379,6 +389,8 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                         "directional_bias": hyp_dir_bias,
                         "target_call_delta": hyp_c_delta,
                         "target_put_delta": hyp_p_delta,
+                        "atm_straddle_ratio": gate_res.atm_straddle_ratio,
+                        "overnight_gap_pct": gate_res.overnight_gap_pct,
                     }
                     insert_gate_deferred_shadow(shadow_db, shadow_record)
                     logger.info(
@@ -406,7 +418,9 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         ) = select_strikes(
             reference_ltp=nifty_ltp,
             sqlite_dir=SQLITE_DIR,
-            force_static=force_static
+            force_static=force_static,
+            moneyness_mode=STRIKE_MONEYNESS_MODE,
+            days_to_expiry=d_to_exp,
         )
         logger.info(
             "Selected strikes from LTP %.2f [%s]: PUT=%d (Delta=%.2f)  CALL=%d (Delta=%.2f) | Bias=%s (Score=%.2f) (Static Benchmark: PUT=%d CALL=%d)",
@@ -461,11 +475,14 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             call_buy_price = call_ltp
             put_buy_price = put_ltp
 
+            ie = compute_intrinsic_extrinsic(nifty_ltp, call_strike, put_strike, call_buy_price, put_buy_price)
+
             snapshot = {
                 "strategy_name": STRATEGY_NAME,
                 "cycle_id": cycle_id,
                 "week_start_date": start_str,
                 "expiry_date": expiry_file,
+                "entry_spot": nifty_ltp,
                 "call_strike": call_strike,
                 "put_strike": put_strike,
                 "call_buy_price": call_buy_price,
@@ -477,8 +494,16 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 "selection_rationale": selection_rationale,
                 "composite_direction_score": composite_score if 'composite_score' in locals() else get_last_composite_score(),
                 "directional_bias": directional_bias if 'directional_bias' in locals() else "NEUTRAL",
-                "target_call_delta": target_call_delta if 'target_call_delta' in locals() else 0.35,
-                "target_put_delta": target_put_delta if 'target_put_delta' in locals() else -0.35,
+                "target_call_delta": target_call_delta if 'target_call_delta' in locals() else 0.68,
+                "target_put_delta": target_put_delta if 'target_put_delta' in locals() else -0.68,
+                "moneyness": STRIKE_MONEYNESS_MODE,
+                "spread_width": ie["spread_width"],
+                "call_intrinsic": ie["call_intrinsic"],
+                "call_extrinsic": ie["call_extrinsic"],
+                "put_intrinsic": ie["put_intrinsic"],
+                "put_extrinsic": ie["put_extrinsic"],
+                "total_intrinsic": ie["total_intrinsic"],
+                "total_extrinsic": ie["total_extrinsic"],
                 "smart_gate": gate_res.to_dict() if 'gate_res' in locals() else {},
                 "alpha_fsm": init_fsm_state(
                     call_strike=call_strike,
@@ -487,6 +512,12 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     put_buy_price=put_buy_price,
                     entry_ts=_now_utc_ts(),
                     composite_score=composite_score if 'composite_score' in locals() else get_last_composite_score(),
+                    moneyness=STRIKE_MONEYNESS_MODE,
+                    call_intrinsic=ie["call_intrinsic"],
+                    call_extrinsic=ie["call_extrinsic"],
+                    put_intrinsic=ie["put_intrinsic"],
+                    put_extrinsic=ie["put_extrinsic"],
+                    spread_width=ie["spread_width"],
                 ),
             }
 
@@ -505,12 +536,14 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             cycle_id = generate_cycle_id(start_str)
             call_buy_price = call_ltp
             put_buy_price = put_ltp
+            ie = compute_intrinsic_extrinsic(nifty_ltp, call_strike, put_strike, call_buy_price, put_buy_price)
 
             snapshot = {
                 "strategy_name": STRATEGY_NAME,
                 "cycle_id": cycle_id,
                 "week_start_date": start_str,
                 "expiry_date": expiry_file,
+                "entry_spot": nifty_ltp,
                 "call_strike": call_strike,
                 "put_strike": put_strike,
                 "call_buy_price": call_buy_price,
@@ -522,8 +555,16 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 "selection_rationale": selection_rationale,
                 "composite_direction_score": get_last_composite_score(),
                 "directional_bias": "NEUTRAL",
-                "target_call_delta": 0.35,
-                "target_put_delta": -0.35,
+                "target_call_delta": 0.68,
+                "target_put_delta": -0.68,
+                "moneyness": STRIKE_MONEYNESS_MODE,
+                "spread_width": ie["spread_width"],
+                "call_intrinsic": ie["call_intrinsic"],
+                "call_extrinsic": ie["call_extrinsic"],
+                "put_intrinsic": ie["put_intrinsic"],
+                "put_extrinsic": ie["put_extrinsic"],
+                "total_intrinsic": ie["total_intrinsic"],
+                "total_extrinsic": ie["total_extrinsic"],
                 "smart_gate": {"status": "MIDWEEK_FALLBACK", "should_enter": True},
                 "alpha_fsm": init_fsm_state(
                     call_strike=call_strike,
@@ -532,6 +573,12 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     put_buy_price=put_buy_price,
                     entry_ts=_now_utc_ts(),
                     composite_score=get_last_composite_score(),
+                    moneyness=STRIKE_MONEYNESS_MODE,
+                    call_intrinsic=ie["call_intrinsic"],
+                    call_extrinsic=ie["call_extrinsic"],
+                    put_intrinsic=ie["put_intrinsic"],
+                    put_extrinsic=ie["put_extrinsic"],
+                    spread_width=ie["spread_width"],
                 ),
             }
             save_active_snapshot(snapshot)
@@ -569,17 +616,27 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
     curr_active = load_active_snapshot()
     fsm_state = curr_active.get("alpha_fsm")
     if not fsm_state:
+        entry_spot_fb = curr_active.get("entry_spot") or curr_active.get("nifty_open") or nifty_ltp
+        ie_fb = compute_intrinsic_extrinsic(entry_spot_fb, call_strike, put_strike, call_buy_price, put_buy_price)
         fsm_state = init_fsm_state(
             call_strike=call_strike,
             put_strike=put_strike,
             call_buy_price=call_buy_price,
             put_buy_price=put_buy_price,
             entry_ts=_now_utc_ts(),
+            composite_score=curr_active.get("composite_direction_score", 0.0),
+            moneyness=curr_active.get("moneyness") or ("ITM" if put_strike > call_strike else "OTM"),
+            call_intrinsic=curr_active.get("call_intrinsic", ie_fb["call_intrinsic"]),
+            call_extrinsic=curr_active.get("call_extrinsic", ie_fb["call_extrinsic"]),
+            put_intrinsic=curr_active.get("put_intrinsic", ie_fb["put_intrinsic"]),
+            put_extrinsic=curr_active.get("put_extrinsic", ie_fb["put_extrinsic"]),
+            spread_width=curr_active.get("spread_width", ie_fb["spread_width"]),
         )
 
     days_to_expiry = max(0.1, (expiry_date - today).days)
     call_delta = estimate_option_delta(nifty_ltp, call_strike, days_to_expiry, is_call=True)
     put_delta = estimate_option_delta(nifty_ltp, put_strike, days_to_expiry, is_call=False)
+    call_iv, put_iv = fetch_option_surface_iv(call_strike, put_strike, sqlite_dir=SQLITE_DIR)
     updated_fsm, fsm_events = evaluate_fsm_tick(
         fsm_state=fsm_state,
         current_call_ltp=call_ltp,
@@ -588,6 +645,8 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         days_to_expiry=days_to_expiry,
         call_delta=call_delta,
         put_delta=put_delta,
+        put_iv=put_iv,
+        call_iv=call_iv,
     )
     if fsm_events:
         for ev in fsm_events:

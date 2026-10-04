@@ -52,6 +52,13 @@ COLLECTION_START_MINUTE = 30
 COLLECTION_INTERVAL_MINUTES = 60  # Hourly after start
 NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))  # Default Nifty contract lot size (revised to 65 by NSE)
 
+# Moneyness parameters (ITM default per 6-year backtesting data, supports OTM / ATM)
+STRIKE_MONEYNESS_MODE = os.getenv("STRIKE_MONEYNESS_MODE", "ITM").upper()
+STRIKE_MONEYNESS_MODE_THURSDAY = os.getenv("STRIKE_MONEYNESS_MODE_THURSDAY", "ITM").upper()
+TARGET_ITM_DELTA = float(os.getenv("TARGET_ITM_DELTA", "0.68"))  # Target |Delta| ~ 0.65 - 0.70 for ITM
+PUT_IV_SPIKE_THRESHOLD = float(os.getenv("PUT_IV_SPIKE_THRESHOLD", "18.0"))  # IV threshold for accelerated trailing stop
+
+
 # ---------------------------------------------------------------------------
 # Peak profit alert parameters
 # ---------------------------------------------------------------------------

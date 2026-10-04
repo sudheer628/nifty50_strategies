@@ -75,3 +75,27 @@ def test_entry_gate_missing_db_graceful_pass():
     # When DB is missing, filters gracefully pass to ensure trading is never blocked by telemetry issues
     assert res.should_enter is True
     assert res.status == "CLEARED"
+
+
+def test_entry_gate_overnight_gap_and_straddle_telemetry():
+    """Verify that overnight gap and ATM straddle ratio are computed and attached as shadow telemetry."""
+    normal_dt = datetime(2026, 9, 15, 10, 15, 0, tzinfo=IST_TZ)
+    res = evaluate_entry_gate(
+        reference_ltp=24500.0,
+        sqlite_dir="/tmp/dummy_sqlite",
+        current_time_ist=normal_dt,
+        force=False,
+        nifty_open=24700.0,
+        nifty_prev_close=24500.0,
+        atm_straddle_price=350.0,
+    )
+    assert res.should_enter is True
+    assert res.overnight_gap_pct == pytest.approx(0.816, rel=1e-3)
+    assert res.atm_straddle_ratio == pytest.approx(1.429, rel=1e-3)
+
+    d = res.to_dict()
+    assert "overnight_gap_pct" in d
+    assert "atm_straddle_ratio" in d
+    assert d["overnight_gap_pct"] == pytest.approx(0.816, rel=1e-3)
+    assert d["atm_straddle_ratio"] == pytest.approx(1.429, rel=1e-3)
+

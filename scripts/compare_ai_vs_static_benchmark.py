@@ -192,17 +192,38 @@ def compare_strategies(
     fsm_total_pts = float(latest_ai.get("fsm_total_gainloss", 0.0) or alpha_snapshot.get("total_gainloss", latest_ai_call_ltp + latest_ai_put_ltp - ai_total_buy))
     fsm_roi_pct = float(latest_ai.get("fsm_roi_pct", 0.0) or alpha_snapshot.get("roi_pct", ai_total_pnl))
 
+    moneyness = str(snapshot.get("moneyness", "ITM")).upper()
+    spread_w = snapshot.get("spread_width", 0)
+    total_ext_risk = snapshot.get("total_extrinsic", 0.0) or (snapshot.get("alpha_fsm") or {}).get("total_extrinsic_risk", 0.0)
+
+    # Reconstruct ATM Straddle benchmark (Delta ~ 0.50)
+    nifty_entry_spot = strategy_rows[0].get("nifty_open") or strategy_rows[0].get("nifty_ltp") or 0.0
+    atm_strike = int(round(float(nifty_entry_spot) / 50.0) * 50) if nifty_entry_spot > 0 else 0
+    atm_history = reconstruct_static_benchmark_pnl(
+        signals_db, atm_strike, atm_strike, start_ts, end_ts
+    ) if atm_strike > 0 else []
+
+    atm_call_buy = atm_history[0]["call_ltp"] if atm_history else None
+    atm_put_buy = atm_history[0]["put_ltp"] if atm_history else None
+    atm_total_buy = (atm_call_buy + atm_put_buy) if (atm_call_buy and atm_put_buy) else None
+    latest_atm_c = atm_history[-1]["call_ltp"] if atm_history else None
+    latest_atm_p = atm_history[-1]["put_ltp"] if atm_history else None
+    atm_total_pnl = ((latest_atm_c + latest_atm_p - atm_total_buy) / atm_total_buy * 100) if (atm_total_buy and latest_atm_c and latest_atm_p) else None
+
     # Print Table
     cycle_id = snapshot.get("cycle_id", "ACTIVE")
     selection_mode = snapshot.get("selection_mode", "AI")
     rationale = snapshot.get("selection_rationale", "N/A")
 
     print("\n" + "=" * 90)
-    print(f"  WEEKLY OPTION STRATEGY 3-WAY BENCHMARK COMPARISON: {cycle_id}")
+    print(f"  WEEKLY OPTION STRATEGY MULTI-BENCHMARK COMPARISON: {cycle_id}")
     print("=" * 90)
+    print(f"Moneyness Mode:      {moneyness} (Spread Width: {spread_w} pts | Extrinsic Risk: {total_ext_risk} pts)")
     print(f"Selection Mode:      {selection_mode}")
     print(f"AI Selection Reason: {rationale}")
     print(f"Alpha FSM State:     {fsm_state}")
+    if atm_total_pnl is not None:
+        print(f"ATM Straddle ({atm_strike}): Entry=₹{atm_total_buy:.2f} | Current=₹{latest_atm_c + latest_atm_p:.2f} | P&L={atm_total_pnl:+.2f}%")
     print("-" * 90)
     print(f"{'Metric':<24} | {'Static Benchmark':<18} | {'Base (Buy & Hold)':<20} | {'Alpha FSM Strategy':<20}")
     print("-" * 90)

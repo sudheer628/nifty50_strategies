@@ -31,8 +31,12 @@ MANUAL_SNAPSHOT = {
 
 class CycleSnapshotTests(unittest.TestCase):
     def test_strikes_are_symmetric_around_first_trigger_ltp_anchor(self):
-        self.assertEqual(strike_selector(25000.0), (24900, 25100))
-        self.assertEqual(strike_selector(25087.5), (24900, 25100))
+        # ITM mode (default per 6-year backtesting data: Put=25100, Call=24900)
+        self.assertEqual(strike_selector(25000.0, mode="ITM"), (25100, 24900))
+        self.assertEqual(strike_selector(25087.5, mode="ITM"), (25100, 24900))
+        # Legacy OTM mode (Put=24900, Call=25100)
+        self.assertEqual(strike_selector(25000.0, mode="OTM"), (24900, 25100))
+        self.assertEqual(strike_selector(25087.5, mode="OTM"), (24900, 25100))
 
     def test_monday_reuses_complete_manual_cycle(self):
         cycle = _active_cycle(MANUAL_SNAPSHOT, date(2026, 8, 10))
@@ -132,15 +136,16 @@ class CycleSnapshotTests(unittest.TestCase):
 
         self.assertTrue(collect_once())
 
-        get_options.assert_called_once_with("18AUG2026", 25100, 24900)
+        # In ITM mode, delta-calibrated selection chooses Call=24800, Put=25250 (7 DTE)
+        get_options.assert_called_once_with("18AUG2026", 24800, 25250)
         snapshot = save_snapshot.call_args.args[0]
-        self.assertEqual(snapshot["call_strike"], 25100)
-        self.assertEqual(snapshot["put_strike"], 24900)
+        self.assertEqual(snapshot["call_strike"], 24800)
+        self.assertEqual(snapshot["put_strike"], 25250)
         record = insert_record.call_args.args[1]
         self.assertEqual(record["nifty_open"], 24875.0)
         self.assertEqual(record["nifty_ltp"], 25000.0)
-        self.assertEqual(record["call_strike"], 25100)
-        self.assertEqual(record["put_strike"], 24900)
+        self.assertEqual(record["call_strike"], 24800)
+        self.assertEqual(record["put_strike"], 25250)
         self.assertEqual(record["gainloss"], 0.0)
 
 
