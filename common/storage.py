@@ -281,6 +281,30 @@ def init_db(db_path: str) -> None:
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS timing_shadow_entries (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id                    TEXT    NOT NULL,
+            trade_date                  TEXT    NOT NULL,
+            variant                     TEXT    NOT NULL,
+            call_strike                 INTEGER NOT NULL,
+            put_strike                  INTEGER NOT NULL,
+            call_entry_time             TEXT    NOT NULL,
+            call_entry_price            REAL    NOT NULL,
+            call_entry_ts               INTEGER NOT NULL,
+            put_entry_time              TEXT    NOT NULL,
+            put_entry_price             REAL    NOT NULL,
+            put_entry_ts                INTEGER NOT NULL,
+            combined_entry_price        REAL    NOT NULL,
+            spot_at_call_entry          REAL,
+            spot_at_put_entry           REAL,
+            nifty_spot_entry            REAL,
+            moneyness                   TEXT    DEFAULT 'ITM',
+            created_at                  INTEGER NOT NULL,
+            UNIQUE(cycle_id, variant)
+        )
+    """)
+
     # Migrate gate_deferred_shadows table if columns are missing
     cur.execute("PRAGMA table_info(gate_deferred_shadows)")
     shadow_cols = {row[1] for row in cur.fetchall()}
@@ -399,6 +423,44 @@ def insert_gate_deferred_shadow(db_path: str, shadow_record: dict) -> None:
     conn.commit()
     conn.close()
     logger.info("Inserted gate deferred shadow record into %s", db_path)
+
+
+def insert_timing_shadow_entry(db_path: str, shadow_record: dict) -> None:
+    """Insert or update a counterfactual timing shadow record (delayed/staggered entries)."""
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(timing_shadow_entries)")
+    cols = {row[1] for row in cur.fetchall()}
+    ins = {k: v for k, v in shadow_record.items() if k in cols}
+    col_names = ", ".join(ins.keys())
+    placeholders = ", ".join("?" for _ in ins)
+    cur.execute(
+        f"INSERT OR REPLACE INTO timing_shadow_entries ({col_names}) VALUES ({placeholders})",
+        tuple(ins.values())
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Recorded timing shadow entry [%s] for cycle %s", shadow_record.get("variant"), shadow_record.get("cycle_id"))
+
+
+def get_timing_shadow_entries(db_path: str, cycle_id: Optional[str] = None) -> list:
+    """Retrieve timing shadow entry records from a weekly database."""
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    try:
+        if cycle_id:
+            cur.execute("SELECT * FROM timing_shadow_entries WHERE cycle_id = ? ORDER BY id ASC", (cycle_id,))
+        else:
+            cur.execute("SELECT * FROM timing_shadow_entries ORDER BY id ASC")
+        return [dict(r) for r in cur.fetchall()]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
 
 
 def get_gamma_sniper_trades(db_path: str) -> list:

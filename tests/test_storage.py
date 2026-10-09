@@ -165,6 +165,61 @@ class StorageMigrationTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(atm_recheck[0], "ATM")
 
+    def test_timing_shadow_entries_storage_and_idempotency(self):
+        from common.storage import insert_timing_shadow_entry, get_timing_shadow_entries
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "timing_test.db")
+            init_db(db_path)
+
+            record_v0 = {
+                "cycle_id": "CYCLE-20261006",
+                "trade_date": "2026-10-06",
+                "variant": "V0_baseline_0931",
+                "call_strike": 24900,
+                "put_strike": 25100,
+                "call_entry_time": "09:31:00",
+                "call_entry_price": 280.0,
+                "call_entry_ts": 1786452660,
+                "put_entry_time": "09:31:00",
+                "put_entry_price": 270.0,
+                "put_entry_ts": 1786452660,
+                "combined_entry_price": 550.0,
+                "spot_at_call_entry": 25000.0,
+                "spot_at_put_entry": 25000.0,
+                "nifty_spot_entry": 25000.0,
+                "moneyness": "ITM",
+                "created_at": 1786452660,
+            }
+            insert_timing_shadow_entry(db_path, record_v0)
+
+            # Insert second variant
+            record_v1 = dict(record_v0)
+            record_v1["variant"] = "V1_delayed_1000"
+            record_v1["call_entry_price"] = 270.0
+            record_v1["put_entry_price"] = 265.0
+            record_v1["combined_entry_price"] = 535.0
+            insert_timing_shadow_entry(db_path, record_v1)
+
+            # Retrieve all
+            entries = get_timing_shadow_entries(db_path)
+            self.assertEqual(len(entries), 2)
+
+            # Retrieve by cycle_id
+            cycle_entries = get_timing_shadow_entries(db_path, cycle_id="CYCLE-20261006")
+            self.assertEqual(len(cycle_entries), 2)
+            self.assertEqual(cycle_entries[0]["variant"], "V0_baseline_0931")
+            self.assertEqual(cycle_entries[1]["variant"], "V1_delayed_1000")
+
+            # Update record_v1 (idempotent replace)
+            record_v1["combined_entry_price"] = 530.0
+            insert_timing_shadow_entry(db_path, record_v1)
+
+            updated_entries = get_timing_shadow_entries(db_path, cycle_id="CYCLE-20261006")
+            self.assertEqual(len(updated_entries), 2)
+            v1_updated = [e for e in updated_entries if e["variant"] == "V1_delayed_1000"][0]
+            self.assertEqual(v1_updated["combined_entry_price"], 530.0)
+
 
 if __name__ == "__main__":
     unittest.main()

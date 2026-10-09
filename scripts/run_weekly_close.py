@@ -246,6 +246,25 @@ def main() -> int:
         logger.warning(f"Script not found: {benchmark_script}")
 
     # -----------------------------------------------------------------
+    # Step 2b: Retrospective Counterfactual Entry Timing Comparison
+    # -----------------------------------------------------------------
+    logger.info("▶ Step 2b: Running counterfactual entry timing analysis (delayed & staggered)...")
+    timing_script = os.path.join(PROJECT_ROOT, "scripts", "compare_entry_timing_counterfactuals.py")
+    if os.path.exists(timing_script):
+        timing_cmd = [python_bin, timing_script]
+        try:
+            from scripts.send_weekly_report import find_weekly_db
+            cur_db = find_weekly_db(target_date)
+            timing_cmd.extend(["--db", str(cur_db)])
+        except Exception as e:
+            logger.info(f"Target weekly DB for {target_date} not resolved directly ({e}), running full scan.")
+        run_command(
+            timing_cmd,
+            cwd=PROJECT_ROOT,
+            dry_run=args.dry_run,
+        )
+
+    # -----------------------------------------------------------------
     # Step 3 & 4: Sentinel-Hermes Weekly Merge & Skill Generator
     # -----------------------------------------------------------------
     hermes_dir = locate_sentinel_hermes_dir()

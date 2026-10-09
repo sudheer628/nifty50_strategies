@@ -82,6 +82,8 @@ from common.storage import (
     update_active_fsm_state,
     generate_cycle_id,
     insert_gate_deferred_shadow,
+    insert_timing_shadow_entry,
+    get_timing_shadow_entries,
 )
 
 from common.fsm_strategy import (
@@ -525,6 +527,35 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             save_active_snapshot(snapshot)
             insert_buy_snapshot(db_path, snapshot)
 
+            # Record counterfactual baseline V0 (09:31 lock)
+            try:
+                shadow_v0 = {
+                    "cycle_id": cycle_id,
+                    "trade_date": today_str,
+                    "variant": "V0_baseline_0931",
+                    "call_strike": call_strike,
+                    "put_strike": put_strike,
+                    "call_entry_time": _now_ist().strftime("%H:%M:%S"),
+                    "call_entry_price": call_buy_price,
+                    "call_entry_ts": _now_utc_ts(),
+                    "put_entry_time": _now_ist().strftime("%H:%M:%S"),
+                    "put_entry_price": put_buy_price,
+                    "put_entry_ts": _now_utc_ts(),
+                    "combined_entry_price": round(call_buy_price + put_buy_price, 2),
+                    "spot_at_call_entry": nifty_ltp,
+                    "spot_at_put_entry": nifty_ltp,
+                    "nifty_spot_entry": nifty_ltp,
+                    "moneyness": STRIKE_MONEYNESS_MODE,
+                    "created_at": _now_utc_ts(),
+                }
+                insert_timing_shadow_entry(db_path, shadow_v0)
+                logger.info(
+                    "  [TIMING SHADOW V0 RECORDED] Baseline 09:31: CALL %d @ ₹%.2f | PUT %d @ ₹%.2f (Combined: ₹%.2f)",
+                    call_strike, call_buy_price, put_strike, put_buy_price, shadow_v0["combined_entry_price"]
+                )
+            except Exception as shadow_err:
+                logger.warning("Failed to record timing shadow V0: %s", shadow_err)
+
             logger.info("Cycle buy prices captured [%s]: CALL=%d (₹%.2f)  PUT=%d (₹%.2f)",
                      selection_mode, call_strike, call_buy_price, put_strike, put_buy_price)
     else:
@@ -721,6 +752,102 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         )
     except Exception as peak_err:
         logger.warning("Failed to evaluate peak profit: %s", peak_err)
+
+    # ------------------------------------------------------------------
+    # Counterfactual Timing Shadows (Delayed 10:00 & Staggered Variants)
+    # ------------------------------------------------------------------
+    try:
+        now_dt = _now_ist()
+        # On Tuesday (start date) after 09:55 AM IST and before 10:35 AM IST
+        if today_str == start_str and (now_dt.hour == 10 or (now_dt.hour == 9 and now_dt.minute >= 55)):
+            existing_shadows = {s["variant"] for s in get_timing_shadow_entries(db_path, cycle_id=cycle_id)}
+            if "V1_delayed_1000" not in existing_shadows:
+                entry_time_str = now_dt.strftime("%H:%M:%S")
+                now_ts = _now_utc_ts()
+
+                # V1: Delayed both legs (10:01 CALL + 10:01 PUT)
+                v1_record = {
+                    "cycle_id": cycle_id,
+                    "trade_date": today_str,
+                    "variant": "V1_delayed_1000",
+                    "call_strike": call_strike,
+                    "put_strike": put_strike,
+                    "call_entry_time": entry_time_str,
+                    "call_entry_price": call_ltp,
+                    "call_entry_ts": now_ts,
+                    "put_entry_time": entry_time_str,
+                    "put_entry_price": put_ltp,
+                    "put_entry_ts": now_ts,
+                    "combined_entry_price": round(call_ltp + put_ltp, 2),
+                    "spot_at_call_entry": nifty_ltp,
+                    "spot_at_put_entry": nifty_ltp,
+                    "nifty_spot_entry": nifty_ltp,
+                    "moneyness": STRIKE_MONEYNESS_MODE,
+                    "created_at": now_ts,
+                }
+                insert_timing_shadow_entry(db_path, v1_record)
+
+                entry_ref = active_cycle or (snapshot if "snapshot" in locals() else None) or curr_active or load_active_snapshot() or {}
+                spot_0931 = float(entry_ref.get("entry_spot") or entry_ref.get("nifty_open") or nifty_ltp)
+
+                # V2: Staggered (09:31 CALL + 10:01 PUT)
+                v2_record = {
+                    "cycle_id": cycle_id,
+                    "trade_date": today_str,
+                    "variant": "V2_staggered_c0931_p1000",
+                    "call_strike": call_strike,
+                    "put_strike": put_strike,
+                    "call_entry_time": "09:31:00",
+                    "call_entry_price": call_buy_price,
+                    "call_entry_ts": now_ts,
+                    "put_entry_time": entry_time_str,
+                    "put_entry_price": put_ltp,
+                    "put_entry_ts": now_ts,
+                    "combined_entry_price": round(call_buy_price + put_ltp, 2),
+                    "spot_at_call_entry": spot_0931,
+                    "spot_at_put_entry": nifty_ltp,
+                    "nifty_spot_entry": nifty_ltp,
+                    "moneyness": STRIKE_MONEYNESS_MODE,
+                    "created_at": now_ts,
+                }
+                insert_timing_shadow_entry(db_path, v2_record)
+
+                # V3: Staggered (09:31 PUT + 10:01 CALL)
+                v3_record = {
+                    "cycle_id": cycle_id,
+                    "trade_date": today_str,
+                    "variant": "V3_staggered_p0931_c1000",
+                    "call_strike": call_strike,
+                    "put_strike": put_strike,
+                    "call_entry_time": entry_time_str,
+                    "call_entry_price": call_ltp,
+                    "call_entry_ts": now_ts,
+                    "put_entry_time": "09:31:00",
+                    "put_entry_price": put_buy_price,
+                    "put_entry_ts": now_ts,
+                    "combined_entry_price": round(call_ltp + put_buy_price, 2),
+                    "spot_at_call_entry": nifty_ltp,
+                    "spot_at_put_entry": spot_0931,
+                    "nifty_spot_entry": nifty_ltp,
+                    "moneyness": STRIKE_MONEYNESS_MODE,
+                    "created_at": now_ts,
+                }
+                insert_timing_shadow_entry(db_path, v3_record)
+
+                # V4: Trend-guided stagger (selects V2 if spot@09:31 >= prev_close else V3)
+                is_bullish_morning = spot_0931 >= (nifty_prev_close or spot_0931)
+                chosen_stag = v2_record if is_bullish_morning else v3_record
+                v4_record = dict(chosen_stag)
+                v4_record["variant"] = "V4_trend_stagger"
+                insert_timing_shadow_entry(db_path, v4_record)
+
+                logger.info(
+                    "  [TIMING SHADOWS RECORDED] V1 (10:00 Delayed): ₹%.2f | V2 (Call@9:30, Put@10:00): ₹%.2f | V3 (Put@9:30, Call@10:00): ₹%.2f | V4 (Trend Stagger - %s): ₹%.2f",
+                    v1_record["combined_entry_price"], v2_record["combined_entry_price"], v3_record["combined_entry_price"],
+                    "V2" if is_bullish_morning else "V3", v4_record["combined_entry_price"]
+                )
+    except Exception as shadow_err:
+        logger.warning("Failed to record delayed/staggered timing shadows: %s", shadow_err)
 
     # ------------------------------------------------------------------
     # Summary

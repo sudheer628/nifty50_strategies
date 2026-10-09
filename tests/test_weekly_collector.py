@@ -148,6 +148,74 @@ class CycleSnapshotTests(unittest.TestCase):
         self.assertEqual(record["put_strike"], 25250)
         self.assertEqual(record["gainloss"], 0.0)
 
+    @patch("strategies.weekly_option_collector.insert_timing_shadow_entry")
+    @patch("strategies.weekly_option_collector.get_timing_shadow_entries", return_value=[])
+    @patch("strategies.weekly_option_collector.insert_record")
+    @patch("strategies.weekly_option_collector.insert_buy_snapshot")
+    @patch("strategies.weekly_option_collector._ensure_db", return_value="cycle.db")
+    @patch("strategies.weekly_option_collector.get_nifty_option_chain")
+    @patch("strategies.weekly_option_collector.get_nifty_spot")
+    @patch("strategies.weekly_option_collector.load_active_snapshot")
+    @patch("strategies.weekly_option_collector._now_ist")
+    @patch("strategies.weekly_option_collector._today_ist", return_value=date(2026, 8, 11))
+    def test_tuesday_1001_mid_cycle_records_timing_shadows(
+        self,
+        _today,
+        now_ist,
+        load_snapshot,
+        get_spot,
+        get_options,
+        _ensure_db,
+        insert_snapshot,
+        insert_record,
+        get_shadows,
+        insert_shadow,
+    ):
+        from datetime import datetime
+        import pytz
+        ist = pytz.timezone("Asia/Kolkata")
+        now_ist.return_value = datetime(2026, 8, 11, 10, 1, 0, tzinfo=ist)
+        load_snapshot.return_value = {
+            "strategy_name": "nifty50_weekly_option_collector",
+            "cycle_id": "20260811-test",
+            "week_start_date": "20260811",
+            "expiry_date": "20260818",
+            "call_strike": 24800,
+            "put_strike": 25250,
+            "call_buy_price": 150.0,
+            "put_buy_price": 140.0,
+            "entry_spot": 25000.0,
+            "captured_at": 1786452660,
+        }
+        get_spot.return_value = {
+            "ltp": 25050.0,
+            "open": 24900.0,
+            "close": 24850.0,
+        }
+        get_options.return_value = {
+            "call": {"ltp": 135.0},
+            "put": {"ltp": 125.0},
+        }
+
+        self.assertTrue(collect_once())
+
+        # Assert insert_timing_shadow_entry was called for V1, V2, V3, V4
+        self.assertEqual(insert_shadow.call_count, 4)
+        variants_recorded = {call.args[1]["variant"]: call.args[1] for call in insert_shadow.call_args_list}
+        self.assertIn("V1_delayed_1000", variants_recorded)
+        self.assertIn("V2_staggered_c0931_p1000", variants_recorded)
+        self.assertIn("V3_staggered_p0931_c1000", variants_recorded)
+        self.assertIn("V4_trend_stagger", variants_recorded)
+
+        # Verify spot prices recorded per leg in V2 and V3 (N1 fix & F4 verification)
+        v2 = variants_recorded["V2_staggered_c0931_p1000"]
+        self.assertEqual(v2["spot_at_call_entry"], 25000.0)  # 09:31 spot from active_cycle
+        self.assertEqual(v2["spot_at_put_entry"], 25050.0)   # 10:01 current spot
+
+        v3 = variants_recorded["V3_staggered_p0931_c1000"]
+        self.assertEqual(v3["spot_at_call_entry"], 25050.0)  # 10:01 current spot
+        self.assertEqual(v3["spot_at_put_entry"], 25000.0)   # 09:31 spot from active_cycle
+
 
 if __name__ == "__main__":
     unittest.main()

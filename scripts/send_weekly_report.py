@@ -142,6 +142,15 @@ def load_report_data(db_path: Path) -> Tuple[List[Dict], Dict]:
             (STRATEGY_NAME,),
         ).fetchone()
         snapshot = dict(snapshot_row) if snapshot_row else {}
+
+        timing_shadows = []
+        try:
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='timing_shadow_entries'")
+            if cur.fetchone():
+                timing_shadows = [dict(r) for r in conn.execute("SELECT * FROM timing_shadow_entries ORDER BY id ASC").fetchall()]
+        except Exception:
+            pass
+        snapshot["timing_shadows"] = timing_shadows
     finally:
         conn.close()
 
@@ -191,6 +200,7 @@ def calculate_summary(rows: Sequence[Dict], snapshot: Dict, db_path: Path) -> Di
         "selection_rationale": snapshot.get("selection_rationale") or "",
         "static_call_strike": snapshot.get("static_call_strike"),
         "static_put_strike": snapshot.get("static_put_strike"),
+        "timing_shadows": snapshot.get("timing_shadows", []),
         "db_name": db_path.name,
     }
 
@@ -275,6 +285,37 @@ def render_html(rows: Sequence[Dict], summary: Dict, chart_src: str) -> str:
     if summary.get("static_call_strike") and summary.get("static_put_strike"):
         benchmark_info = f" &nbsp;·&nbsp; <span style='color:#64748b;'>Static Benchmark: PUT {summary['static_put_strike']} / CALL {summary['static_call_strike']}</span>"
 
+    timing_html = ""
+    timing_shadows = summary.get("timing_shadows", [])
+    if timing_shadows:
+        var_map = {s.get("variant"): s for s in timing_shadows}
+        v0 = var_map.get("V0_baseline_0931")
+        v1 = var_map.get("V1_delayed_1000")
+        v2 = var_map.get("V2_staggered_c0931_p1000")
+        v3 = var_map.get("V3_staggered_p0931_c1000")
+        v4 = var_map.get("V4_trend_stagger")
+        items = []
+        if v0:
+            items.append(f"<li><strong>V0 Baseline (09:31)</strong>: ₹{v0['combined_entry_price']:.1f}</li>")
+        if v1 and v0:
+            diff = round(v0['combined_entry_price'] - v1['combined_entry_price'], 2)
+            pct = round(diff / v0['combined_entry_price'] * 100, 1) if v0['combined_entry_price'] else 0
+            items.append(f"<li><strong>V1 Delayed (10:00)</strong>: ₹{v1['combined_entry_price']:.1f} ({diff:+.1f} pts / {pct:+.1f}%)</li>")
+        if v2 and v0:
+            diff2 = round(v0['combined_entry_price'] - v2['combined_entry_price'], 2)
+            items.append(f"<li><strong>V2 Staggered (Call 9:30, Put 10:00)</strong>: ₹{v2['combined_entry_price']:.1f} ({diff2:+.1f} pts)</li>")
+        if v3 and v0:
+            diff3 = round(v0['combined_entry_price'] - v3['combined_entry_price'], 2)
+            items.append(f"<li><strong>V3 Staggered (Put 9:30, Call 10:00)</strong>: ₹{v3['combined_entry_price']:.1f} ({diff3:+.1f} pts)</li>")
+        if v4 and v0:
+            diff4 = round(v0['combined_entry_price'] - v4['combined_entry_price'], 2)
+            items.append(f"<li><strong>V4 Trend Stagger</strong>: ₹{v4['combined_entry_price']:.1f} ({diff4:+.1f} pts)</li>")
+        if items:
+            timing_html = f"""<div style="margin-top:10px;padding-top:8px;border-top:1px dashed #cbd5e1;font-size:12px;color:#334155;">
+              <strong>⏱️ Entry Timing Benchmark:</strong>
+              <ul style="margin:4px 0 0 16px;padding:0;">{''.join(items)}</ul>
+            </div>"""
+
     return f"""<!doctype html>
 <html><body style="margin:0;background:#eef2f7;font-family:Arial,sans-serif;color:#0f172a;">
 <div style="max-width:900px;margin:0 auto;padding:24px 12px;">
@@ -298,6 +339,7 @@ def render_html(rows: Sequence[Dict], summary: Dict, chart_src: str) -> str:
       CALL {summary['call_strike']} @ {_number(summary['call_buy_price'])}{benchmark_info}<br>
       <span style="font-size:12px;color:#475569;">Cycle {html.escape(str(summary['cycle_id']))} · {summary['row_count']} observations · Last update {summary['latest_timestamp'].strftime('%d %b %Y %H:%M IST')}</span>
       {rationale_html}
+      {timing_html}
     </div>
 
     <img src="{html.escape(chart_src)}" alt="NIFTY50 and gain/loss chart" style="display:block;width:100%;max-width:840px;margin:22px auto;border:1px solid #e2e8f0;border-radius:12px;">
@@ -498,6 +540,39 @@ def send_weekly_report_discord(summary: Dict[str, Any], track: str = "weekly") -
             "value": str(summary["selection_rationale"])[:1000],
             "inline": False,
         })
+
+    timing_shadows = summary.get("timing_shadows", [])
+    if timing_shadows:
+        var_map = {s.get("variant"): s for s in timing_shadows}
+        v0 = var_map.get("V0_baseline_0931")
+        v1 = var_map.get("V1_delayed_1000")
+        v2 = var_map.get("V2_staggered_c0931_p1000")
+        v3 = var_map.get("V3_staggered_p0931_c1000")
+        v4 = var_map.get("V4_trend_stagger")
+
+        lines = []
+        if v0:
+            lines.append(f"• **V0 Baseline (09:31)**: ₹{v0['combined_entry_price']:.1f}")
+        if v1 and v0:
+            diff = round(v0['combined_entry_price'] - v1['combined_entry_price'], 2)
+            pct = round(diff / v0['combined_entry_price'] * 100, 1) if v0['combined_entry_price'] else 0
+            lines.append(f"• **V1 Delayed (10:00)**: ₹{v1['combined_entry_price']:.1f} ({diff:+.1f} pts / {pct:+.1f}%)")
+        if v2 and v0:
+            diff2 = round(v0['combined_entry_price'] - v2['combined_entry_price'], 2)
+            lines.append(f"• **V2 Call 9:30 / Put 10:00**: ₹{v2['combined_entry_price']:.1f} ({diff2:+.1f} pts)")
+        if v3 and v0:
+            diff3 = round(v0['combined_entry_price'] - v3['combined_entry_price'], 2)
+            lines.append(f"• **V3 Put 9:30 / Call 10:00**: ₹{v3['combined_entry_price']:.1f} ({diff3:+.1f} pts)")
+        if v4 and v0:
+            diff4 = round(v0['combined_entry_price'] - v4['combined_entry_price'], 2)
+            lines.append(f"• **V4 Trend Stagger**: ₹{v4['combined_entry_price']:.1f} ({diff4:+.1f} pts)")
+
+        if lines:
+            fields.append({
+                "name": "⏱️ Entry Timing Benchmark (Counterfactuals)",
+                "value": "\n".join(lines),
+                "inline": False,
+            })
 
     embed = {
         "title": f"📈 NIFTY50 {track_label} Lifecycle Report [{cycle_id}]",
