@@ -135,7 +135,8 @@ def evaluate_gamma_signals(
     Returns: (signal_direction: 'CALL' | 'PUT' | None, vwap_dist: float, rsi: float, reason: str)
     """
     yyyy_mm = as_of_dt.strftime("%Y_%m")
-    base_dir = sqlite_dir.replace("/strategies", "").rstrip("/\\")
+    clean_dir = sqlite_dir.rstrip("/\\")
+    base_dir = os.path.dirname(clean_dir) if os.path.basename(clean_dir) == "strategies" else clean_dir
     nsf_db = os.path.join(base_dir, f"nifty_signal_features_{yyyy_mm}.db")
 
     if not os.path.exists(nsf_db):
@@ -148,11 +149,32 @@ def evaluate_gamma_signals(
         conn = sqlite3.connect(nsf_db)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute(
-            "SELECT ts, ltp, vwap, vwap_distance, nsf_rsi14, volume FROM signals "
-            "WHERE symbol = 'NIFTY50' AND ts >= ? AND ts <= ? ORDER BY ts ASC",
-            (ts_start, ts_end)
+
+        # Check existing table columns dynamically to prevent 'no such column' errors
+        cols = {col[1] for col in cur.execute("PRAGMA table_info(signals)").fetchall()}
+        if not cols:
+            conn.close()
+            return None, None, None, f"No columns found in signals table in {nsf_db}"
+
+        select_cols = ["ts", "ltp"]
+        if "vwap" in cols:
+            select_cols.append("vwap")
+        if "vwap_distance" in cols:
+            select_cols.append("vwap_distance")
+
+        rsi_col = "nsf_rsi14" if "nsf_rsi14" in cols else ("rsi14" if "rsi14" in cols else None)
+        if rsi_col:
+            select_cols.append(f"{rsi_col} AS nsf_rsi14")
+
+        has_volume = "volume" in cols
+        if has_volume:
+            select_cols.append("volume")
+
+        query = (
+            f"SELECT {', '.join(select_cols)} FROM signals "
+            "WHERE symbol = 'NIFTY50' AND ts >= ? AND ts <= ? ORDER BY ts ASC"
         )
+        cur.execute(query, (ts_start, ts_end))
         rows = cur.fetchall()
         conn.close()
 
@@ -160,24 +182,40 @@ def evaluate_gamma_signals(
             return None, None, None, "Insufficient recent 5-min bars (< 3 bars in lookback)"
 
         latest = rows[-1]
-        vwap_dist = float(latest["vwap_distance"] or 0.0)
-        rsi = float(latest["nsf_rsi14"] or 50.0)
+        ltp = float(latest["ltp"] or 0.0)
+        vwap = float(latest["vwap"] or 0.0) if "vwap" in latest.keys() else ltp
 
-        # Volume surge check
-        volumes = [float(r["volume"]) for r in rows if r["volume"] is not None]
-        avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1.0
-        cur_vol = float(latest["volume"] or 0.0)
-        vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
+        if "vwap_distance" in latest.keys() and latest["vwap_distance"] is not None:
+            vwap_dist = float(latest["vwap_distance"])
+        elif vwap > 0:
+            vwap_dist = round(((ltp - vwap) / vwap) * 100.0, 3)
+        else:
+            vwap_dist = 0.0
 
-        # Bullish Gamma Trigger: Spot breaking above VWAP by >= +0.15% with RSI >= 58 and volume surge >= 1.5x
-        if vwap_dist >= 0.15 and rsi >= 58 and vol_ratio >= 1.5:
-            return "CALL", vwap_dist, rsi, f"Bullish gamma breakout: VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}, Vol ratio={vol_ratio:.1f}x"
+        rsi = float(latest["nsf_rsi14"] or 50.0) if "nsf_rsi14" in latest.keys() and latest["nsf_rsi14"] is not None else 50.0
 
-        # Bearish Gamma Trigger: Spot breaking below VWAP by <= -0.15% with RSI <= 42 and volume surge >= 1.5x
-        if vwap_dist <= -0.15 and rsi <= 42 and vol_ratio >= 1.5:
-            return "PUT", vwap_dist, rsi, f"Bearish gamma breakdown: VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}, Vol ratio={vol_ratio:.1f}x"
+        # Volume surge check (if volume is recorded; spot indices on NSE do not track volume)
+        if has_volume:
+            volumes = [float(r["volume"]) for r in rows if r["volume"] is not None]
+            avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1.0
+            cur_vol = float(latest["volume"] or 0.0)
+            vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
+            vol_ok = vol_ratio >= 1.5
+            vol_desc = f", Vol ratio={vol_ratio:.1f}x"
+        else:
+            vol_ratio = 1.0
+            vol_ok = True
+            vol_desc = ""
 
-        return None, vwap_dist, rsi, f"Market rangebound (VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}, Vol ratio={vol_ratio:.1f}x); no directional breakout"
+        # Bullish Gamma Trigger: Spot breaking above VWAP by >= +0.15% with RSI >= 58 and volume surge >= 1.5x (if volume available)
+        if vwap_dist >= 0.15 and rsi >= 58 and vol_ok:
+            return "CALL", vwap_dist, rsi, f"Bullish gamma breakout: VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}{vol_desc}"
+
+        # Bearish Gamma Trigger: Spot breaking below VWAP by <= -0.15% with RSI <= 42 and volume surge >= 1.5x (if volume available)
+        if vwap_dist <= -0.15 and rsi <= 42 and vol_ok:
+            return "PUT", vwap_dist, rsi, f"Bearish gamma breakdown: VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}{vol_desc}"
+
+        return None, vwap_dist, rsi, f"Market rangebound (VWAP dist={vwap_dist:+.3f}%, RSI={rsi:.1f}{vol_desc}); no directional breakout"
 
     except Exception as e:
         sniper_logger.error("Error reading gamma signals: %s", e)

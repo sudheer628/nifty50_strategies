@@ -3,6 +3,7 @@ Unit tests for strategies/monday_gamma_sniper.py (Gamma Sniper - Enhancement 4).
 """
 
 import os
+import sqlite3
 import pytest
 from datetime import datetime, time
 import pytz
@@ -11,6 +12,7 @@ from strategies.monday_gamma_sniper import (
     is_sniper_time_window,
     get_active_strategy_pnl,
     run_gamma_sniper,
+    evaluate_gamma_signals,
     IST_TZ,
 )
 
@@ -103,4 +105,105 @@ def test_gamma_sniper_exit_triggers(monkeypatch, tmp_path):
     assert closed_trade["exit_price"] == 36.0
     assert "TARGET_HIT" in closed_trade["exit_reason"]
     assert closed_trade["pnl_points"] == 16.0
+
+
+def test_evaluate_gamma_signals_without_volume_column(tmp_path):
+    """Verify evaluate_gamma_signals succeeds when signals table lacks a volume column (production NSF DB schema)."""
+    nsf_db = str(tmp_path / "nifty_signal_features_2026_10.db")
+    conn = sqlite3.connect(nsf_db)
+    # Production NSF schema: no volume column
+    conn.execute("""
+        CREATE TABLE signals (
+            ts INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            ltp REAL,
+            vwap REAL,
+            vwap_distance REAL,
+            nsf_rsi14 REAL
+        )
+    """)
+    as_of = datetime(2026, 10, 12, 13, 30, 0, tzinfo=IST_TZ)
+    base_ts = int(as_of.timestamp())
+
+    # Insert 3 consecutive 5-min bars with bullish gamma breakout (+0.18% VWAP distance, RSI=62.0)
+    for i in range(3):
+        ts = base_ts - (15 - i * 5) * 60
+        conn.execute(
+            "INSERT INTO signals VALUES (?, 'NIFTY50', 25100.0, 25055.0, 0.18, 62.0)",
+            (ts,)
+        )
+    conn.commit()
+    conn.close()
+
+    # Call evaluate_gamma_signals pointing to tmp_path
+    direction, vwap_dist, rsi, reason = evaluate_gamma_signals(str(tmp_path / "strategies"), as_of)
+    assert direction == "CALL"
+    assert vwap_dist == 0.18
+    assert rsi == 62.0
+    assert "Bullish gamma breakout" in reason
+
+
+def test_evaluate_gamma_signals_with_volume_column(tmp_path):
+    """Verify evaluate_gamma_signals calculates volume surge when volume column exists."""
+    nsf_db = str(tmp_path / "nifty_signal_features_2026_10.db")
+    conn = sqlite3.connect(nsf_db)
+    conn.execute("""
+        CREATE TABLE signals (
+            ts INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            ltp REAL,
+            vwap REAL,
+            vwap_distance REAL,
+            nsf_rsi14 REAL,
+            volume REAL
+        )
+    """)
+    as_of = datetime(2026, 10, 12, 13, 30, 0, tzinfo=IST_TZ)
+    base_ts = int(as_of.timestamp())
+
+    # First 2 bars volume = 1000, 3rd bar surge volume = 2000 (ratio = 2.0x >= 1.5x)
+    conn.execute("INSERT INTO signals VALUES (?, 'NIFTY50', 24900.0, 24950.0, -0.20, 38.0, 1000.0)", (base_ts - 600,))
+    conn.execute("INSERT INTO signals VALUES (?, 'NIFTY50', 24890.0, 24950.0, -0.24, 36.0, 1000.0)", (base_ts - 300,))
+    conn.execute("INSERT INTO signals VALUES (?, 'NIFTY50', 24880.0, 24950.0, -0.28, 35.0, 2000.0)", (base_ts,))
+    conn.commit()
+    conn.close()
+
+    direction, vwap_dist, rsi, reason = evaluate_gamma_signals(str(tmp_path / "strategies"), as_of)
+    assert direction == "PUT"
+    assert vwap_dist == -0.28
+    assert rsi == 35.0
+    assert "Bearish gamma breakdown" in reason
+    assert "Vol ratio=2.0x" in reason
+
+
+def test_evaluate_gamma_signals_rangebound(tmp_path):
+    """Verify rangebound markets yield no direction trigger."""
+    nsf_db = str(tmp_path / "nifty_signal_features_2026_10.db")
+    conn = sqlite3.connect(nsf_db)
+    conn.execute("""
+        CREATE TABLE signals (
+            ts INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            ltp REAL,
+            vwap REAL,
+            vwap_distance REAL,
+            nsf_rsi14 REAL
+        )
+    """)
+    as_of = datetime(2026, 10, 12, 13, 30, 0, tzinfo=IST_TZ)
+    base_ts = int(as_of.timestamp())
+
+    for i in range(3):
+        ts = base_ts - (15 - i * 5) * 60
+        conn.execute(
+            "INSERT INTO signals VALUES (?, 'NIFTY50', 25000.0, 25000.0, 0.02, 51.0)",
+            (ts,)
+        )
+    conn.commit()
+    conn.close()
+
+    direction, vwap_dist, rsi, reason = evaluate_gamma_signals(str(tmp_path / "strategies"), as_of)
+    assert direction is None
+    assert "Market rangebound" in reason
+
 
