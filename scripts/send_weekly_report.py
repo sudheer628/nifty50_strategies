@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-from config import SQLITE_DIR, STRATEGY_NAME, STRATEGY_NAME_THURSDAY, NIFTY_LOT_SIZE
+from config import SQLITE_DIR, STRATEGY_NAME, STRATEGY_NAME_THURSDAY, NIFTY_LOT_SIZE, DISCORD_URL
 
 
 logger = logging.getLogger("nifty50_weekly_report")
@@ -409,12 +409,12 @@ def send_email(subject: str, plain_body: str, html_body: str, chart_path: Path) 
     Deprecated: Email notifications have been retired in favor of DISCORD_WATCHDOG.
     Logs notification and returns.
     """
-    logger.info("Email notifications are disabled. Weekly report cards route to DISCORD_WATCHDOG.")
+    logger.info("Email notifications are disabled. Weekly report cards route to DISCORD_URL.")
 
 
-def resolve_discord_watchdog_url() -> str:
-    """Resolve DISCORD_WATCHDOG webhook URL from os.environ or candidate .env files."""
-    env_val = os.getenv("DISCORD_WATCHDOG", "").strip()
+def resolve_discord_url() -> str:
+    """Resolve DISCORD_URL webhook URL from os.environ, config, or candidate .env files."""
+    env_val = os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
     if env_val:
         return env_val
 
@@ -436,7 +436,7 @@ def resolve_discord_watchdog_url() -> str:
                 with p.open("r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
-                        if line.startswith("DISCORD_WATCHDOG="):
+                        if line.startswith("DISCORD_URL="):
                             val = line.split("=", 1)[1].strip().strip('"').strip("'")
                             if val:
                                 return val
@@ -445,16 +445,20 @@ def resolve_discord_watchdog_url() -> str:
     return ""
 
 
-def send_discord_watchdog(content: str, embed: Optional[Dict[str, Any]] = None) -> bool:
+# Backwards compatibility alias
+resolve_discord_watchdog_url = resolve_discord_url
+
+
+def send_discord_report(content: str, embed: Optional[Dict[str, Any]] = None) -> bool:
     """
-    Send an operational notification to the dedicated #watchdog channel.
+    Send a report notification to the dedicated DISCORD_URL channel.
     Uses standard library urllib (zero external pip dependencies) and is wrapped
     in try/except so webhook issues never crash the script.
     """
-    webhook_url = resolve_discord_watchdog_url()
+    webhook_url = resolve_discord_url()
     if not webhook_url:
         logger.warning(
-            "⚠️ [DISCORD_WATCHDOG] Webhook URL not set in environment or .env; alert dropped: %s",
+            "⚠️ [DISCORD_URL] Webhook URL not set in environment or .env; alert dropped: %s",
             content[:120],
         )
         return False
@@ -476,21 +480,26 @@ def send_discord_watchdog(content: str, embed: Optional[Dict[str, Any]] = None) 
             data=data,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "Nifty50WeeklyReport-Watchdog/1.0",
+                "User-Agent": "Nifty50WeeklyReport/1.0",
             },
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             success = 200 <= resp.status < 300
             if success:
-                logger.info("✓ Discord watchdog weekly report dispatched successfully")
+                logger.info("✓ Discord weekly report dispatched successfully")
             return success
     except Exception as exc:
-        logger.warning("Discord watchdog notification delivery failed: %s", exc)
+        logger.warning("Discord notification delivery failed: %s", exc)
         return False
 
 
+def send_discord_watchdog(content: str, embed: Optional[Dict[str, Any]] = None) -> bool:
+    """Send an operational notification to DISCORD_URL (alias for backward compatibility)."""
+    return send_discord_report(content, embed)
+
+
 def send_weekly_report_discord(summary: Dict[str, Any], track: str = "weekly") -> bool:
-    """Send NIFTY50 weekly strangle close report card to DISCORD_WATCHDOG."""
+    """Send NIFTY50 weekly strangle close report card to DISCORD_URL."""
     cycle_id = summary.get("cycle_id", "UNKNOWN")
     latest_gain = summary.get("latest_gainloss")
     best_gain = summary.get("best_gainloss")
@@ -674,16 +683,16 @@ def main() -> int:
             logger.info("Dry run complete; report card not sent")
             return 0
 
-        # Dispatch to DISCORD_WATCHDOG channel
+        # Dispatch to DISCORD_URL channel
         try:
-            logger.info("Dispatching %s report card to DISCORD_WATCHDOG...", args.track)
+            logger.info("Dispatching %s report card to DISCORD_URL...", args.track)
             success = send_weekly_report_discord(summary, track=args.track)
             if success:
-                logger.info("✓ Discord watchdog report dispatched successfully")
+                logger.info("✓ Discord report dispatched successfully")
             else:
-                logger.warning("⚠ Discord watchdog delivery skipped or webhook not set")
+                logger.warning("⚠ Discord delivery skipped or webhook not set")
         except Exception as discord_err:
-            logger.warning("Discord watchdog delivery failed: %s", discord_err)
+            logger.warning("Discord delivery failed: %s", discord_err)
 
         return 0
     except Exception as exc:

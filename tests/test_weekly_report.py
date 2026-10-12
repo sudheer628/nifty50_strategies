@@ -19,7 +19,9 @@ from scripts.send_weekly_report import (
     main,
     render_html,
     send_email,
+    resolve_discord_url,
     resolve_discord_watchdog_url,
+    send_discord_report,
     send_discord_watchdog,
     send_weekly_report_discord,
 )
@@ -103,23 +105,25 @@ class WeeklyReportTests(unittest.TestCase):
                 chart_path,
             )
 
-    def test_resolve_discord_watchdog_url_from_env(self):
-        with patch.dict(os.environ, {"DISCORD_WATCHDOG": "https://discord.com/api/webhooks/test-url"}):
+    def test_resolve_discord_url_from_env(self):
+        with patch.dict(os.environ, {"DISCORD_URL": "https://discord.com/api/webhooks/test-url"}):
+            self.assertEqual(resolve_discord_url(), "https://discord.com/api/webhooks/test-url")
             self.assertEqual(resolve_discord_watchdog_url(), "https://discord.com/api/webhooks/test-url")
 
-    def test_send_discord_watchdog_missing_url(self):
-        with patch("scripts.send_weekly_report.resolve_discord_watchdog_url", return_value=""):
+    def test_send_discord_report_missing_url(self):
+        with patch("scripts.send_weekly_report.resolve_discord_url", return_value=""):
+            self.assertFalse(send_discord_report("Test message"))
             self.assertFalse(send_discord_watchdog("Test message"))
 
     @patch("scripts.send_weekly_report.urllib.request.urlopen")
-    def test_send_discord_watchdog_success(self, mock_urlopen):
+    def test_send_discord_report_success(self, mock_urlopen):
         from unittest.mock import MagicMock
         mock_resp = MagicMock()
         mock_resp.status = 204
         mock_urlopen.return_value.__enter__.return_value = mock_resp
 
-        with patch("scripts.send_weekly_report.resolve_discord_watchdog_url", return_value="https://discord.com/api/webhooks/test"):
-            res = send_discord_watchdog("Test content", embed={"title": "Weekly Report", "fields": []})
+        with patch("scripts.send_weekly_report.resolve_discord_url", return_value="https://discord.com/api/webhooks/test"):
+            res = send_discord_report("Test content", embed={"title": "Weekly Report", "fields": []})
             self.assertTrue(res)
             self.assertTrue(mock_urlopen.called)
 
