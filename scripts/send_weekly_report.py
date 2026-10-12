@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-from config import SQLITE_DIR, STRATEGY_NAME, NIFTY_LOT_SIZE
+from config import SQLITE_DIR, STRATEGY_NAME, STRATEGY_NAME_THURSDAY, NIFTY_LOT_SIZE
 
 
 logger = logging.getLogger("nifty50_weekly_report")
@@ -101,8 +101,8 @@ def find_weekly_db(report_date: date, explicit_path: Optional[str] = None, track
     return max(candidates, key=lambda item: item[0])[2]
 
 
-def load_report_data(db_path: Path) -> Tuple[List[Dict], Dict]:
-    """Load hourly rows and the cycle snapshot from a weekly database."""
+def load_report_data(db_path: Path, track: Optional[str] = None) -> Tuple[List[Dict], Dict]:
+    """Load hourly rows and the cycle snapshot from a weekly or thursday database."""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
@@ -115,6 +115,10 @@ def load_report_data(db_path: Path) -> Tuple[List[Dict], Dict]:
             if "gainloss" in columns
             else "ROUND((call_ltp-call_buy_price)+(put_ltp-put_buy_price), 2)"
         )
+
+        is_thu = (track and track.lower() == "thursday") or ("thursday" in db_path.name.lower())
+        target_strategy = STRATEGY_NAME_THURSDAY if is_thu else STRATEGY_NAME
+
         rows = [
             dict(row)
             for row in conn.execute(
@@ -129,9 +133,27 @@ def load_report_data(db_path: Path) -> Tuple[List[Dict], Dict]:
                 WHERE strategy_name = ?
                 ORDER BY collection_timestamp ASC
                 """,
-                (STRATEGY_NAME,),
+                (target_strategy,),
             )
         ]
+        # Resilient fallback: if no rows match target_strategy, query all rows from this dedicated cycle DB
+        if not rows:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT
+                        id, collection_timestamp, expiry_date,
+                        nifty_open, nifty_ltp, nifty_previous_close,
+                        put_strike, put_ltp, put_buy_price,
+                        call_strike, call_ltp, call_buy_price,
+                        {gainloss_sql} AS gainloss, cycle_id
+                    FROM strategy_hourly_data
+                    ORDER BY collection_timestamp ASC
+                    """
+                )
+            ]
+
         snapshot_row = conn.execute(
             """
             SELECT * FROM strategy_buy_snapshots
@@ -139,8 +161,16 @@ def load_report_data(db_path: Path) -> Tuple[List[Dict], Dict]:
             ORDER BY captured_at DESC
             LIMIT 1
             """,
-            (STRATEGY_NAME,),
+            (target_strategy,),
         ).fetchone()
+        if not snapshot_row:
+            snapshot_row = conn.execute(
+                """
+                SELECT * FROM strategy_buy_snapshots
+                ORDER BY captured_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
         snapshot = dict(snapshot_row) if snapshot_row else {}
 
         timing_shadows = []
@@ -166,7 +196,9 @@ def calculate_summary(rows: Sequence[Dict], snapshot: Dict, db_path: Path) -> Di
     first = rows[0]
     latest = rows[-1]
     gains = [float(row["gainloss"]) for row in rows if row["gainloss"] is not None]
-    match = DB_NAME_PATTERN.match(db_path.name)
+    is_thu = "thursday" in db_path.name.lower()
+    pattern = DB_NAME_PATTERN_THURSDAY if is_thu else DB_NAME_PATTERN_WEEKLY
+    match = pattern.match(db_path.name)
     start_str = snapshot.get("week_start_date") or (
         match.group("start") if match else ""
     )
@@ -619,7 +651,11 @@ def main() -> int:
             report_date = datetime.now(IST).date()
         db_path = find_weekly_db(report_date, args.db, track=args.track)
         logger.info("Using strategy database: %s", db_path)
-        rows, snapshot = load_report_data(db_path)
+        try:
+            rows, snapshot = load_report_data(db_path, track=args.track)
+        except ValueError as val_err:
+            logger.warning("Strategy reporting skipped cleanly: %s", val_err)
+            return 0
         summary = calculate_summary(rows, snapshot, db_path)
 
         output_dir = Path(args.output_dir).expanduser().resolve()

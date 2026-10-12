@@ -16,6 +16,7 @@ from scripts.send_weekly_report import (
     create_chart,
     find_weekly_db,
     load_report_data,
+    main,
     render_html,
     send_email,
     resolve_discord_watchdog_url,
@@ -151,6 +152,85 @@ class WeeklyReportTests(unittest.TestCase):
         self.assertIn("+16.00 pts", headline)
         self.assertEqual(embed["color"], 0x16a34a)
         self.assertGreaterEqual(len(embed["fields"]), 5)
+
+    def _create_thursday_db(self, directory: str) -> Path:
+        db_path = Path(directory) / "nifty50_thursday_data_20261008_20261013.db"
+        init_db(str(db_path))
+        insert_buy_snapshot(
+            str(db_path),
+            {
+                "strategy_name": "nifty50_thursday_3day_collector",
+                "cycle_id": "CYCLE-THU-20261008",
+                "week_start_date": "20261008",
+                "expiry_date": "20261013",
+                "call_strike": 25200,
+                "put_strike": 25000,
+                "call_buy_price": 85.0,
+                "put_buy_price": 75.0,
+                "captured_at": 1791450000,
+            },
+        )
+        for timestamp, nifty, call_ltp, put_ltp, gainloss in (
+            (1791450000, 25100.0, 85.0, 75.0, 0.0),
+            (1791460000, 25150.0, 95.0, 60.0, -5.0),
+            (1791470000, 25250.0, 120.0, 45.0, 5.0),
+        ):
+            insert_record(
+                str(db_path),
+                {
+                    "strategy_name": "nifty50_thursday_3day_collector",
+                    "collection_timestamp": timestamp,
+                    "expiry_date": "20261013",
+                    "nifty_open": 25080.0,
+                    "nifty_ltp": nifty,
+                    "nifty_previous_close": 25050.0,
+                    "put_strike": 25000,
+                    "put_ltp": put_ltp,
+                    "call_strike": 25200,
+                    "call_ltp": call_ltp,
+                    "call_buy_price": 85.0,
+                    "put_buy_price": 75.0,
+                    "gainloss": gainloss,
+                    "cycle_id": "CYCLE-THU-20261008",
+                },
+            )
+        return db_path
+
+    def test_thursday_track_loads_data_and_calculates_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = self._create_thursday_db(temp_dir)
+            with patch("scripts.send_weekly_report.SQLITE_DIR", temp_dir):
+                discovered = find_weekly_db(date(2026, 10, 12), track="thursday")
+                self.assertEqual(discovered, db_path)
+
+            rows, snapshot = load_report_data(db_path, track="thursday")
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(snapshot.get("cycle_id"), "CYCLE-THU-20261008")
+
+            summary = calculate_summary(rows, snapshot, db_path)
+            self.assertEqual(summary["start_date"], date(2026, 10, 8))
+            self.assertEqual(summary["expiry_date"], date(2026, 10, 13))
+            self.assertEqual(summary["latest_gainloss"], 5.0)
+            self.assertEqual(summary["best_gainloss"], 5.0)
+            self.assertEqual(summary["worst_gainloss"], -5.0)
+
+    def test_load_report_data_raises_value_error_on_empty_db(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            empty_db = Path(temp_dir) / "nifty50_thursday_data_20261008_20261013.db"
+            init_db(str(empty_db))
+            with self.assertRaises(ValueError) as cm:
+                load_report_data(empty_db, track="thursday")
+            self.assertIn("No strategy rows found", str(cm.exception))
+
+    def test_main_skips_cleanly_on_empty_db(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            empty_db = Path(temp_dir) / "nifty50_thursday_data_20261008_20261013.db"
+            init_db(str(empty_db))
+            with patch("scripts.send_weekly_report.SQLITE_DIR", temp_dir), \
+                 patch("sys.argv", ["send_weekly_report.py", "--track", "thursday", "--report-date", "2026-10-12"]):
+                exit_code = main()
+                self.assertEqual(exit_code, 0)
+
 
 
 if __name__ == "__main__":
