@@ -191,7 +191,7 @@ class ProfitMonitorTests(unittest.TestCase):
 
     @patch("common.profit_monitor.update_active_peak_state")
     @patch("common.profit_monitor.on_new_peak")
-    def test_hysteresis_suppression_and_expansion(self, mock_on_peak, mock_save_peak):
+    def test_single_alert_policy_suppresses_subsequent_expansions(self, mock_on_peak, mock_save_peak):
         snapshot = dict(self.mock_snapshot)
         # Previously alerted at +21.5% (+43.0 pts)
         snapshot["peak_profit"] = {
@@ -204,9 +204,10 @@ class ProfitMonitorTests(unittest.TestCase):
             "last_notified_timestamp": TS_TUE_1300,
             "alerts_sent_today": 1,
             "last_alert_date": "2026-09-22",
+            "alert_dispatched": True,
         }
 
-        # Small expansion to +22.5% (+45.0 pts): +1.0% / +2 pts bump -> Suppressed!
+        # Small expansion to +22.5% (+45.0 pts): +1.0% / +2 pts bump -> Suppressed under single-alert policy!
         state, triggered, msg = evaluate_peak_profit(
             snapshot=snapshot,
             nifty_ltp=25120.0,
@@ -223,29 +224,10 @@ class ProfitMonitorTests(unittest.TestCase):
         self.assertEqual(state["peak_pnl_pts"], 45.0)  # Peak tracked in snapshot
         self.assertEqual(state["last_notified_pts"], 43.0)  # Last notified remains unchanged
         self.assertEqual(state["alerts_sent_today"], 1)
-        self.assertIn("below hysteresis", msg)
+        self.assertIn("already dispatched for cycle", msg)
         mock_on_peak.assert_not_called()
 
-        # Moderate expansion to +25.0% (+50.0 pts): +3.5% / +7 pts bump -> Still below +5% / +10 pts -> Suppressed!
-        snapshot["peak_profit"] = state
-        state, triggered, msg = evaluate_peak_profit(
-            snapshot=snapshot,
-            nifty_ltp=25150.0,
-            call_strike=25000,
-            call_ltp=150.0,
-            call_buy=100.0,
-            put_strike=24800,
-            put_ltp=100.0,
-            put_buy=100.0,
-            is_first_tick=False,
-            current_ts=TS_TUE_1400 + 1800,
-        )
-        self.assertFalse(triggered)
-        self.assertEqual(state["peak_pnl_pts"], 50.0)
-        self.assertEqual(state["last_notified_pts"], 43.0)
-        mock_on_peak.assert_not_called()
-
-        # Surge to +27.5% (+55.0 pts): +6.0% / +12 pts bump above last notified (21.5% / 43.0 pts) -> Qualifies!
+        # Surge to +27.5% (+55.0 pts): +6.0% / +12 pts bump -> Still suppressed! Single-alert policy.
         snapshot["peak_profit"] = state
         state, triggered, msg = evaluate_peak_profit(
             snapshot=snapshot,
@@ -259,48 +241,69 @@ class ProfitMonitorTests(unittest.TestCase):
             is_first_tick=False,
             current_ts=TS_TUE_1500,
         )
-        self.assertTrue(triggered)
-        self.assertEqual(state["peak_pnl_pts"], 55.0)
+        self.assertFalse(triggered)
+        self.assertEqual(state["peak_pnl_pts"], 55.0)  # Peak updated faithfully
         self.assertEqual(state["peak_pnl_pct"], 27.5)
-        self.assertEqual(state["last_notified_pts"], 55.0)
-        self.assertEqual(state["alerts_sent_today"], 2)
-        self.assertEqual(mock_on_peak.call_count, 1)
+        self.assertEqual(state["last_notified_pts"], 43.0)
+        self.assertEqual(state["alerts_sent_today"], 1)
+        self.assertIn("Single-alert policy suppresses expansion alerts", msg)
+        mock_on_peak.assert_not_called()
 
     @patch("common.profit_monitor.update_active_peak_state")
     @patch("common.profit_monitor.on_new_peak")
-    def test_no_daily_alert_cap_triggers_beyond_four(self, mock_on_peak, mock_save_peak):
+    def test_rollback_on_failed_dispatch_allows_retry(self, mock_on_peak, mock_save_peak):
+        mock_on_peak.return_value = False  # Simulate Discord delivery failure
         snapshot = dict(self.mock_snapshot)
-        # 4 alerts already sent today
         snapshot["peak_profit"] = {
-            "peak_pnl_pts": 55.0,
-            "peak_pnl_pct": 27.5,
-            "peak_pnl_inr": 3575.0,
-            "peak_timestamp": TS_TUE_1400,
-            "last_notified_pts": 55.0,
-            "last_notified_pct": 27.5,
-            "last_notified_timestamp": TS_TUE_1400,
-            "alerts_sent_today": 4,
+            "peak_pnl_pts": 39.0,
+            "peak_pnl_pct": 19.5,
+            "peak_pnl_inr": 2535.0,
+            "peak_timestamp": TS_TUE_1200,
+            "last_notified_pts": None,
+            "last_notified_pct": None,
+            "last_notified_timestamp": None,
+            "alerts_sent_today": 0,
             "last_alert_date": "2026-09-22",
+            "alert_dispatched": False,
         }
 
-        # Major profit surge to +35% (+70 pts) on same day -> No daily cap! Triggers 5th alert!
+        # Tick 1: Reaches +21.5% but dispatch fails -> State rolled back
         state, triggered, msg = evaluate_peak_profit(
             snapshot=snapshot,
-            nifty_ltp=25300.0,
+            nifty_ltp=25100.0,
             call_strike=25000,
-            call_ltp=180.0,
+            call_ltp=138.0,
             call_buy=100.0,
             put_strike=24800,
-            put_ltp=90.0,
+            put_ltp=105.0,
             put_buy=100.0,
             is_first_tick=False,
-            current_ts=TS_TUE_1500,
+            current_ts=TS_TUE_1300,
         )
-        self.assertTrue(triggered)
-        self.assertEqual(state["peak_pnl_pts"], 70.0)
-        self.assertEqual(state["last_notified_pts"], 70.0)
-        self.assertEqual(state["alerts_sent_today"], 5)
-        self.assertEqual(mock_on_peak.call_count, 1)
+        self.assertFalse(triggered)
+        self.assertFalse(state.get("alert_dispatched"))
+        self.assertIsNone(state.get("last_notified_pts"))
+        self.assertIn("alert delivery failed; state rolled back", msg)
+
+        # Tick 2: Discord connectivity restored -> Retries and succeeds!
+        mock_on_peak.return_value = True
+        snapshot["peak_profit"] = state
+        state2, triggered2, msg2 = evaluate_peak_profit(
+            snapshot=snapshot,
+            nifty_ltp=25120.0,
+            call_strike=25000,
+            call_ltp=140.0,
+            call_buy=100.0,
+            put_strike=24800,
+            put_ltp=105.0,
+            put_buy=100.0,
+            is_first_tick=False,
+            current_ts=TS_TUE_1400,
+        )
+        self.assertTrue(triggered2)
+        self.assertTrue(state2.get("alert_dispatched"))
+        self.assertEqual(state2["last_notified_pts"], 45.0)
+        self.assertEqual(state2["alerts_sent_today"], 1)
 
     @patch("common.profit_monitor.update_active_peak_state")
     @patch("common.profit_monitor.on_new_peak")
@@ -331,11 +334,11 @@ class ProfitMonitorTests(unittest.TestCase):
             is_first_tick=False,
             current_ts=TS_WED_0930,  # 2026-09-23 in IST
         )
-        self.assertTrue(triggered)
+        self.assertFalse(triggered)
         self.assertEqual(state["peak_pnl_pts"], 80.0)
-        self.assertEqual(state["alerts_sent_today"], 1)  # Reset and incremented
+        self.assertEqual(state["alerts_sent_today"], 0)
         self.assertEqual(state["last_alert_date"], "2026-09-23")
-        self.assertEqual(mock_on_peak.call_count, 1)
+        mock_on_peak.assert_not_called()
 
     @patch("common.profit_monitor.requests.post")
     def test_send_peak_alert_discord_success(self, mock_post):

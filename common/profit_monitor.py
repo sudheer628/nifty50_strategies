@@ -142,6 +142,7 @@ def evaluate_peak_profit(
             "last_notified_timestamp": None,
             "alerts_sent_today": 0,
             "last_alert_date": today_ist,
+            "alert_dispatched": False,
         }
         _persist_peak(peak_state)
         return peak_state, False, "Baseline established at cycle order lock"
@@ -213,21 +214,18 @@ def evaluate_peak_profit(
 
     alerts_today = peak_state.get("alerts_sent_today", 0)
 
-    # Hysteresis check against last notified peak
+    # Single-alert policy: only one peak profit alert (>=20%) is sent per cycle.
+    # Subsequent expansion (+5% or +10 pts) alerts are completely suppressed to eliminate notification spam.
     last_notified_pts = peak_state.get("last_notified_pts")
     last_notified_pct = peak_state.get("last_notified_pct")
 
-    if last_notified_pts is not None and last_notified_pct is not None:
-        pts_diff = combined_pnl_pts - last_notified_pts
-        pct_diff = combined_pnl_pct - last_notified_pct
-
-        if pts_diff < PEAK_ALERT_HYSTERESIS_PTS and pct_diff < PEAK_ALERT_HYSTERESIS_PCT:
-            _persist_peak(peak_state)
-            return (
-                peak_state,
-                False,
-                f"Peak expansion (+{pct_diff:.1f}% / +{pts_diff:.1f} pts) below hysteresis (+{PEAK_ALERT_HYSTERESIS_PCT:.1f}% / +{PEAK_ALERT_HYSTERESIS_PTS:.1f} pts)",
-            )
+    if last_notified_pts is not None or peak_state.get("alert_dispatched"):
+        _persist_peak(peak_state)
+        return (
+            peak_state,
+            False,
+            f"Peak profit alert already dispatched for cycle '{cycle_id}' (+{last_notified_pct or 0.0:.1f}% / +{last_notified_pts or 0.0:.1f} pts). Single-alert policy suppresses expansion alerts.",
+        )
 
     # All criteria satisfied: Qualifies for alert!
     prev_notified_pts = peak_state.get("last_notified_pts")
@@ -278,6 +276,7 @@ def evaluate_peak_profit(
         peak_state["last_notified_pct"] = prev_notified_pct
         peak_state["last_notified_timestamp"] = prev_notified_ts
         peak_state["alerts_sent_today"] = prev_alerts_today
+        peak_state["alert_dispatched"] = False
         _persist_peak(peak_state)
         return (
             peak_state,
@@ -285,6 +284,8 @@ def evaluate_peak_profit(
             f"Peak qualified (+{combined_pnl_pct:.1f}% / +{combined_pnl_pts:.1f} pts) but alert delivery failed; state rolled back to retry next tick",
         )
 
+    peak_state["alert_dispatched"] = True
+    _persist_peak(peak_state)
     return peak_state, True, f"Qualifying peak alert triggered (+{combined_pnl_pct:.1f}% / +{combined_pnl_pts:.1f} pts)"
 
 
