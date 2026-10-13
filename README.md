@@ -230,6 +230,13 @@ On Tuesday at 09:31 AM IST, `weekly_option_collector.py` invokes [`common/ai_str
                          skill on cycle start, continuously compounding learned rules!
 ```
 
+#### 4.7.1 Exchange Holiday Expiry Preponement Rule (`common/expiry.py`)
+
+Under Indian exchange rules (NSE/NFO), when a scheduled weekly contract expiry falls on an exchange trading holiday, the contract expiry is **preponed to the preceding active trading day**:
+- **Automatic Stepping**: When resolving [`get_next_weekly_expiry(from_date)`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/expiry.py), the system checks the target Tuesday against [`check_nse_holiday()`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/calendar_utils.py). If the Tuesday is an NSE trading holiday (e.g. `2026-10-20` Dussehra), the algorithm automatically steps backward day-by-day (skipping weekends and preceding holidays) to locate the actual open trading day (Monday, `2026-10-19`).
+- **Angel One Scrip Master Alignment**: Guarantees that the formatted Angel One expiry string (e.g., `"19OCT2026"`) matches listed exchange contracts (`NIFTY19OCT26...`), preventing scrip lookup errors.
+- **Expiry-Day Rollover**: If `from_date` is on or after the preponed expiry day itself (e.g. calling on Monday, `2026-10-19`), the resolver automatically rolls forward to the following week (`2026-10-27`).
+
 ### 4.8 Parallel 3-Day Thursday Strategy Track (September 2026+)
 
 Running concurrently with the 5-day Tuesday-to-Monday master cycle, the project includes a standalone **Parallel 3-Day Thursday Strategy Track** (`strategies/thursday_option_collector.py`):
@@ -281,6 +288,38 @@ Running concurrently with the 5-day Tuesday-to-Monday master cycle, the project 
 
 #### 4. Decoupled FSM Trailing Stop Adaptation
 Because the Thursday strangle begins at $\approx 5.0$ DTE, [`common/fsm_strategy.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/fsm_strategy.py) automatically places entry directly into the **18% trailing buffer bracket** (covering 1.5–5.0 DTE). This tighter buffer is economically optimized for shorter-duration options experiencing rapid theta decay, compared to the looser 25% buffer applied to Tuesday entries (>5 DTE).
+
+### 4.9 Decoupled Leg Finite State Machine (Alpha FSM Engine)
+
+While the baseline strategy holds both option legs blindly until the final Monday close, the **Alpha FSM Engine** ([`common/fsm_strategy.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/fsm_strategy.py)) provides active, decoupled leg risk management.
+
+#### 1. Machine States
+- `DUAL_LONG`: Both CALL and PUT legs are actively open in the market.
+- `SOLO_CALL`: PUT leg has been closed (harvested or salvaged); CALL leg continues active or trailing.
+- `SOLO_PUT`: CALL leg has been closed (harvested or salvaged); PUT leg continues active or trailing.
+- `FLAT`: Both legs closed. Capital is fully protected; cycle stops market participation.
+
+#### 2. Decoupled Leg Exit Rules
+1. **House Money Harvest**:
+   - In ITM mode (Long Gut): When a winning leg's gain covers the initial total extrinsic time-value risk of the entire strategy (or leg gain $\ge +50\%$), that winning leg is closed to lock in profits. The remaining leg is marked `free_roll_active: true`, riding intrinsic value risk-free.
+   - In OTM mode: Triggers when single-leg gain $\ge$ initial total strangle cost.
+2. **Dynamic Trailing Stop Ladder**:
+   - Armed once a leg is in profit ($\ge +30\%$ gain or exceeding extrinsic risk buffer).
+   - Trailing stop buffer tightens dynamically as Days to Expiry (DTE) decreases:
+     - **25% buffer**: Tuesday/Wednesday ($>5.0$ DTE).
+     - **18% buffer**: Thursday/Friday ($1.5 - 5.0$ DTE).
+     - **10% buffer**: Expiry Eve / Monday morning ($<1.5$ DTE).
+     - **5% tight trail**: Monday afternoon 14:00+ IST (Theta Cliff safeguard).
+   - If the price retraces from peak and breaches the trailing stop, that leg closes (`TRAILING_STOP_CLOSED`).
+3. **Losing Leg Salvage Stop**:
+   - In ITM mode: Cuts a decaying leg if price drops $\ge 50\%$ from entry and $|\Delta|$ falls below $0.35$ (loss of ITM moneyness advantage).
+   - In OTM mode: Cuts decaying leg at $\le -55\%$ when $|\Delta| < 0.10$ and premium $\ge ₹5.0$.
+
+#### 3. Risk Management & Loss Mitigation Clarification
+> [!IMPORTANT]
+> **FSM is an active risk manager, not a zero-loss guarantee.**
+> - The explicit purpose of the Salvage Stop is **loss mitigation**: selling a collapsing leg at $-50\%$ recovers $\sim 50\%$ of the leg's premium rather than letting it decay passively to ₹0 ($-100\%$ total wipeout).
+> - In range-bound, sideways markets where neither leg breaks out, theta decay burns extrinsic value on both sides. Legs can trigger Salvage Stops or exit below entry price, resulting in a **controlled net negative P&L**.
 
 ---
 
@@ -735,10 +774,21 @@ The strategy monitors floating strangle profit against the historical high-water
 - **Dual-Track & Dual-Runner 15-Minute Cadence**: 
   - **Master Weekly**: `weekly_option_collector.py` evaluates peaks at `:01` and `:31`; `peak_profit_monitor.py` evaluates at `:16` and `:46` using `current_week_buy.json`.
   - **Thursday 3-Day Track**: `thursday_option_collector.py` evaluates peaks at `:02` and `:32`; `peak_profit_monitor.py --track thursday` evaluates at `:17` and `:47` using `current_thursday_buy.json`.
-- **$\ge 20.0\%$ Profit Validation**: Alerts strictly trigger only when profit is $\ge 20.0\%$ (`combined_pnl_pct >= 20.0`). Any minor fluctuations below 20% update the snapshot high-water mark but send **zero alerts**.
-- **Anti-Spam Hysteresis**: Subsequent peak alerts require at least a **$+5.0\%$ jump** or **$+10.0$ points** ($\sim ₹650$/lot) above the last notified peak.
+- **$\ge 20.0\%$ Profit Validation**: Alerts strictly trigger only when combined profit is $\ge 20.0\%$ (`combined_pnl_pct >= 20.0`). Any minor fluctuations below 20% update the snapshot high-water mark but send **zero alerts**.
+- **Single-Alert-Per-Scenario Policy (Anti-Spam)**: Exactly **one peak profit alert ($\ge 20\%$) is sent per weekly cycle**. Once dispatched (`alert_dispatched: true`), all subsequent profit expansion alerts (+5% or +10 pts) are completely suppressed to eliminate Discord noise while the collector continues tracking the high-water mark.
+- **Rollback Safety**: If the Discord webhook dispatch fails, notification state is rolled back so the alert can be retried cleanly on the next collection tick.
 - **Zero SQLite Changes & Atomic Writes**: Peak state is stored in-place directly in `current_week_buy.json` (weekly) or `current_thursday_buy.json` (thursday) under `"peak_profit"` via atomic temporary file replacement (`os.replace`). SQLite schema remains 100% untouched.
 - **Future Live Broker Hook**: Qualifying new peaks trigger `common.profit_monitor.on_new_peak(event)`. Currently, this dispatches a high-priority styled Discord alert via Webhook; in future phases, live broker order execution (Angel One / Upstox) can be connected directly into this seam.
+
+#### Architectural Comparison: Peak Profit Alerts vs Alpha FSM Exit Alerts
+
+| Dimension | Peak Profit Alert ($\ge 20\%$) | Alpha FSM Exit Alert |
+| :--- | :--- | :--- |
+| **Origin Engine** | `nifty50_strategies` ([`common/profit_monitor.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/profit_monitor.py)) | `sentinel-hermes` ([`fast_exit_check.py`](file:///c:/Users/sai-s/Documents/GitHub/sentinel-hermes/fast_exit_check.py) & [`inference_runner.py`](file:///c:/Users/sai-s/Documents/GitHub/sentinel-hermes/inference_runner.py)) |
+| **Trigger Nature** | **Milestone Notification** (combined strangle gain $\ge 20\%$) | **Actionable Trade Exit Execution** (leg harvest, stop hit, salvage) |
+| **Position Impact** | **None** — position remains 100% active in the market | **Leg State Transition** — triggers close order, moves to `SOLO_*` or `FLAT` |
+| **Deduplication Scope** | Dispatches **exactly once per cycle** | Dispatches **exactly once per leg** (CALL, PUT, or BOTH) via `dispatched_exit_alerts` table |
+| **Coexistence** | **Independent**: If $\ge 20\%$ peak profit has already fired, Alpha FSM **continues to monitor and alert** when individual legs reach their exits |
 
 ```env
 PEAK_ALERT_ENABLED=true
