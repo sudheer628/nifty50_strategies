@@ -13,7 +13,7 @@ from common.angelone_client import (
     get_nifty_spot,
     resolve_option_token,
 )
-from common.expiry import get_next_weekly_expiry
+from common.expiry import get_next_weekly_expiry, format_expiry_angelone
 from config import NIFTY50_TOKEN, NIFTY50_TRADING_SYMBOL
 
 
@@ -53,6 +53,27 @@ class ExpiryTests(unittest.TestCase):
             get_next_weekly_expiry(date(2026, 8, 11)),
             date(2026, 8, 18),
         )
+
+    def test_holiday_tuesday_prepones_expiry_to_monday(self):
+        # 2026-10-20 is Dussehra (holiday). On Tuesday 2026-10-13, the next expiry
+        # must prepone to Monday 2026-10-19.
+        next_expiry = get_next_weekly_expiry(date(2026, 10, 13))
+        self.assertEqual(next_expiry, date(2026, 10, 19))
+        self.assertEqual(format_expiry_angelone(next_expiry), "19OCT2026")
+
+    def test_preponed_expiry_day_rolls_to_following_week(self):
+        # On Monday 2026-10-19 (the preponed expiry day itself), looking up the next
+        # weekly expiry must roll to the following week's Tuesday 2026-10-27.
+        next_expiry = get_next_weekly_expiry(date(2026, 10, 19))
+        self.assertEqual(next_expiry, date(2026, 10, 27))
+        self.assertEqual(format_expiry_angelone(next_expiry), "27OCT2026")
+
+    def test_holi_tuesday_prepones_to_monday(self):
+        # 2026-03-03 is Holi (Tuesday holiday). From Wednesday 2026-02-25, the next
+        # weekly expiry must prepone to Monday 2026-03-02.
+        next_expiry = get_next_weekly_expiry(date(2026, 2, 25))
+        self.assertEqual(next_expiry, date(2026, 3, 2))
+        self.assertEqual(format_expiry_angelone(next_expiry), "02MAR2026")
 
 
 class InstrumentResolutionTests(unittest.TestCase):

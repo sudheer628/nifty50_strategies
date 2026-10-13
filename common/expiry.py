@@ -10,28 +10,45 @@ import math
 from datetime import date, datetime, timedelta
 
 
+from common.calendar_utils import check_nse_holiday
+
 # Weekday constants: Monday=0 ... Sunday=6
 TUESDAY = 1
 
 
 def get_next_weekly_expiry(from_date: date = None) -> date:
     """
-    Return the next future weekly expiry (Tuesday) after ``from_date``.
+    Return the next future weekly expiry date after ``from_date``.
 
-    If ``from_date`` is a Tuesday, it returns the *following* Tuesday
-    (per the plan rule: do not collect the current week's expiry).
+    NIFTY weekly index options normally expire on Tuesday.
+    If the target expiry Tuesday falls on an NSE trading holiday or weekend,
+    the contract expiry is preponed to the preceding active trading day (per NSE rules).
+
+    If ``from_date`` is on or after the current week's expiry (e.g. on an expiry
+    Tuesday, or on a preponed expiry Monday), it rolls to the following week's expiry.
 
     Args:
         from_date:  Reference date (defaults to today if None).
 
     Returns:
-        The Tuesday date of the next weekly expiry.
+        The date of the next weekly expiry.
     """
     ref = from_date if from_date else date.today()
-    # Move to the next day first so an expiry Tuesday rolls to next week.
+    # Move to the next day first so an expiry day rolls to next week.
     ref += timedelta(days=1)
     days_until_tuesday = (TUESDAY - ref.weekday()) % 7
-    return ref + timedelta(days=days_until_tuesday)
+    candidate = ref + timedelta(days=days_until_tuesday)
+
+    base_ref = from_date if from_date else date.today()
+    while True:
+        expiry_candidate = candidate
+        while check_nse_holiday(expiry_candidate):
+            expiry_candidate -= timedelta(days=1)
+        if expiry_candidate > base_ref:
+            return expiry_candidate
+        # If the preponed date is not strictly in the future relative to from_date,
+        # roll candidate forward to the following Tuesday.
+        candidate += timedelta(days=7)
 
 
 def is_tuesday(d: date = None) -> bool:
