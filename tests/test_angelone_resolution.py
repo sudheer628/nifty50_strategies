@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from datetime import date
@@ -81,6 +82,7 @@ class InstrumentResolutionTests(unittest.TestCase):
         self.assertEqual(NIFTY50_TOKEN, "99926000")
         self.assertEqual(NIFTY50_TRADING_SYMBOL, "Nifty 50")
 
+    @patch.dict(os.environ, {"UPSTOX_FEED_CACHE_PATH": "/tmp/nonexistent_upstox_feed_for_test.json"})
     @patch("common.angelone_client.build_headers", return_value={"test": "header"})
     @patch("common.angelone_client.requests.post")
     def test_nifty_spot_uses_official_nse_token(self, post, _headers):

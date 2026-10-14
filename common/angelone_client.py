@@ -15,6 +15,7 @@ import time
 from datetime import datetime
 from functools import lru_cache
 import requests
+from typing import Optional
 
 from config import (
     logger,
@@ -25,6 +26,13 @@ from config import (
     NIFTY50_SYMBOL,
     NIFTY50_TRADING_SYMBOL,
 )
+
+try:
+    from common.upstox_feed_reader import read_quote, FeedUnavailableError
+except ImportError:
+    from upstox_feed_reader import read_quote, FeedUnavailableError
+
+_NIFTY50_FEED_KEY = "NSE_INDEX|Nifty 50"
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +120,7 @@ def _resolve_nifty50_token() -> tuple:
     return (NIFTY50_TOKEN, "NSE", NIFTY50_TRADING_SYMBOL)
 
 
-def get_nifty_spot() -> dict:
+def _get_nifty_spot_angel() -> dict:
     """
     Fetch current NIFTY50 spot market data via the Market Data API.
 
@@ -172,10 +180,93 @@ def get_nifty_spot() -> dict:
             "close": float(item.get("close", 0) or 0),
             "high": float(item.get("high", 0) or 0),
             "low": float(item.get("low", 0) or 0),
+            "source": "angelone",
         }
     except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
         logger.error("NIFTY spot fetch failed: %s", exc)
         return {}
+
+
+def _get_nifty_spot_from_feed(max_age_sec: Optional[int] = None) -> dict:
+    """
+    Fetch current NIFTY50 spot from local Upstox websocket feed cache.
+
+    Requires valid ltp > 0, open > 0, and close > 0; otherwise raises
+    FeedUnavailableError to trigger the Angel One fallback.
+    """
+    if max_age_sec is None:
+        try:
+            max_age_sec = int(os.environ.get("UPSTOX_SPOT_FEED_MAX_AGE_SEC", "30"))
+        except (ValueError, TypeError):
+            max_age_sec = 30
+    quote = read_quote(_NIFTY50_FEED_KEY, max_age_sec=max_age_sec)
+
+    ltp = float(quote.get("ltp") or 0.0)
+    open_p = float(quote.get("open") or 0.0)
+    close_p = float(quote.get("close") or quote.get("cp") or 0.0)
+    if close_p <= 0.0 and quote.get("change_pct") is not None:
+        try:
+            chg_pct = float(quote.get("change_pct"))
+            if 1.0 + chg_pct / 100.0 != 0:
+                close_p = round(ltp / (1.0 + chg_pct / 100.0), 2)
+        except (ValueError, TypeError, ZeroDivisionError):
+            pass
+
+    high_p = float(quote.get("high") or 0.0)
+    low_p = float(quote.get("low") or 0.0)
+
+    if ltp <= 0 or open_p <= 0 or close_p <= 0:
+        raise FeedUnavailableError(
+            f"Incomplete quote fields from feed (ltp={ltp}, open={open_p}, close={close_p})"
+        )
+
+    # NIFTY +/-5% previous close drift against live spot is impossible (circuit limit is 10%)
+    if abs(close_p - ltp) / ltp > 0.05:
+        raise FeedUnavailableError(
+            f"Implausible prev close {close_p} vs ltp {ltp} (>5% drift)"
+        )
+
+    return {
+        "ltp": ltp,
+        "open": open_p,
+        "close": close_p,
+        "high": high_p,
+        "low": low_p,
+        "source": "upstox_feed",
+    }
+
+
+def get_nifty_spot() -> dict:
+    """
+    Fetch current NIFTY50 spot market data.
+
+    Attempts to read from local Upstox websocket feed cache first
+    (/tmp/upstox_live_quotes.json, max_age 30s).
+    Falls back to Angel One SmartAPI Market Data quote on any feed error.
+
+    Returns:
+        Dictionary with keys:
+            - ``ltp`` (float)   : last traded price
+            - ``open`` (float)  : day open price
+            - ``close`` (float) : previous close
+            - ``high`` (float)  : day high
+            - ``low`` (float)   : day low
+            - ``source`` (str)  : 'upstox_feed' or 'angelone'
+        Returns empty dict on total failure.
+    """
+    try:
+        spot = _get_nifty_spot_from_feed()
+        logger.info(
+            "NIFTY spot fetched from Upstox feed: LTP=%.2f  Open=%.2f  Close=%.2f",
+            spot["ltp"], spot["open"], spot["close"]
+        )
+        return spot
+    except FeedUnavailableError as exc:
+        logger.warning("Upstox feed unavailable for NIFTY spot (%s); falling back to Angel One", exc)
+    except Exception as exc:
+        logger.warning("Unexpected error reading Upstox feed (%s); falling back to Angel One", exc)
+
+    return _get_nifty_spot_angel()
 
 
 def get_option_ltp(exchange: str, trading_symbol: str, token: str) -> dict:
