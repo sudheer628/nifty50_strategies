@@ -479,6 +479,52 @@ class ProfitMonitorTests(unittest.TestCase):
                 success = send_peak_alert_discord(event)
                 self.assertFalse(success)
 
+    def test_send_peak_alert_discord_milestone_formatting(self):
+        posted = []
+
+        def mock_post(url, json=None, headers=None, timeout=None):
+            class Resp:
+                status_code = 204
+            posted.append(json)
+            return Resp()
+
+        event = {
+            "cycle_id": "20261013-test",
+            "week_start_date": "20261013",
+            "expiry_date": "20261019",
+            "timestamp": TS_TUE_1300,
+            "nifty_ltp": 22750.0,
+            "combined_pnl_pts": 45.0,
+            "combined_pnl_pct": 22.5,
+            "combined_pnl_inr": 2925.0,
+            "call_strike": 22600,
+            "call_buy": 297.5,
+            "call_ltp": 400.0,
+            "call_pnl_pts": 102.5,
+            "put_strike": 22800,
+            "put_buy": 135.0,
+            "put_ltp": 77.5,
+            "put_pnl_pts": -57.5,
+            "alerts_sent_today": 1,
+            "track_label": "5-Day Tuesday Strategy",
+        }
+
+        with patch.dict(os.environ, {"DISCORD_URL": "https://discord.com/mock"}), \
+             patch("requests.post", side_effect=mock_post):
+            success = send_peak_alert_discord(event)
+            self.assertTrue(success)
+            self.assertEqual(len(posted), 1)
+            payload = posted[0]
+
+            self.assertIn("[PORTFOLIO MILESTONE +20%]", payload["content"])
+            embed = payload["embeds"][0]
+            self.assertIn("[PORTFOLIO MILESTONE]", embed["title"])
+            self.assertIn("+20% Target Achieved", embed["title"])
+
+            status_field = [f for f in embed["fields"] if f["name"] == "🏁 Milestone Status & Next Steps"][0]
+            self.assertIn("Single-Alert Policy", status_field["value"])
+            self.assertIn("Alpha FSM", status_field["value"])
+
     @patch("common.profit_monitor.send_peak_alert_discord")
     def test_dry_run_skips_discord_dispatch(self, mock_discord):
         event = {

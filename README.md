@@ -785,8 +785,11 @@ The strategy monitors floating strangle profit against the historical high-water
 | Dimension | Peak Profit Alert ($\ge 20\%$) | Alpha FSM Exit Alert |
 | :--- | :--- | :--- |
 | **Origin Engine** | `nifty50_strategies` ([`common/profit_monitor.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/profit_monitor.py)) | `sentinel-hermes` ([`fast_exit_check.py`](file:///c:/Users/sai-s/Documents/GitHub/sentinel-hermes/fast_exit_check.py) & [`inference_runner.py`](file:///c:/Users/sai-s/Documents/GitHub/sentinel-hermes/inference_runner.py)) |
+| **Discord Title** | `🎯 [PORTFOLIO MILESTONE] NIFTY [<Track>] +20% Target Achieved` | • `🚨 [ALERT 1 of 2] [<Track>] <LEG> Leg Exited: <ACTION>`<br>• `🏁 [ALERT 2 of 2 — FINAL EXIT] [<Track>] <LEG> Leg Exited: <ACTION>`<br>• `🚨 [DUAL EXIT — BOTH LEGS] [<Track>] Both Legs Exited: <ACTION>` |
 | **Trigger Nature** | **Milestone Notification** (combined strangle gain $\ge 20\%$) | **Actionable Trade Exit Execution** (leg harvest, stop hit, salvage) |
 | **Position Impact** | **None** — position remains 100% active in the market | **Leg State Transition** — triggers close order, moves to `SOLO_*` or `FLAT` |
+| **History Context** | N/A (single 1-time announcement per cycle) | On Alert 2: displays `⏮️ Cycle History (Previous Exits)` with prior leg's exit action, time, and P&L % |
+| **Conclusion Field** | Explains single-alert policy: data logging continues until expiry; FSM signals operate independently | Declares remaining active legs (on Alert 1) or `ALL LEGS EXITED (2 of 2) — no further signals` (on Alert 2) |
 | **Deduplication Scope** | Dispatches **exactly once per cycle** | Dispatches **exactly once per leg** (CALL, PUT, or BOTH) via `dispatched_exit_alerts` table |
 | **Coexistence** | **Independent**: If $\ge 20\%$ peak profit has already fired, Alpha FSM **continues to monitor and alert** when individual legs reach their exits |
 

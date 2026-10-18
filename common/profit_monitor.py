@@ -356,7 +356,7 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     title_label = f" [{track_label}]"
 
     headline = (
-        f"🎯 **NIFTY{headline_label} NEW PEAK PROFIT: {comb_pnl_sign}{event['combined_pnl_pct']:.1f}% "
+        f"🎯 **[PORTFOLIO MILESTONE +20%]{headline_label} {comb_pnl_sign}{event['combined_pnl_pct']:.1f}% "
         f"({comb_pnl_sign}{event['combined_pnl_pts']:.1f} pts / ₹{event['combined_pnl_inr']:,.0f})** | NIFTY: {event['nifty_ltp']:.2f}"
     )
 
@@ -375,8 +375,8 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     put_ltp_str = f"₹{put_ltp:.2f}" if put_ltp is not None else "N/A"
 
     embed = {
-        "title": f"🎯 NIFTY{title_label} High-Water Mark",
-        "description": f"New peak profit achieved for active cycle `{event.get('cycle_id', 'UNKNOWN')}`{fsm_str}",
+        "title": f"🎯 [PORTFOLIO MILESTONE] NIFTY{title_label} +20% Target Achieved",
+        "description": f"Portfolio high-water mark reached for active cycle `{event.get('cycle_id', 'UNKNOWN')}`{fsm_str}",
         "color": 0x10B981,  # Emerald green
         "fields": [
             {
@@ -415,16 +415,17 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
                 "inline": False,
             },
             {
-                "name": "📌 Alert Frequency & Hysteresis",
+                "name": "🏁 Milestone Status & Next Steps",
                 "value": (
-                    f"Alert #{event.get('alerts_sent_today', 1)} today.\n"
-                    f"Next alert requires a +{PEAK_ALERT_HYSTERESIS_PCT:.1f}% or +{PEAK_ALERT_HYSTERESIS_PTS:.1f} pts expansion above this peak."
+                    "• **Single-Alert Policy**: This is the **only** portfolio peak profit alert for this cycle (expansion alerts are suppressed).\n"
+                    "• **Data Collection**: Hourly price logging continues automatically until expiry.\n"
+                    "• **Alpha FSM**: Dynamic leg harvest/stop-loss exit signals operate independently and will alert when individual leg exit criteria are met."
                 ),
                 "inline": False,
             },
         ],
         "footer": {
-            "text": f"NIFTY 50 Strategy Automated Monitor • Time: {time_ist}"
+            "text": f"NIFTY 50 Strategy Automated Monitor • {track_label} • Time: {time_ist}"
         },
         "timestamp": datetime.fromtimestamp(event["timestamp"], tz=timezone.utc).isoformat(),
     }
