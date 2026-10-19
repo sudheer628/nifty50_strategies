@@ -2,7 +2,7 @@ import sys
 import unittest
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -26,6 +26,20 @@ MANUAL_SNAPSHOT = {
     "call_buy_price": 92.0,
     "put_buy_price": 82.0,
     "captured_at": 1785854400,
+}
+
+# Prior week's cycle (started Tue 2026-10-13, expiry preponed to Mon 2026-10-19
+# because Tue 2026-10-20/Dussehra is a holiday), already closed post-market.
+CLOSED_PRIOR_SNAPSHOT = {
+    "strategy_name": "nifty50_weekly_option_collector",
+    "cycle_id": "20261013-test",
+    "week_start_date": "20261013",
+    "expiry_date": "20261019",
+    "call_strike": 25100,
+    "put_strike": 24900,
+    "call_buy_price": 100.0,
+    "put_buy_price": 90.0,
+    "status": "closed",
 }
 
 
@@ -215,6 +229,78 @@ class CycleSnapshotTests(unittest.TestCase):
         v3 = variants_recorded["V3_staggered_p0931_c1000"]
         self.assertEqual(v3["spot_at_call_entry"], 25050.0)  # 10:01 current spot
         self.assertEqual(v3["spot_at_put_entry"], 25000.0)   # 09:31 spot from active_cycle
+
+    def test_cycle_start_defers_to_wednesday_after_tuesday_holiday(self):
+        # 2026-10-20 (Dussehra) is an NSE holiday: the 5-day cycle starts Wed 2026-10-21.
+        self.assertEqual(_cycle_start_for_day(date(2026, 10, 21)), date(2026, 10, 21))
+        self.assertEqual(_cycle_start_for_day(date(2026, 10, 22)), date(2026, 10, 21))
+        self.assertEqual(_cycle_start_for_day(date(2026, 10, 23)), date(2026, 10, 21))
+        # The following Monday still belongs to the Wednesday-started cycle.
+        self.assertEqual(_cycle_start_for_day(date(2026, 10, 26)), date(2026, 10, 21))
+
+    def test_cycle_start_stays_tuesday_after_monday_holiday(self):
+        # 2026-09-14 (Ganesh Chaturthi) is an NSE holiday. The prior cycle's close
+        # defers to Tuesday, but the fresh cycle still starts Tuesday 2026-09-15
+        # (matches is_strategy_start_day and the Monday-holiday shift test).
+        self.assertEqual(_cycle_start_for_day(date(2026, 9, 16)), date(2026, 9, 15))
+        self.assertEqual(_cycle_start_for_day(date(2026, 9, 17)), date(2026, 9, 15))
+
+    @patch("strategies.weekly_option_collector.insert_timing_shadow_entry")
+    @patch("strategies.weekly_option_collector.get_timing_shadow_entries", return_value=[])
+    @patch("strategies.weekly_option_collector.insert_record")
+    @patch("strategies.weekly_option_collector.insert_buy_snapshot")
+    @patch("strategies.weekly_option_collector.save_active_snapshot")
+    @patch("strategies.weekly_option_collector._ensure_db", return_value="cycle.db")
+    @patch("strategies.weekly_option_collector.get_nifty_option_chain")
+    @patch("strategies.weekly_option_collector.get_nifty_spot")
+    @patch("strategies.weekly_option_collector.evaluate_entry_gate")
+    @patch(
+        "strategies.weekly_option_collector.load_active_snapshot",
+        return_value=CLOSED_PRIOR_SNAPSHOT,
+    )
+    @patch(
+        "strategies.weekly_option_collector._today_ist",
+        return_value=date(2026, 10, 21),
+    )
+    def test_wednesday_after_tuesday_holiday_starts_fresh_cycle(
+        self,
+        _today,
+        _load_snapshot,
+        gate,
+        get_spot,
+        get_options,
+        _ensure_db,
+        save_snapshot,
+        _insert_snapshot,
+        insert_record,
+        _get_shadows,
+        _insert_shadow,
+    ):
+        # Scenario: Tue 2026-10-20 is a Dussehra holiday, VM was down, and the
+        # collector's first run of the week happens on Wed 2026-10-21.
+        gate.return_value = MagicMock(
+            should_enter=True,
+            status="OPEN",
+            defer_reason="",
+            to_dict=MagicMock(return_value={"should_enter": True}),
+        )
+        get_spot.return_value = {"ltp": 25000.0, "open": 24950.0, "close": 24900.0}
+        get_options.return_value = {"call": {"ltp": 95.0}, "put": {"ltp": 88.0}}
+
+        self.assertTrue(collect_once())
+
+        # Entry gate is evaluated because Wednesday is the deferred start day.
+        gate.assert_called_once()
+
+        # Fresh cycle locked on Wednesday, targeting next Tuesday's expiry.
+        snapshot = save_snapshot.call_args.args[0]
+        self.assertEqual(snapshot["week_start_date"], "20261021")
+        self.assertEqual(snapshot["expiry_date"], "20261027")
+        self.assertTrue(snapshot["cycle_id"].startswith("20261021"))
+
+        record = insert_record.call_args.args[1]
+        self.assertEqual(record["expiry_date"], "20261027")
+        self.assertTrue(record["cycle_id"].startswith("20261021"))
 
 
 if __name__ == "__main__":

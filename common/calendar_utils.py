@@ -8,8 +8,8 @@ milestones according to exchange operating schedules:
    - Tuesday (09:30 IST): Strategy Beginning Day.
 2. Monday Holiday shift:
    - Monday: Closed (Holiday).
-   - Tuesday (15:30 IST): Deferred Strategy Closing Day for the active cycle.
-   - Wednesday (09:30 IST): Deferred Strategy Beginning Day for the fresh cycle.
+   - Tuesday (pre-open): Deferred Strategy Closing Day for the prior cycle.
+   - Tuesday (09:31 IST): Strategy Beginning Day for the fresh cycle (no shift).
 3. Tuesday Holiday shift:
    - Monday (15:30 IST): Strategy Closing Day.
    - Tuesday: Closed (Holiday).

@@ -4,8 +4,8 @@ run_weekly_close.py - Holiday-Aware Weekly Strategy Closing Orchestrator.
 
 Orchestrates the complete post-market weekly closing sequence for NIFTY 50:
 1. Validates whether today is the true Strategy Closing Day:
-   - Normal week: Monday post-market (15:35 IST).
-   - Monday Holiday: Tuesday post-market (15:35 IST).
+   - Normal week: Monday post-market (15:37 IST).
+   - Monday Holiday: Tuesday pre-open deferred close (09:07 IST).
    - Skips silently when not the designated closing day.
 2. Runs the end-of-cycle pipeline in sequence:
    - Step 1: scripts/send_weekly_report.py (PDF/HTML weekly performance report)
@@ -13,8 +13,11 @@ Orchestrates the complete post-market weekly closing sequence for NIFTY 50:
    - Step 3: sentinel-hermes/run_weekly_merge.sh (rebuilds merged SQLite database)
    - Step 4: sentinel-hermes/skill_generator.py (synthesizes weekly skill and syncs to MongoDB Atlas)
 
-Scheduled in crontab on both Monday and Tuesday at 15:35 IST (10:05 UTC):
-    35 10 * * 1,2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
+Scheduled in crontab (see README "Production Crontab Entries"; times UTC):
+    # Monday post-market close (10:07 UTC = 15:37 IST)
+    7 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
+    # Tuesday deferred close, only when Monday was an exchange holiday (03:37 UTC = 09:07 IST)
+    37 3 * * 2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
 
 Usage:
     python scripts/run_weekly_close.py

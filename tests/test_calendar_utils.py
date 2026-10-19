@@ -106,6 +106,36 @@ class TestCalendarUtils(unittest.TestCase):
         self.assertTrue(is_strategy_start_day(wed_after))
         self.assertEqual(get_strategy_cycle_role(wed_after), "START_DAY")
 
+    def test_dussehra_2026_tuesday_holiday_shift(self):
+        """
+        Explicit coverage for the 2026-10-20 Dussehra holiday week:
+        - Monday (2026-10-19): CLOSING_DAY for the prior cycle (preponed expiry day).
+        - Tuesday (2026-10-20): HOLIDAY - no close, no start.
+        - Wednesday (2026-10-21): START_DAY - the 5-day cycle begins.
+        - Thursday/Friday: REGULAR_DAY mid-cycle holding days.
+        """
+        mon = date(2026, 10, 19)
+        tue = date(2026, 10, 20)
+        wed = date(2026, 10, 21)
+        thu = date(2026, 10, 22)
+        fri = date(2026, 10, 23)
+
+        self.assertFalse(check_nse_holiday(mon))
+        self.assertEqual(get_strategy_cycle_role(mon), "CLOSING_DAY")
+
+        self.assertTrue(check_nse_holiday(tue))
+        self.assertFalse(is_strategy_closing_day(tue))
+        self.assertFalse(is_strategy_start_day(tue))
+        self.assertEqual(get_strategy_cycle_role(tue), "HOLIDAY")
+
+        self.assertFalse(check_nse_holiday(wed))
+        self.assertTrue(is_strategy_start_day(wed))
+        self.assertEqual(get_strategy_cycle_role(wed), "START_DAY")
+
+        for day in (thu, fri):
+            self.assertFalse(is_strategy_start_day(day))
+            self.assertEqual(get_strategy_cycle_role(day), "REGULAR_DAY")
+
     def test_cycle_status_lifecycle(self):
         """Verify that a closed status in active snapshot is recognized and retired."""
         from strategies.weekly_option_collector import _active_cycle

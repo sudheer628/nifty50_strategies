@@ -149,13 +149,20 @@ def _parse_file_date(value: str) -> date:
 
 
 def _cycle_start_for_day(d: date) -> date:
-    """Return the start date of the weekly cycle containing ``d``."""
+    """Return the start date of the weekly cycle containing ``d``.
+
+    Mirrors ``is_strategy_start_day``:
+    - The fresh cycle starts on Tuesday unless Tuesday is an NSE holiday,
+      in which case the start defers to Wednesday (Scenario-2).
+    - A Monday holiday only defers the previous cycle's *closing* day to
+      Tuesday; the fresh cycle still starts that Tuesday.
+    """
     if is_strategy_start_day(d):
         return d
     days_since_tuesday = (d.weekday() - 1) % 7
     tue = d - timedelta(days=days_since_tuesday)
-    mon = tue - timedelta(days=1)
-    if check_nse_holiday(mon):
+    if check_nse_holiday(tue):
+        # Tuesday holiday: the fresh cycle started on Wednesday instead.
         wed = tue + timedelta(days=1)
         if wed <= d:
             return wed
@@ -255,9 +262,10 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
     """
     Perform one hourly data collection cycle.
 
-    - **Tuesday**: ends the previous cycle, starts a fresh one with a
-      new expiry, new strikes, and new buy prices.  The old snapshot is
-      archived to a dated JSON file; the new one becomes active.
+    - **Tuesday** (or Wednesday when Tuesday was an NSE holiday): ends the
+      previous cycle, starts a fresh one with a new expiry, new strikes,
+      and new buy prices.  The old snapshot is archived to a dated JSON
+      file; the new one becomes active.
     - **Wednesday-Monday**: reuses the active snapshot's buy prices and
       continues writing to the same weekly DB.
 
