@@ -175,9 +175,8 @@ def evaluate_peak_profit(
     moneyness = str(snapshot.get("moneyness") or ("ITM" if put_strike > call_strike else "OTM")).upper()
     total_extrinsic = float(snapshot.get("total_extrinsic") or 0.0)
     extrinsic_pnl_pct = round((combined_pnl_pts / total_extrinsic) * 100.0, 2) if total_extrinsic > 0 else 0.0
-    profit_meets_min = (combined_pnl_pct >= PEAK_ALERT_MIN_PROFIT_PCT) or (
-        moneyness == "ITM" and total_extrinsic > 0 and extrinsic_pnl_pct >= PEAK_ALERT_MIN_PROFIT_PCT
-    )
+    # Option-A: Strict Total Premium basis (no extrinsic shortcut qualifying early)
+    profit_meets_min = combined_pnl_pct >= PEAK_ALERT_MIN_PROFIT_PCT
 
     is_retry_at_peak = (
         combined_pnl_pts >= previous_peak_pts
@@ -356,7 +355,7 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     title_label = f" [{track_label}]"
 
     headline = (
-        f"🎯 **[PORTFOLIO MILESTONE +20%]{headline_label} {comb_pnl_sign}{event['combined_pnl_pct']:.1f}% "
+        f"🎯 **[PORTFOLIO MILESTONE +20% — NO EXIT]{headline_label} {comb_pnl_sign}{event['combined_pnl_pct']:.1f}% "
         f"({comb_pnl_sign}{event['combined_pnl_pts']:.1f} pts / ₹{event['combined_pnl_inr']:,.0f})** | NIFTY: {event['nifty_ltp']:.2f}"
     )
 
@@ -375,7 +374,7 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     put_ltp_str = f"₹{put_ltp:.2f}" if put_ltp is not None else "N/A"
 
     embed = {
-        "title": f"🎯 [PORTFOLIO MILESTONE] NIFTY{title_label} +20% Target Achieved",
+        "title": f"🎯 [PORTFOLIO MILESTONE — NO EXIT] NIFTY{title_label} +20% Target Achieved",
         "description": f"Portfolio high-water mark reached for active cycle `{event.get('cycle_id', 'UNKNOWN')}`{fsm_str}",
         "color": 0x10B981,  # Emerald green
         "fields": [
@@ -417,9 +416,10 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
             {
                 "name": "🏁 Milestone Status & Next Steps",
                 "value": (
+                    "• **Milestone Notification Only**: This alert tracks portfolio high-water mark; **positions remain open** (no broker action required).\n"
                     "• **Single-Alert Policy**: This is the **only** portfolio peak profit alert for this cycle (expansion alerts are suppressed).\n"
-                    "• **Data Collection**: Hourly price logging continues automatically until expiry.\n"
-                    "• **Alpha FSM**: Dynamic leg harvest/stop-loss exit signals operate independently and will alert when individual leg exit criteria are met."
+                    "• **Continuous Price Logging**: Hourly price logging continues automatically until expiry for counterfactual and EoD analysis.\n"
+                    "• **Alpha FSM (Actionable Exits)**: Dynamic leg harvest/stop-loss exit signals operate independently and will alert when actionable exit criteria are met."
                 ),
                 "inline": False,
             },

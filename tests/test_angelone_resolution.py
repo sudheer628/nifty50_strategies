@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import unittest
@@ -308,6 +309,140 @@ class InstrumentResolutionTests(unittest.TestCase):
         result = get_option_ltp("NFO", "NIFTY11AUG2624500PE", "41012")
         self.assertEqual(result["ltp"], 95.25)
         self.assertEqual(result["source"], "upstox_api")
+
+
+    @patch("common.angelone_client.get_redis_client")
+    @patch("common.angelone_client.requests.get")
+    @patch("common.angelone_client.get_instrument_master", return_value=CURRENT_CONTRACTS)
+    @patch("common.angelone_client.build_headers", return_value={"test": "header"})
+    @patch("common.angelone_client.requests.post")
+    def test_option_chain_logs_warning_not_error_when_upstox_recovers(
+        self, mock_post, _headers, _master, mock_upstox_get, mock_redis
+    ):
+        from common import angelone_client
+        # Angel One returns HTTP 500 error
+        mock_post.return_value = Mock(status_code=500, text="Internal Error")
+
+        mock_r = Mock()
+        mock_r.get.return_value = "fake_upstox_token"
+        mock_redis.return_value = mock_r
+
+        upstox_resp = Mock(status_code=200)
+        upstox_resp.json.return_value = {
+            "status": "success",
+            "data": [
+                {"strike_price": 24700, "call_options": {"instrument_key": "NSE_FO|41020", "market_data": {"ltp": 105.50}}},
+                {"strike_price": 24500, "put_options": {"instrument_key": "NSE_FO|41012", "market_data": {"ltp": 92.00}}},
+            ],
+        }
+        mock_upstox_get.return_value = upstox_resp
+
+        with self.assertLogs("nifty50_strategies", level="WARNING") as cm:
+            result = get_nifty_option_chain("11AUG2026", 24700, 24500)
+            self.assertEqual(result["call"]["ltp"], 105.50)
+            self.assertEqual(result["put"]["ltp"], 92.00)
+
+        # Assert WARNING was logged for recovery, and NO ERROR log was emitted
+        warnings = [rec for rec in cm.records if rec.levelno == logging.WARNING]
+        errors = [rec for rec in cm.records if rec.levelno >= logging.ERROR]
+        self.assertTrue(any("recovered Call LTP" in rec.getMessage() for rec in warnings))
+        self.assertTrue(any("recovered Put LTP" in rec.getMessage() for rec in warnings))
+        self.assertEqual(errors, [])
+
+    @patch("common.angelone_client.get_redis_client")
+    @patch("common.angelone_client.get_instrument_master", return_value=CURRENT_CONTRACTS)
+    @patch("common.angelone_client.build_headers", return_value={"test": "header"})
+    @patch("common.angelone_client.requests.post")
+    def test_option_chain_logs_error_when_both_fail(
+        self, mock_post, _headers, _master, mock_redis
+    ):
+        from common import angelone_client
+        # Angel One fails
+        mock_post.return_value = Mock(status_code=500, text="Internal Error")
+        # Redis has no Upstox token (total failure)
+        mock_r = Mock()
+        mock_r.get.return_value = None
+        mock_redis.return_value = mock_r
+
+        with self.assertLogs("nifty50_strategies", level="WARNING") as cm:
+            result = get_nifty_option_chain("11AUG2026", 24700, 24500)
+
+        errors = [rec for rec in cm.records if rec.levelno >= logging.ERROR]
+        self.assertTrue(any("Failed to retrieve Call LTP" in rec.getMessage() for rec in errors))
+        self.assertTrue(any("Failed to retrieve Put LTP" in rec.getMessage() for rec in errors))
+
+    @patch("common.angelone_client.get_redis_client")
+    @patch("common.angelone_client.requests.get")
+    @patch("common.angelone_client.get_instrument_master", return_value=[])
+    @patch("common.angelone_client.search_instruments", return_value=[])
+    def test_option_chain_recovers_via_upstox_when_token_resolution_fails(
+        self, _search, _master, mock_upstox_get, mock_redis
+    ):
+        # Both master and searchScrip fail to resolve Angel One tokens
+        clear_token_cache()
+        mock_r = Mock()
+        mock_r.get.return_value = "fake_upstox_token"
+        mock_redis.return_value = mock_r
+
+        upstox_resp = Mock(status_code=200)
+        upstox_resp.json.return_value = {
+            "status": "success",
+            "data": [
+                {"strike_price": 24700, "call_options": {"instrument_key": "NSE_FO|41020", "market_data": {"ltp": 105.50}}},
+                {"strike_price": 24500, "put_options": {"instrument_key": "NSE_FO|41012", "market_data": {"ltp": 92.00}}},
+            ],
+        }
+        mock_upstox_get.return_value = upstox_resp
+
+        with self.assertLogs("nifty50_strategies", level="WARNING") as cm:
+            result = get_nifty_option_chain("11AUG2026", 24700, 24500)
+            self.assertEqual(result["call"]["ltp"], 105.50)
+            self.assertEqual(result["call"]["source"], "upstox_api")
+            self.assertEqual(result["put"]["ltp"], 92.00)
+            self.assertEqual(result["put"]["source"], "upstox_api")
+
+        # ZERO errors logged, only warnings describing token resolution skip + Upstox recovery
+        errors = [rec for rec in cm.records if rec.levelno >= logging.ERROR]
+        warnings = [rec for rec in cm.records if rec.levelno == logging.WARNING]
+        self.assertEqual(errors, [])
+        self.assertTrue(any("Failed to resolve Angel One option token" in rec.getMessage() for rec in warnings))
+        self.assertTrue(any("recovered Call LTP" in rec.getMessage() for rec in warnings))
+
+    @patch("common.angelone_client.build_headers", return_value={"test": "header"})
+    @patch("common.angelone_client.requests.post")
+    def test_option_batch_handles_malformed_non_dict_body(self, mock_post, _headers):
+        from common.angelone_client import get_option_ltps
+        # Test 1: JSON null (resp.json() returns None)
+        resp1 = Mock(status_code=200, text="null")
+        resp1.json.return_value = None
+        mock_post.return_value = resp1
+        res1 = get_option_ltps([{"token": "41020"}])
+        self.assertEqual(res1, {})
+
+        # Test 2: JSON list (resp.json() returns a list)
+        resp2 = Mock(status_code=200, text="[1, 2, 3]")
+        resp2.json.return_value = [1, 2, 3]
+        mock_post.return_value = resp2
+        res2 = get_option_ltps([{"token": "41020"}])
+        self.assertEqual(res2, {})
+
+    def test_master_cooldown_persists_to_disk_across_process_reset(self):
+        from common import angelone_client
+        clear_token_cache()
+        self.assertEqual(angelone_client._get_master_cooldown_remaining(), 0.0)
+
+        # Record a failure
+        angelone_client._record_master_failure()
+        self.assertGreater(angelone_client._get_master_cooldown_remaining(), 0.0)
+
+        # Simulate new process starting (memory variable reset to 0.0)
+        angelone_client._LAST_MASTER_FAILURE_TIME = 0.0
+        # Disk cache should still report cooldown active!
+        self.assertGreater(angelone_client._get_master_cooldown_remaining(), 290.0)
+
+        # Clearing cache resets disk cooldown
+        clear_token_cache()
+        self.assertEqual(angelone_client._get_master_cooldown_remaining(), 0.0)
 
 
 if __name__ == "__main__":

@@ -516,9 +516,9 @@ class ProfitMonitorTests(unittest.TestCase):
             self.assertEqual(len(posted), 1)
             payload = posted[0]
 
-            self.assertIn("[PORTFOLIO MILESTONE +20%]", payload["content"])
+            self.assertIn("[PORTFOLIO MILESTONE +20% — NO EXIT]", payload["content"])
             embed = payload["embeds"][0]
-            self.assertIn("[PORTFOLIO MILESTONE]", embed["title"])
+            self.assertIn("[PORTFOLIO MILESTONE — NO EXIT]", embed["title"])
             self.assertIn("+20% Target Achieved", embed["title"])
 
             status_field = [f for f in embed["fields"] if f["name"] == "🏁 Milestone Status & Next Steps"][0]
@@ -618,6 +618,77 @@ class ProfitMonitorTests(unittest.TestCase):
         )
         self.assertFalse(triggered)
         self.assertIn("Cycle is closed", msg)
+
+    @patch("common.profit_monitor.update_active_peak_state")
+    @patch("common.profit_monitor.on_new_peak")
+    def test_itm_strangle_strict_total_premium_qualification(self, mock_on_peak, mock_save_peak):
+        # ITM Strangle: Call 22900 (Buy 303.60), Put 23100 (Buy 160.25) -> Total Buy = 463.85
+        # Total Extrinsic = 463.85 - 200 = 263.85
+        snapshot = {
+            "strategy_name": "nifty50_weekly_option_collector",
+            "cycle_id": "20261021-test",
+            "week_start_date": "20261021",
+            "expiry_date": "20261027",
+            "moneyness": "ITM",
+            "total_extrinsic": 263.85,
+            "call_strike": 22900,
+            "put_strike": 23100,
+            "call_buy_price": 303.60,
+            "put_buy_price": 160.25,
+            "peak_profit": {
+                "peak_pnl_pts": 0.0,
+                "peak_pnl_pct": 0.0,
+                "peak_pnl_inr": 0.0,
+                "peak_timestamp": TS_TUE_0930,
+                "last_notified_pts": None,
+                "last_notified_pct": None,
+                "last_notified_timestamp": None,
+                "alerts_sent_today": 0,
+                "last_alert_date": "2026-10-21",
+                "alert_dispatched": False,
+            },
+        }
+
+        # Case 1: Combined profit = +60.60 pts.
+        # Extrinsic P&L = +22.97% (>=20%), BUT Total Premium P&L = +13.06% (<20%)
+        # Under Option-A (strict total premium), this must NOT trigger an alert!
+        state, triggered, msg = evaluate_peak_profit(
+            snapshot=snapshot,
+            nifty_ltp=22737.20,
+            call_strike=22900,
+            call_ltp=116.40,
+            call_buy=303.60,
+            put_strike=23100,
+            put_ltp=408.05,
+            put_buy=160.25,
+            is_first_tick=False,
+            current_ts=TS_TUE_1200,
+        )
+        self.assertFalse(triggered)
+        self.assertEqual(state["peak_pnl_pts"], 60.60)
+        self.assertEqual(state["peak_pnl_pct"], 13.06)
+        self.assertIn("below minimum 20.0% threshold", msg)
+        mock_on_peak.assert_not_called()
+
+        # Case 2: Profit increases to +93.0 pts (Total Premium P&L = +20.05% >= 20.0%)
+        # Now it MUST trigger!
+        snapshot["peak_profit"] = state
+        state2, triggered2, msg2 = evaluate_peak_profit(
+            snapshot=snapshot,
+            nifty_ltp=22700.00,
+            call_strike=22900,
+            call_ltp=110.00,
+            call_buy=303.60,
+            put_strike=23100,
+            put_ltp=446.85,
+            put_buy=160.25,
+            is_first_tick=False,
+            current_ts=TS_TUE_1300,
+        )
+        self.assertTrue(triggered2)
+        self.assertEqual(state2["peak_pnl_pts"], 93.0)
+        self.assertAlmostEqual(state2["peak_pnl_pct"], 20.05, places=1)
+        self.assertEqual(mock_on_peak.call_count, 1)
 
 
 if __name__ == "__main__":

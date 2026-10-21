@@ -493,33 +493,44 @@ def get_option_ltps(option_infos: list) -> dict:
             resp.text[:500] if resp.text else "(empty)",
         )
         if resp.status_code != 200 or not resp.text.strip():
-            logger.error("Option batch LTP HTTP %s", resp.status_code)
+            logger.warning("Option batch LTP HTTP %s; will attempt fallback", resp.status_code)
             return {}
 
-        body = resp.json()
+        try:
+            body = resp.json()
+        except Exception as exc:
+            logger.warning("Option batch LTP JSON decode failed: %s; will attempt fallback", exc)
+            return {}
+
+        if not isinstance(body, dict):
+            logger.warning("Option batch LTP non-dict response (%s); will attempt fallback", type(body))
+            return {}
+
         if body.get("status") is not True:
-            logger.error("Option batch LTP API error: %s", body)
+            logger.warning("Option batch LTP API error: %s; will attempt fallback", body.get("message", body))
             return {}
 
         quotes = {}
         for item in (body.get("data") or {}).get("fetched", []):
-            token = str(item.get("symbolToken") or item.get("symboltoken") or "")
-            if token:
-                quotes[token] = {
-                    "ltp": float(item.get("ltp", 0) or 0),
-                }
+            if isinstance(item, dict):
+                token = str(item.get("symbolToken") or item.get("symboltoken") or "")
+                if token:
+                    quotes[token] = {
+                        "ltp": float(item.get("ltp", 0) or 0),
+                    }
 
         for item in (body.get("data") or {}).get("unfetched", []):
-            logger.error("Option batch LTP unfetched: %s", item)
+            logger.warning("Option batch LTP unfetched: %s; will attempt fallback", item)
         return quotes
-    except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
-        logger.error("Option batch LTP fetch failed: %s", exc)
+    except Exception as exc:
+        logger.warning("Option batch LTP fetch failed: %s; will attempt fallback", exc)
         return {}
 
 
 _CACHE_DIR = os.environ.get("CACHE_DIR") or tempfile.gettempdir()
 _MASTER_DISK_CACHE_PATH = os.path.join(_CACHE_DIR, "angelone_scrip_master.json")
 _TOKEN_DISK_CACHE_PATH = os.path.join(_CACHE_DIR, "angelone_resolved_tokens.json")
+_MASTER_COOLDOWN_DISK_PATH = os.path.join(_CACHE_DIR, "angelone_master_cooldown.txt")
 
 _INSTRUMENT_MASTER_RETRIES = int(os.environ.get("ANGELONE_MASTER_RETRIES", "1"))
 _INSTRUMENT_MASTER_BACKOFF = (2,)
@@ -530,11 +541,50 @@ _LAST_MASTER_FAILURE_TIME = 0.0
 _RESOLVED_OPTION_TOKENS: Dict[Tuple[str, int, str], dict] = {}
 
 
+def _get_master_cooldown_remaining() -> float:
+    """Check remaining failure cooldown in seconds across in-memory and disk state."""
+    global _LAST_MASTER_FAILURE_TIME
+    last_failure = _LAST_MASTER_FAILURE_TIME
+    if last_failure <= 0.0 and os.path.exists(_MASTER_COOLDOWN_DISK_PATH):
+        try:
+            with open(_MASTER_COOLDOWN_DISK_PATH, "r", encoding="utf-8") as f:
+                last_failure = float(f.read().strip())
+                _LAST_MASTER_FAILURE_TIME = last_failure
+        except Exception:
+            pass
+    if last_failure > 0.0:
+        elapsed = time.time() - last_failure
+        if elapsed < _MASTER_FAILURE_COOLDOWN_SEC:
+            return _MASTER_FAILURE_COOLDOWN_SEC - elapsed
+    return 0.0
+
+
+def _record_master_failure() -> None:
+    """Persist master failure timestamp in memory and to disk."""
+    global _LAST_MASTER_FAILURE_TIME
+    _LAST_MASTER_FAILURE_TIME = time.time()
+    try:
+        with open(_MASTER_COOLDOWN_DISK_PATH, "w", encoding="utf-8") as f:
+            f.write(str(_LAST_MASTER_FAILURE_TIME))
+    except Exception as exc:
+        logger.debug("Failed writing master cooldown to disk: %s", exc)
+
+
+def _clear_master_cooldown() -> None:
+    """Reset master failure timestamp in memory and remove disk cooldown file."""
+    global _LAST_MASTER_FAILURE_TIME
+    _LAST_MASTER_FAILURE_TIME = 0.0
+    if os.path.exists(_MASTER_COOLDOWN_DISK_PATH):
+        try:
+            os.remove(_MASTER_COOLDOWN_DISK_PATH)
+        except OSError:
+            pass
+
+
 def clear_token_cache() -> None:
     """Clear in-memory and disk token cache (primarily for tests and weekly resets)."""
-    global _LAST_MASTER_FAILURE_TIME
+    _clear_master_cooldown()
     _RESOLVED_OPTION_TOKENS.clear()
-    _LAST_MASTER_FAILURE_TIME = 0.0
     try:
         _fetch_instrument_master.cache_clear()
     except Exception:
@@ -599,15 +649,13 @@ def _fetch_instrument_master() -> list:
 
     Raises on failure so lru_cache does NOT cache empty results.
     """
-    global _LAST_MASTER_FAILURE_TIME
-
-    # If recent failure cooldown is active, return disk cache if valid, otherwise raise
-    if _LAST_MASTER_FAILURE_TIME > 0 and (time.time() - _LAST_MASTER_FAILURE_TIME < _MASTER_FAILURE_COOLDOWN_SEC):
+    cooldown_rem = _get_master_cooldown_remaining()
+    if cooldown_rem > 0.0:
         cached = _load_master_from_disk()
         if cached:
             return cached
         raise requests.RequestException(
-            f"Instrument master download in failure cooldown ({int(_MASTER_FAILURE_COOLDOWN_SEC - (time.time() - _LAST_MASTER_FAILURE_TIME))}s remaining)"
+            f"Instrument master download in failure cooldown ({int(cooldown_rem)}s remaining)"
         )
 
     last_exc = None
@@ -624,7 +672,7 @@ def _fetch_instrument_master() -> list:
             logger.info("Loaded %d instruments from Angel One master (attempt %d)",
                         len(instruments), attempt + 1)
             _save_master_to_disk(instruments)
-            _LAST_MASTER_FAILURE_TIME = 0.0
+            _clear_master_cooldown()
             return instruments
         except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
             last_exc = exc
@@ -636,7 +684,7 @@ def _fetch_instrument_master() -> list:
                 )
                 time.sleep(wait)
 
-    _LAST_MASTER_FAILURE_TIME = time.time()
+    _record_master_failure()
     # If network attempts failed, attempt recovery from local disk cache
     cached = _load_master_from_disk()
     if cached:
@@ -691,28 +739,33 @@ def search_instruments(search_text: str, exchange: str = "NFO") -> list:
         logger.info("searchScrip '%s' HTTP %s", search_text, resp.status_code)
 
         if resp.status_code != 200 or not resp.text.strip():
-            logger.error("searchScrip HTTP %s (empty response)", resp.status_code)
+            logger.warning("searchScrip HTTP %s (empty response); will attempt fallback", resp.status_code)
             return []
 
-        body = resp.json()
-        if body is None:
-            logger.error("searchScrip returned null body")
+        try:
+            body = resp.json()
+        except Exception as exc:
+            logger.warning("searchScrip JSON decode failed: %s; will attempt fallback", exc)
+            return []
+
+        if body is None or not isinstance(body, dict):
+            logger.warning("searchScrip returned invalid body (%s); will attempt fallback", type(body))
             return []
 
         if body.get("status") is False:
-            logger.error("searchScrip API error: %s", body.get("message", ""))
+            logger.warning("searchScrip API error: %s; will attempt fallback", body.get("message", ""))
             return []
 
         data = body.get("data", [])
         if not isinstance(data, list):
-            logger.warning("searchScrip data is not a list: %s", type(data))
+            logger.warning("searchScrip data is not a list: %s; will attempt fallback", type(data))
             return []
 
         logger.info("searchScrip '%s' returned %d results",
                     search_text, len(data))
         return data
-    except (requests.RequestException, json.JSONDecodeError) as exc:
-        logger.error("searchScrip failed: %s", exc)
+    except Exception as exc:
+        logger.warning("searchScrip failed: %s; will attempt fallback", exc)
         return []
 
 
@@ -791,7 +844,7 @@ def resolve_option_token(
             "%d%b%y"
         ).upper()
     except ValueError:
-        logger.error("Invalid Angel One expiry date: %s", expiry_str)
+        logger.warning("Invalid Angel One expiry date: %s; will attempt fallback", expiry_str)
         return {}
 
     search_term = f"{NIFTY50_SYMBOL}{expiry_symbol}{int(strike)}{option_type}"
@@ -816,9 +869,9 @@ def resolve_option_token(
             _save_token_to_disk(str_key, resolved)
             return resolved
 
-    # Only log ERROR when BOTH master and searchScrip fail
-    logger.error(
-        "Failed to resolve NIFTY option token for %s (expiry=%s, strike=%s, type=%s) across master and searchScrip",
+    # Master and searchScrip both failed to resolve Angel One token; warn and let Upstox fallback handle it
+    logger.warning(
+        "Failed to resolve Angel One option token for %s (expiry=%s, strike=%s, type=%s) across master and searchScrip; will attempt fallback",
         search_term, expiry_str, strike, option_type
     )
     return {}
@@ -878,6 +931,7 @@ def get_nifty_option_chain(
                 "Angel One Call LTP unavailable; recovered Call LTP=%.2f from Upstox API",
                 result["call"]["ltp"]
             )
+            call_ltp = result["call"]["ltp"]
         if put_ltp <= 0.0 and "put" in upstox_quotes:
             if not result.get("put"):
                 result["put"] = {
@@ -892,5 +946,20 @@ def get_nifty_option_chain(
                 "Angel One Put LTP unavailable; recovered Put LTP=%.2f from Upstox API",
                 result["put"]["ltp"]
             )
+            put_ltp = result["put"]["ltp"]
+
+    # Only log ERROR when BOTH Angel One and Upstox fallback fail to retrieve LTP
+    if call_strike > 0 and call_ltp <= 0.0:
+        call_sym = (result.get("call") or {}).get("trading_symbol") or f"NIFTY{expiry_str}{call_strike}CE"
+        logger.error(
+            "Failed to retrieve Call LTP for %s across Angel One and Upstox fallback",
+            call_sym
+        )
+    if put_strike > 0 and put_ltp <= 0.0:
+        put_sym = (result.get("put") or {}).get("trading_symbol") or f"NIFTY{expiry_str}{put_strike}PE"
+        logger.error(
+            "Failed to retrieve Put LTP for %s across Angel One and Upstox fallback",
+            put_sym
+        )
 
     return result
