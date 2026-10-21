@@ -57,8 +57,10 @@ except ImportError:
         return None
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+CHEAPERINFERENCE_API_URL = "https://api.cheaperinference.com/v1/chat/completions"
 DEFAULT_SQLITE_DIR = os.getenv("SQLITE_DIR", "/home/ubuntu/sqlite")
 REDIS_FINANCE_MODELS_KEY = "finance_llm_models"
+REDIS_CHEAPER_MODELS_KEY = "cheaperinference_llm_models"
 FALLBACK_MODELS = [
     "deepseek/deepseek-v4-pro",
     "minimax/minimax-m3",
@@ -148,6 +150,53 @@ def fetch_redis_models() -> List[str]:
     except Exception as e:
         logger.warning(f"Could not load '{REDIS_FINANCE_MODELS_KEY}' from Redis: {e}")
     return FALLBACK_MODELS
+
+
+def fetch_cheaper_redis_models() -> List[str]:
+    """Fetch ordered model list from Redis Cloud key 'cheaperinference_llm_models'."""
+    try:
+        r = get_redis_client()
+        if r:
+            val = r.get(REDIS_CHEAPER_MODELS_KEY)
+            if val:
+                parsed = json.loads(val)
+                if isinstance(parsed, list) and parsed:
+                    return [str(m).strip() for m in parsed if str(m).strip()]
+                elif isinstance(parsed, str) and parsed.strip():
+                    return [parsed.strip()]
+    except Exception as e:
+        logger.warning(f"Could not load '{REDIS_CHEAPER_MODELS_KEY}' from Redis: {e}")
+    return []
+
+
+def get_interleaved_strike_models(
+    finance_models: Optional[List[str]] = None,
+    cheaper_models: Optional[List[str]] = None
+) -> List[Tuple[str, str]]:
+    """
+    Construct 1-to-1 interleaved sequence:
+    [(provider, model_name), ...]
+    where provider is 'openrouter' or 'cheaperinference'.
+    """
+    or_models = finance_models if finance_models is not None else fetch_redis_models()
+    ci_models = cheaper_models if cheaper_models is not None else fetch_cheaper_redis_models()
+
+    has_or_key = bool(os.getenv("OPENROUTER_API_KEY"))
+    has_ci_key = bool(os.getenv("CHEAPERINFERENCE_API_KEY"))
+
+    candidates: List[Tuple[str, str]] = []
+    max_len = max(len(or_models), len(ci_models))
+    for i in range(max_len):
+        if i < len(or_models) and has_or_key:
+            item = ("openrouter", or_models[i])
+            if item not in candidates:
+                candidates.append(item)
+        if i < len(ci_models) and has_ci_key:
+            item = ("cheaperinference", ci_models[i])
+            if item not in candidates:
+                candidates.append(item)
+
+    return candidates
 
 
 def load_market_context_for_strikes(
@@ -454,24 +503,47 @@ def build_strike_selection_prompt(
 def call_openrouter_strike_selector(
     system_prompt: str,
     user_prompt: str,
-    models: List[str]
+    models: Optional[List[str]] = None,
+    interleaved_candidates: Optional[List[Tuple[str, str]]] = None
 ) -> Optional[Tuple[Dict[str, Any], str]]:
-    """Query OpenRouter using sequential model fallback chain."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        logger.warning("OPENROUTER_API_KEY not found in environment. Using fallback.")
+    """Query AI strike selector using 1-to-1 interleaved candidate fallback chain."""
+    val = os.getenv("ENABLE_LLM_INFERENCE", "true").strip().lower()
+    if val not in ("true", "1", "yes"):
+        logger.info("LLM inference is disabled via ENABLE_LLM_INFERENCE=false. Bypassing strike selector.")
         return None
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/sudheer628/nifty50_strategies",
-        "X-Title": "Nifty50 Strategy Strike Selector"
-    }
+    api_key_or = os.getenv("OPENROUTER_API_KEY")
+    api_key_ci = os.getenv("CHEAPERINFERENCE_API_KEY")
 
-    for model in models:
+    if not api_key_or and not api_key_ci:
+        logger.warning("Neither OPENROUTER_API_KEY nor CHEAPERINFERENCE_API_KEY found in environment. Using fallback.")
+        return None
+
+    if interleaved_candidates is not None:
+        candidates = interleaved_candidates
+    elif models is not None:
+        candidates = get_interleaved_strike_models(finance_models=models)
+    else:
+        candidates = get_interleaved_strike_models()
+
+    for provider, model in candidates:
+        if provider == "openrouter":
+            url = OPENROUTER_API_URL
+            headers = {
+                "Authorization": f"Bearer {api_key_or}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/sudheer628/nifty50_strategies",
+                "X-Title": "Nifty50 Strategy Strike Selector"
+            }
+        else:
+            url = CHEAPERINFERENCE_API_URL
+            headers = {
+                "Authorization": f"Bearer {api_key_ci}",
+                "Content-Type": "application/json"
+            }
+
         try:
-            logger.info(f"Attempting AI strike selection via model: {model}")
+            logger.info(f"Attempting AI strike selection via [{provider}] model: {model}")
             payload = {
                 "model": model,
                 "messages": [
@@ -483,23 +555,24 @@ def call_openrouter_strike_selector(
                 "response_format": {"type": "json_object"}
             }
 
-            resp = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=7)
+            resp = requests.post(url, headers=headers, json=payload, timeout=7)
             if resp.status_code == 200:
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"].strip()
-                
+
                 # Parse JSON
                 if content.startswith("```"):
                     content = content.split("```")[1]
                     if content.startswith("json"):
                         content = content[4:]
                 parsed = json.loads(content.strip())
-                logger.info(f"Successfully generated strikes via {model}: Call={parsed.get('call_strike')}, Put={parsed.get('put_strike')}")
-                return parsed, model
+                model_tag = f"cheaperinference/{model}" if provider == "cheaperinference" else model
+                logger.info(f"Successfully generated strikes via [{provider}] {model}: Call={parsed.get('call_strike')}, Put={parsed.get('put_strike')}")
+                return parsed, model_tag
             else:
-                logger.warning(f"Model {model} returned HTTP {resp.status_code}: {resp.text[:150]}")
+                logger.warning(f"[{provider}] Model {model} returned HTTP {resp.status_code}: {resp.text[:150]}")
         except Exception as e:
-            logger.warning(f"Model {model} failed: {e}")
+            logger.warning(f"[{provider}] Model {model} failed: {e}")
 
     return None
 
@@ -605,7 +678,10 @@ def select_strikes(
     _LAST_TARGET_CALL_DELTA = default_call_delta
     _LAST_TARGET_PUT_DELTA = default_put_delta
 
-    if force_static or not os.getenv("OPENROUTER_API_KEY"):
+    val = os.getenv("ENABLE_LLM_INFERENCE", "true").strip().lower()
+    llm_enabled = val in ("true", "1", "yes")
+    has_ai_key = bool(os.getenv("OPENROUTER_API_KEY") or os.getenv("CHEAPERINFERENCE_API_KEY"))
+    if force_static or not llm_enabled or not has_ai_key:
         return (
             asym_put if not force_static else static_put,
             asym_call if not force_static else static_call,
@@ -628,9 +704,9 @@ def select_strikes(
         moneyness_mode=effective_mode
     )
 
-    # 3. Fetch model chain & query OpenRouter
-    models = fetch_redis_models()
-    result = call_openrouter_strike_selector(sys_p, user_p, models)
+    # 3. Fetch model chain & query AI strike selector
+    candidates = get_interleaved_strike_models()
+    result = call_openrouter_strike_selector(sys_p, user_p, interleaved_candidates=candidates)
 
     if result:
         parsed_json, used_model = result
