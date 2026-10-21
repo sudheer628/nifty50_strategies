@@ -10,8 +10,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from common.angelone_client import (
+    clear_token_cache,
     get_nifty_option_chain,
     get_nifty_spot,
+    get_option_ltp,
     resolve_option_token,
 )
 from common.expiry import get_next_weekly_expiry, format_expiry_angelone
@@ -78,6 +80,9 @@ class ExpiryTests(unittest.TestCase):
 
 
 class InstrumentResolutionTests(unittest.TestCase):
+    def setUp(self):
+        clear_token_cache()
+
     def test_nifty_spot_constants(self):
         self.assertEqual(NIFTY50_TOKEN, "99926000")
         self.assertEqual(NIFTY50_TRADING_SYMBOL, "Nifty 50")
@@ -203,6 +208,106 @@ class InstrumentResolutionTests(unittest.TestCase):
         )
         self.assertEqual(result["call"]["ltp"], 101.25)
         self.assertEqual(result["put"]["ltp"], 88.5)
+
+    @patch(
+        "common.angelone_client.get_instrument_master",
+        return_value=CURRENT_CONTRACTS,
+    )
+    def test_token_caching_avoids_repeated_resolution(self, mock_master):
+        res1 = resolve_option_token("11AUG2026", 24500, "PE")
+        self.assertEqual(res1["token"], "41012")
+        self.assertEqual(mock_master.call_count, 1)
+
+        # Second call should hit the cache without calling get_instrument_master again
+        res2 = resolve_option_token("11AUG2026", 24500, "PE")
+        self.assertEqual(res2["token"], "41012")
+        self.assertEqual(mock_master.call_count, 1)
+
+    @patch("common.angelone_client.get_redis_client")
+    @patch("common.angelone_client.requests.get")
+    @patch("common.angelone_client.get_instrument_master", return_value=CURRENT_CONTRACTS)
+    @patch("common.angelone_client.build_headers", return_value={"test": "header"})
+    @patch("common.angelone_client.requests.post")
+    def test_option_chain_falls_back_to_upstox_when_angelone_ltp_empty(
+        self, mock_post, _headers, _master, mock_upstox_get, mock_redis
+    ):
+        # Angel One returns empty fetched list
+        response = Mock(status_code=200)
+        response.text = '{"status": true}'
+        response.json.return_value = {
+            "status": True,
+            "data": {"fetched": [], "unfetched": []},
+        }
+        mock_post.return_value = response
+
+        # Mock Redis returning an Upstox access token
+        mock_r = Mock()
+        mock_r.get.return_value = "fake_upstox_token"
+        mock_redis.return_value = mock_r
+
+        # Mock Upstox option chain response
+        upstox_resp = Mock(status_code=200)
+        upstox_resp.json.return_value = {
+            "status": "success",
+            "data": [
+                {
+                    "strike_price": 24700,
+                    "call_options": {
+                        "instrument_key": "NSE_FO|41020",
+                        "market_data": {"ltp": 105.50},
+                    },
+                },
+                {
+                    "strike_price": 24500,
+                    "put_options": {
+                        "instrument_key": "NSE_FO|41012",
+                        "market_data": {"ltp": 92.00},
+                    },
+                },
+            ],
+        }
+        mock_upstox_get.return_value = upstox_resp
+
+        result = get_nifty_option_chain("11AUG2026", 24700, 24500)
+        self.assertEqual(result["call"]["ltp"], 105.50)
+        self.assertEqual(result["call"]["source"], "upstox_api")
+        self.assertEqual(result["put"]["ltp"], 92.00)
+        self.assertEqual(result["put"]["source"], "upstox_api")
+
+    @patch("common.angelone_client.get_redis_client")
+    @patch("common.angelone_client.requests.get")
+    @patch("common.angelone_client.build_headers", return_value={"test": "header"})
+    @patch("common.angelone_client.requests.post")
+    def test_get_option_ltp_falls_back_to_upstox_on_angelone_failure(
+        self, mock_post, _headers, mock_upstox_get, mock_redis
+    ):
+        # Angel One call fails (HTTP 500)
+        mock_post.return_value = Mock(status_code=500, text="Internal Error")
+
+        # Mock Redis
+        mock_r = Mock()
+        mock_r.get.return_value = "fake_upstox_token"
+        mock_redis.return_value = mock_r
+
+        # Mock Upstox option chain response
+        upstox_resp = Mock(status_code=200)
+        upstox_resp.json.return_value = {
+            "status": "success",
+            "data": [
+                {
+                    "strike_price": 24500,
+                    "put_options": {
+                        "instrument_key": "NSE_FO|41012",
+                        "market_data": {"ltp": 95.25},
+                    },
+                },
+            ],
+        }
+        mock_upstox_get.return_value = upstox_resp
+
+        result = get_option_ltp("NFO", "NIFTY11AUG2624500PE", "41012")
+        self.assertEqual(result["ltp"], 95.25)
+        self.assertEqual(result["source"], "upstox_api")
 
 
 if __name__ == "__main__":
