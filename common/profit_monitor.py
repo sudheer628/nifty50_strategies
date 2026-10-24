@@ -24,6 +24,8 @@ from config import (
     PEAK_ALERT_HYSTERESIS_PTS,
     PEAK_ALERT_ENABLED,
     DISCORD_URL,
+    DISCORD_EXIT_3DAY,
+    DISCORD_EXIT_5DAY,
 )
 from common.storage import update_active_peak_state
 
@@ -265,6 +267,7 @@ def evaluate_peak_profit(
         "fsm_total_gainloss": fsm_total_gainloss,
         "dry_run": dry_run,
         "track_label": track_label,
+        "track": "thursday" if ("3-day" in str(track_label).lower() or "thursday" in str(track_label).lower()) else "weekly",
     }
 
     dispatch_ok = on_new_peak(event)
@@ -324,6 +327,37 @@ def on_new_peak(event: Dict[str, Any]) -> bool:
     return dispatch_success
 
 
+def resolve_discord_peak_url(track: Optional[str] = None, track_label: Optional[str] = None) -> str:
+    """
+    Resolve track-specific Discord Webhook URL for peak profit alerts.
+    Priority:
+      3-Day Strategy: DISCORD_EXIT_3DAY -> DISCORD_URL_3DAY -> DISCORD_URL
+      5-Day Strategy: DISCORD_EXIT_5DAY -> DISCORD_URL_5DAY -> DISCORD_URL
+    """
+    is_3day = False
+    if track and "thu" in str(track).lower():
+        is_3day = True
+    elif track_label and ("3-day" in str(track_label).lower() or "thursday" in str(track_label).lower()):
+        is_3day = True
+
+    if is_3day:
+        return (
+            os.getenv("DISCORD_EXIT_3DAY", "").strip()
+            or os.getenv("DISCORD_URL_3DAY", "").strip()
+            or DISCORD_EXIT_3DAY
+            or os.getenv("DISCORD_URL", "").strip()
+            or DISCORD_URL
+        )
+    else:
+        return (
+            os.getenv("DISCORD_EXIT_5DAY", "").strip()
+            or os.getenv("DISCORD_URL_5DAY", "").strip()
+            or DISCORD_EXIT_5DAY
+            or os.getenv("DISCORD_URL", "").strip()
+            or DISCORD_URL
+        )
+
+
 def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     """
     Send formatted peak-profit alert to Discord channel via Webhook.
@@ -331,7 +365,7 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     Webhook URL is fetched from DISCORD_URL environment variable or config.
     Wrapped with robust error isolation so collection/monitor runs never crash on webhook issues.
     """
-    webhook_url = os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
+    webhook_url = resolve_discord_peak_url(track=event.get("track"), track_label=event.get("track_label"))
     if not webhook_url:
         logger.warning(
             "Peak profit alert Discord notification skipped: DISCORD_URL not set in environment or config."

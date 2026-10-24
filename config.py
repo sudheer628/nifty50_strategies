@@ -67,6 +67,8 @@ PEAK_ALERT_HYSTERESIS_PCT = float(os.getenv("PEAK_ALERT_HYSTERESIS_PCT", "5.0"))
 PEAK_ALERT_HYSTERESIS_PTS = float(os.getenv("PEAK_ALERT_HYSTERESIS_PTS", "10.0"))
 PEAK_ALERT_ENABLED = os.getenv("PEAK_ALERT_ENABLED", "true").lower() in ("true", "1", "yes")
 DISCORD_URL = os.getenv("DISCORD_URL", "").strip()
+DISCORD_EXIT_3DAY = os.getenv("DISCORD_EXIT_3DAY", os.getenv("DISCORD_URL_3DAY", "")).strip()
+DISCORD_EXIT_5DAY = os.getenv("DISCORD_EXIT_5DAY", os.getenv("DISCORD_URL_5DAY", "")).strip()
 
 # ---------------------------------------------------------------------------
 # MongoDB Atlas Database Configuration (Derivatives & Predictions)
