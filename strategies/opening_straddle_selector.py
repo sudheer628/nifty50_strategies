@@ -21,8 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from common.angelone_client import (
     get_nifty_spot,
-    get_option_ltp,
-    resolve_option_token,
+    get_nifty_option_chain,
 )
 from common.expiry import format_expiry_angelone
 from strategies.opening_straddle_engine import (
@@ -73,10 +72,17 @@ def run_opening_straddle(
 
     # 3. Step 3: Spot Discovery & ATM Strike Anchor (09:15:05 AM)
     logger.info("Step 3: Sampling 09:15:05 AM spot price anchor...")
-    spot_val = get_nifty_spot()
-    if spot_val is None or spot_val <= 0:
+    spot_res = get_nifty_spot()
+    if isinstance(spot_res, dict):
+        spot_val = float(spot_res.get("ltp") or 0.0)
+    elif spot_res is not None:
+        spot_val = float(spot_res)
+    else:
+        spot_val = 0.0
+
+    if spot_val <= 0:
         if intel.nifty_spot and intel.nifty_spot > 0:
-            spot_val = intel.nifty_spot
+            spot_val = float(intel.nifty_spot)
             logger.info("Using feed cache spot fallback: %.2f", spot_val)
         else:
             logger.error("Unable to obtain valid Nifty spot price. Aborting session.")
@@ -85,32 +91,37 @@ def run_opening_straddle(
     atm_strike = int(round(spot_val / 50.0) * 50)
     logger.info("Spot Anchor: %.2f -> ATM Strike: %d", spot_val, atm_strike)
 
-    # Resolve Call & Put Tokens
-    ce_token = resolve_option_token(atm_strike, "CE", expiry_angel)
-    pe_token = resolve_option_token(atm_strike, "PE", expiry_angel)
-    if not ce_token or not pe_token:
+    # 4. Step 4: Resolve Option Chain Quotes & Execution Quality Gate
+    logger.info("Step 4: Fetching option chain quotes for %s strike %d...", expiry_angel, atm_strike)
+    chain = get_nifty_option_chain(expiry_angel, atm_strike, atm_strike)
+    call_info = chain.get("call") or {}
+    put_info = chain.get("put") or {}
+
+    ce_ltp = float(call_info.get("ltp") or 0.0)
+    pe_ltp = float(put_info.get("ltp") or 0.0)
+
+    if ce_ltp <= 0.0 or pe_ltp <= 0.0:
         logger.error(
-            "Failed to resolve option tokens for strike %d (CE=%s, PE=%s). Aborting.",
+            "Failed to fetch option LTPs for strike %d (CE=%.2f, PE=%.2f). Aborting.",
             atm_strike,
-            ce_token,
-            pe_token,
+            ce_ltp,
+            pe_ltp,
         )
         return 1
 
-    # 4. Step 4: Execution Quality Gate (Spread check)
-    ce_quote = get_option_ltp(f"NIFTY{atm_strike}CE", ce_token, mode="FULL")
-    pe_quote = get_option_ltp(f"NIFTY{atm_strike}PE", pe_token, mode="FULL")
+    ce_token = str(call_info.get("token") or "")
+    pe_token = str(put_info.get("token") or "")
+    ce_symbol = str(call_info.get("trading_symbol") or f"NIFTY{atm_strike}CE")
+    pe_symbol = str(put_info.get("trading_symbol") or f"NIFTY{atm_strike}PE")
 
-    ce_bid = float(ce_quote.get("bid", 0.0))
-    ce_ask = float(ce_quote.get("ask", 0.0))
-    ce_ltp = float(ce_quote.get("ltp", 0.0))
-
-    pe_bid = float(pe_quote.get("bid", 0.0))
-    pe_ask = float(pe_quote.get("ask", 0.0))
-    pe_ltp = float(pe_quote.get("ltp", 0.0))
+    # Bid/Ask from chain (or fallback to tight spread around LTP if depth unavailable)
+    ce_bid = float(call_info.get("bid") or (ce_ltp * 0.998))
+    ce_ask = float(call_info.get("ask") or (ce_ltp * 1.002))
+    pe_bid = float(put_info.get("bid") or (pe_ltp * 0.998))
+    pe_ask = float(put_info.get("ask") or (pe_ltp * 1.002))
 
     call_leg = StraddleLegQuote(
-        symbol=f"NIFTY{atm_strike}CE",
+        symbol=ce_symbol,
         token=ce_token,
         strike=atm_strike,
         option_type="CE",
@@ -119,7 +130,7 @@ def run_opening_straddle(
         ltp=ce_ltp,
     )
     put_leg = StraddleLegQuote(
-        symbol=f"NIFTY{atm_strike}PE",
+        symbol=pe_symbol,
         token=pe_token,
         strike=atm_strike,
         option_type="PE",
@@ -150,14 +161,24 @@ def run_opening_straddle(
                 break
 
             # Fetch fresh quotes
-            curr_spot = get_nifty_spot() or spot_val
-            ce_tick = get_option_ltp(f"NIFTY{atm_strike}CE", ce_token, mode="FULL")
-            pe_tick = get_option_ltp(f"NIFTY{atm_strike}PE", pe_token, mode="FULL")
+            fresh_spot_res = get_nifty_spot()
+            if isinstance(fresh_spot_res, dict):
+                curr_spot = float(fresh_spot_res.get("ltp") or spot_val)
+            elif fresh_spot_res is not None:
+                curr_spot = float(fresh_spot_res)
+            else:
+                curr_spot = spot_val
 
-            c_bid = float(ce_tick.get("bid", ce_tick.get("ltp", 0.0)))
-            c_ask = float(ce_tick.get("ask", ce_tick.get("ltp", 0.0)))
-            p_bid = float(pe_tick.get("bid", pe_tick.get("ltp", 0.0)))
-            p_ask = float(pe_tick.get("ask", pe_tick.get("ltp", 0.0)))
+            chain_tick = get_nifty_option_chain(expiry_angel, atm_strike, atm_strike)
+            c_info = chain_tick.get("call") or {}
+            p_info = chain_tick.get("put") or {}
+
+            c_ltp = float(c_info.get("ltp") or ce_ltp)
+            p_ltp = float(p_info.get("ltp") or pe_ltp)
+            c_bid = float(c_info.get("bid") or c_ltp)
+            c_ask = float(c_info.get("ask") or c_ltp)
+            p_bid = float(p_info.get("bid") or p_ltp)
+            p_ask = float(p_info.get("ask") or p_ltp)
 
             tick = TickObservation(
                 ts=now_ts,
@@ -166,8 +187,8 @@ def run_opening_straddle(
                 call_ask=c_ask,
                 put_bid=p_bid,
                 put_ask=p_ask,
-                call_ltp=float(ce_tick.get("ltp", 0.0)),
-                put_ltp=float(pe_tick.get("ltp", 0.0)),
+                call_ltp=c_ltp,
+                put_ltp=p_ltp,
             )
 
             engine.process_tick(tick)
