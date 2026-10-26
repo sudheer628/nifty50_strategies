@@ -370,7 +370,7 @@ class ProfitMonitorTests(unittest.TestCase):
         }
         with patch.dict(
             os.environ,
-            {"DISCORD_URL": "https://discord.com/api/webhooks/test-webhook-url"},
+            {"DISCORD_URL": "https://discord.com/api/webhooks/test-webhook-url", "DISCORD_EXIT_5DAY": "", "DISCORD_URL_5DAY": ""},
             clear=False,
         ):
             success = send_peak_alert_discord(event)
@@ -426,7 +426,7 @@ class ProfitMonitorTests(unittest.TestCase):
         }
         with patch.dict(
             os.environ,
-            {"DISCORD_URL": "https://discord.com/api/webhooks/test-webhook-url"},
+            {"DISCORD_URL": "https://discord.com/api/webhooks/test-webhook-url", "DISCORD_EXIT_5DAY": "", "DISCORD_URL_5DAY": ""},
             clear=False,
         ):
             success = send_peak_alert_discord(event)
@@ -458,7 +458,7 @@ class ProfitMonitorTests(unittest.TestCase):
         }
         with patch.dict(
             os.environ,
-            {"DISCORD_URL": "https://discord.com/api/webhooks/test-webhook-url"},
+            {"DISCORD_URL": "https://discord.com/api/webhooks/test-webhook-url", "DISCORD_EXIT_5DAY": "", "DISCORD_URL_5DAY": ""},
             clear=False,
         ):
             # Should safely catch exception and return False
@@ -474,8 +474,8 @@ class ProfitMonitorTests(unittest.TestCase):
             "combined_pnl_pts": 43.0,
             "combined_pnl_inr": 2795.0,
         }
-        with patch.dict(os.environ, {"DISCORD_URL": ""}, clear=False):
-            with patch("common.profit_monitor.DISCORD_URL", ""):
+        with patch.dict(os.environ, {"DISCORD_URL": "", "DISCORD_EXIT_5DAY": "", "DISCORD_URL_5DAY": ""}, clear=False):
+            with patch("common.profit_monitor.DISCORD_URL", ""), patch("common.profit_monitor.DISCORD_EXIT_5DAY", ""):
                 success = send_peak_alert_discord(event)
                 self.assertFalse(success)
 

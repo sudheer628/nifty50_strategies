@@ -74,7 +74,8 @@ def test_resolve_straddle_discord_webhook_priority(monkeypatch):
     assert resolve_straddle_discord_webhook() == ""
 
 
-def test_send_straddle_entry_alert_no_webhook(monkeypatch, sample_intel):
+@patch("requests.post")
+def test_send_straddle_entry_alert_no_webhook(mock_post, monkeypatch, sample_intel):
     monkeypatch.delenv("DISCORD_OPENING_STRADDLE", raising=False)
     monkeypatch.delenv("DISCORD_URL", raising=False)
     monkeypatch.delenv("DISCORD_WATCHDOG_URL", raising=False)
@@ -88,6 +89,7 @@ def test_send_straddle_entry_alert_no_webhook(monkeypatch, sample_intel):
         trade_date="2026-10-27",
     )
     assert success is False
+    assert not mock_post.called
 
 
 @patch("requests.post")

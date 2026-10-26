@@ -33,25 +33,22 @@ COLOR_STOP_LOSS = 0xE74C3C    # Red
 COLOR_TRAILING = 0xF39C12     # Amber / Gold
 
 
-def _ensure_dotenv_loaded():
-    """Loads environment variables strictly from repository root .env."""
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    if env_path.is_file():
-        load_dotenv(dotenv_path=env_path, override=False)
-    else:
-        load_dotenv(override=False)
+# Load .env once on module import
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+if _env_path.is_file():
+    load_dotenv(dotenv_path=_env_path, override=False)
+else:
+    load_dotenv(override=False)
 
 
 def resolve_straddle_discord_webhook() -> str:
     """
     Resolves the dedicated Discord webhook URL for opening straddle alerts.
-    Strictly reads DISCORD_OPENING_STRADDLE from .env or environment to prevent
-    spillover into general channels.
+    Strictly reads DISCORD_OPENING_STRADDLE from environment / .env.
     """
-    _ensure_dotenv_loaded()
     webhook = os.getenv("DISCORD_OPENING_STRADDLE", "").strip()
     if not webhook:
-        logger.debug("DISCORD_OPENING_STRADDLE is not configured in .env.")
+        logger.debug("DISCORD_OPENING_STRADDLE is not configured.")
     return webhook
 
 

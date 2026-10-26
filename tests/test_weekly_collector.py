@@ -113,6 +113,7 @@ class CycleSnapshotTests(unittest.TestCase):
         self.assertEqual(record["gainloss"], 6.0)
         insert_snapshot.assert_called_once()
 
+    @patch("common.ai_strike_selector.call_openrouter_strike_selector", return_value=None)
     @patch("strategies.weekly_option_collector.insert_record")
     @patch("strategies.weekly_option_collector.insert_buy_snapshot")
     @patch("strategies.weekly_option_collector.save_active_snapshot")
@@ -137,6 +138,7 @@ class CycleSnapshotTests(unittest.TestCase):
         save_snapshot,
         _insert_snapshot,
         insert_record,
+        _mock_ai,
     ):
         get_spot.return_value = {
             "ltp": 25000.0,
