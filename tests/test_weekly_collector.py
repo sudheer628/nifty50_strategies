@@ -296,11 +296,11 @@ class CycleSnapshotTests(unittest.TestCase):
         snapshot = save_snapshot.call_args.args[0]
         self.assertEqual(snapshot["week_start_date"], "20261021")
         self.assertEqual(snapshot["expiry_date"], "20261027")
-        self.assertTrue(snapshot["cycle_id"].startswith("20261021"))
+        self.assertEqual(snapshot["cycle_id"], "CYCLE-TUE-20261021")
 
         record = insert_record.call_args.args[1]
         self.assertEqual(record["expiry_date"], "20261027")
-        self.assertTrue(record["cycle_id"].startswith("20261021"))
+        self.assertEqual(record["cycle_id"], "CYCLE-TUE-20261021")
 
 
 if __name__ == "__main__":

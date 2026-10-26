@@ -676,15 +676,15 @@ def update_active_peak_state(peak_data: dict, filepath: Optional[str] = None) ->
 
 def generate_cycle_id(start_date_str: str) -> str:
     """
-    Generate a unique cycle identifier.
+    Generate a unique cycle identifier for the weekly/Tuesday strategy.
 
-    Combines a date prefix with a short UUID for uniqueness.
+    Mirrors the Thursday track format (e.g. CYCLE-THU-YYYYMMDD) for consistency:
+    ``"CYCLE-TUE-YYYYMMDD"``.
 
     Args:
         start_date_str:  Week start date as ``"YYYYMMDD"``.
 
     Returns:
-        String like ``"20260804-a1b2c3d4"``.
+        String like ``"CYCLE-TUE-20261027"``.
     """
-    short_uuid = uuid.uuid4().hex[:8]
-    return f"{start_date_str}-{short_uuid}"
+    return f"CYCLE-TUE-{start_date_str}"
