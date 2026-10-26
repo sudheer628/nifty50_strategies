@@ -50,6 +50,7 @@ def run_opening_straddle(
     db_path: Optional[str] = None,
     poll_interval_sec: float = 1.0,
     max_duration_sec: int = 2700,  # 45 minutes
+    enable_alerts: bool = True,
 ) -> int:
     """
     Main orchestrator running the daily opening straddle cycle from 09:14 to 10:00 AM.
@@ -145,6 +146,7 @@ def run_opening_straddle(
         trade_date=datetime.now().strftime("%Y-%m-%d"),
         expiry_date=target_expiry.strftime("%Y-%m-%d"),
         db_path=db_path,
+        enable_alerts=enable_alerts,
     )
 
     if not engine.arm_entry(spot_price=spot_val, call_quote=call_leg, put_quote=put_leg):
@@ -203,15 +205,76 @@ def run_opening_straddle(
     return 0
 
 
+def print_session_report(db_path: Optional[str] = None) -> int:
+    """Prints recent sessions recorded in opening_straddle.db."""
+    default_db = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "opening_straddle.db"
+    )
+    target_db = db_path or os.getenv("OPENING_STRADDLE_DB", default_db)
+    if not os.path.isfile(target_db):
+        print(f"Opening straddle database not found at: {target_db}")
+        return 0
+
+    import sqlite3
+    with sqlite3.connect(target_db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT trade_date, atm_strike, bias_classification, selected_leg,
+                   net_pnl_inr, net_roi_pct, peak_roi_pct, exit_reason, status
+            FROM opening_straddle_sessions
+            ORDER BY trade_date DESC LIMIT 30
+            """
+        ).fetchall()
+
+    if not rows:
+        print(f"No sessions found in {target_db}")
+        return 0
+
+    print("=" * 88)
+    print(" NIFTY 50 OPENING STRADDLE - HISTORICAL SESSIONS")
+    print("=" * 88)
+    header = f"{'Date':<11} | {'ATM':<6} | {'Prior Bias':<14} | {'Leg':<8} | {'Net P&L':>11} | {'ROI %':>8} | {'Peak %':>8} | {'Exit Reason':<14}"
+    print(header)
+    print("-" * 88)
+    for r in rows:
+        pnl_str = f"INR {r['net_pnl_inr']:+,.2f}" if r["net_pnl_inr"] is not None else "N/A"
+        roi_str = f"{r['net_roi_pct']:+.2f}%" if r["net_roi_pct"] is not None else "N/A"
+        peak_str = f"{r['peak_roi_pct']:+.2f}%" if r["peak_roi_pct"] is not None else "N/A"
+        bias = (r["bias_classification"] or "N/A")[:14]
+        leg = (r["selected_leg"] or "N/A")[:8]
+        exit_r = (r["exit_reason"] or "N/A")[:14]
+        print(f"{r['trade_date']:<11} | {r['atm_strike']:<6} | {bias:<14} | {leg:<8} | {pnl_str:>11} | {roi_str:>8} | {peak_str:>8} | {exit_r:<14}")
+    print("=" * 88)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="NIFTY 50 Opening Straddle Strategy (09:15 - 10:00 AM)")
     parser.add_argument("--dry-run", action="store_true", default=True, help="Tracking mode (order placement is out of scope)")
     parser.add_argument("--db-path", type=str, help="Custom SQLite database path")
+    parser.add_argument("--no-alerts", action="store_true", help="Disable Discord webhook notifications")
+    parser.add_argument("--report", action="store_true", help="Print recent strategy sessions from database and exit")
+    parser.add_argument("--send-report", action="store_true", help="Send Discord completion report to DISCORD_OPENING_STRADDLE")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
+    if args.report:
+        return print_session_report(db_path=args.db_path)
+
+    if args.send_report:
+        from strategies.opening_straddle_alerts import send_daily_session_report_from_db
+        setup_cli_logging(args.log_level)
+        success = send_daily_session_report_from_db(db_path=args.db_path)
+        if success:
+            logger.info("Opening straddle completion report dispatched to DISCORD_OPENING_STRADDLE.")
+            return 0
+        else:
+            logger.warning("Could not dispatch Discord report (check DISCORD_OPENING_STRADDLE in .env).")
+            return 1
+
     setup_cli_logging(args.log_level)
-    return run_opening_straddle(db_path=args.db_path)
+    return run_opening_straddle(db_path=args.db_path, enable_alerts=not args.no_alerts)
 
 
 if __name__ == "__main__":

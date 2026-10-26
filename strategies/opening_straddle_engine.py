@@ -17,6 +17,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from common.calendar_utils import check_nse_holiday
+from strategies.opening_straddle_alerts import (
+    send_decoupling_alert,
+    send_straddle_entry_alert,
+    send_straddle_exit_summary,
+)
 from strategies.opening_straddle_models import (
     BiasClassification,
     ConfidenceLevel,
@@ -133,9 +138,14 @@ def init_opening_straddle_db(db_path: str):
                 peak_roi_pct REAL,
                 spot_confirmed_ticks INTEGER,
                 exit_reason TEXT,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                report_sent INTEGER DEFAULT 0
             )
         """)
+        try:
+            conn.execute("ALTER TABLE opening_straddle_sessions ADD COLUMN report_sent INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 
@@ -156,6 +166,7 @@ class OpeningStraddleEngine:
         stop_loss_roi: float = DEFAULT_STOP_LOSS_ROI,
         trailing_trigger_roi: float = DEFAULT_TRAILING_TRIGGER_ROI,
         trailing_drop_roi: float = DEFAULT_TRAILING_DROP_ROI,
+        enable_alerts: bool = False,
     ):
         self.pre_market = pre_market
         self.trade_date = trade_date or datetime.now().strftime("%Y-%m-%d")
@@ -166,6 +177,7 @@ class OpeningStraddleEngine:
         self.stop_loss_roi = stop_loss_roi
         self.trailing_trigger_roi = trailing_trigger_roi
         self.trailing_drop_roi = trailing_drop_roi
+        self.enable_alerts = enable_alerts
 
         default_db = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "opening_straddle.db"
@@ -249,6 +261,20 @@ class OpeningStraddleEngine:
             p0,
             self.total_debit_inr,
         )
+
+        if self.enable_alerts:
+            try:
+                send_straddle_entry_alert(
+                    atm_strike=self.atm_strike,
+                    call_entry=c0,
+                    put_entry=p0,
+                    total_debit_inr=self.total_debit_inr,
+                    intel=self.pre_market,
+                    trade_date=self.trade_date,
+                )
+            except Exception as exc:
+                logger.warning("Failed to dispatch entry alert: %s", exc)
+
         return True
 
     def process_tick(
@@ -466,6 +492,22 @@ class OpeningStraddleEngine:
                 self.call_leg.pnl_pct,
             )
 
+        if self.enable_alerts:
+            try:
+                closed_quote = self.put_leg if closed_leg == SelectedLeg.PUT else self.call_leg
+                live_roi = (closed_quote.pnl_inr / self.total_debit_inr) * 100.0 if self.total_debit_inr > 0 else 0.0
+                send_decoupling_alert(
+                    checkpoint_name=checkpoint_name,
+                    selected_runner=runner,
+                    closed_leg=closed_leg,
+                    closed_exit_price=exit_price,
+                    closed_pnl_inr=closed_quote.pnl_inr,
+                    closed_pnl_pct=closed_quote.pnl_pct,
+                    live_roi_pct=live_roi,
+                )
+            except Exception as exc:
+                logger.warning("Failed to dispatch decoupling alert: %s", exc)
+
     def _monitor_runner_pnl(self, tick: TickObservation, elapsed_sec: float):
         """
         Monitors total straddle P&L safeguards while holding the runner leg.
@@ -582,7 +624,66 @@ class OpeningStraddleEngine:
             self.net_pnl_inr,
             self.net_roi_pct,
         )
+
+        if self.enable_alerts:
+            try:
+                send_decoupling_alert(
+                    checkpoint_name="09:25:00",
+                    selected_runner=SelectedLeg.SCRATCH,
+                    closed_leg=SelectedLeg.SCRATCH,
+                    closed_exit_price=0.0,
+                    closed_pnl_inr=gross_pnl,
+                    closed_pnl_pct=self.net_roi_pct,
+                    live_roi_pct=self.net_roi_pct,
+                )
+            except Exception as exc:
+                logger.warning("Failed to dispatch scratch decoupling alert: %s", exc)
+
         self._persist_session()
+
+    def to_session_record(self) -> StraddleSessionRecord:
+        """Constructs a StraddleSessionRecord dataclass from current engine state."""
+        call_entry = self.call_leg.entry_price if self.call_leg and self.call_leg.entry_price is not None else 0.0
+        put_entry = self.put_leg.entry_price if self.put_leg and self.put_leg.entry_price is not None else 0.0
+
+        if self.selected_runner == SelectedLeg.CALL:
+            closed_exit = self.put_leg.exit_price if self.put_leg else None
+            closed_pnl = self.put_leg.pnl_inr if self.put_leg else 0.0
+            runner_exit = self.call_leg.exit_price if self.call_leg else None
+            runner_pnl = self.call_leg.pnl_inr if self.call_leg else 0.0
+        elif self.selected_runner == SelectedLeg.PUT:
+            closed_exit = self.call_leg.exit_price if self.call_leg else None
+            closed_pnl = self.call_leg.pnl_inr if self.call_leg else 0.0
+            runner_exit = self.put_leg.exit_price if self.put_leg else None
+            runner_pnl = self.put_leg.pnl_inr if self.put_leg else 0.0
+        else:
+            closed_exit = None
+            closed_pnl = 0.0
+            runner_exit = None
+            runner_pnl = 0.0
+
+        return StraddleSessionRecord(
+            trade_date=self.trade_date,
+            expiry_date=self.expiry_date,
+            atm_strike=self.atm_strike or 0,
+            pre_market=self.pre_market,
+            call_entry_price=call_entry,
+            put_entry_price=put_entry,
+            total_debit_inr=self.total_debit_inr,
+            state=self.state,
+            selected_leg=self.selected_runner,
+            decision_time=self.decision_time_str,
+            closed_leg_exit_price=closed_exit,
+            closed_leg_pnl_inr=closed_pnl,
+            runner_exit_price=runner_exit,
+            runner_pnl_inr=runner_pnl,
+            net_pnl_inr=self.net_pnl_inr,
+            net_roi_pct=self.net_roi_pct,
+            peak_roi_pct=self.peak_roi_pct,
+            spot_confirmed_ticks=self.spot_confirmed_ticks,
+            exit_reason=self.exit_reason,
+            status=self.status,
+        )
 
     def _persist_session(self):
         """Persists the final session audit record to opening_straddle.db."""
@@ -639,3 +740,16 @@ class OpeningStraddleEngine:
             logger.info("Persisted session record to %s", self.db_path)
         except Exception as exc:
             logger.error("Failed to persist session record to %s: %s", self.db_path, exc)
+
+        if self.enable_alerts:
+            try:
+                sent = send_straddle_exit_summary(self.to_session_record())
+                if sent and self.db_path:
+                    with sqlite3.connect(self.db_path) as conn:
+                        conn.execute(
+                            "UPDATE opening_straddle_sessions SET report_sent = 1 WHERE trade_date = ?",
+                            (self.trade_date,),
+                        )
+                        conn.commit()
+            except Exception as exc:
+                logger.warning("Failed to dispatch exit summary alert: %s", exc)
