@@ -68,8 +68,8 @@ def send_straddle_entry_alert(
 
     date_label = trade_date or datetime.now().strftime("%Y-%m-%d")
     embed = {
-        "title": f"⚡ NIFTY 50 Opening Straddle Entered ({date_label})",
-        "description": f"**ATM Strike:** `{atm_strike}` | **Total Debit:** `₹{total_debit_inr:,.2f}`",
+        "title": f"⚡ [PAPER TRADING] NIFTY 50 Opening Straddle Entered ({date_label})",
+        "description": f"**[Paper Trading • Virtual Position]**\n**ATM Strike:** `{atm_strike}` | **Total Debit:** `₹{total_debit_inr:,.2f}`",
         "color": COLOR_ENTRY,
         "fields": [
             {
@@ -104,7 +104,7 @@ def send_straddle_entry_alert(
             },
         ],
         "footer": {
-            "text": "NIFTY 50 Opening Straddle Selector • Checkpoint 1 at 09:20:00 AM",
+            "text": "NIFTY 50 Opening Straddle • Paper Trading • Checkpoint 1 at 09:20:00 AM",
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -128,13 +128,13 @@ def send_decoupling_alert(
 
     if selected_runner == SelectedLeg.CALL:
         color = COLOR_CALL_RUNNER
-        title = f"🚀 [{checkpoint_name}] Bullish Decoupling: Retaining CALL Runner"
+        title = f"🚀 [PAPER TRADING] [{checkpoint_name}] Bullish Decoupling: Retaining CALL Runner"
     elif selected_runner == SelectedLeg.PUT:
         color = COLOR_PUT_RUNNER
-        title = f"🔻 [{checkpoint_name}] Bearish Decoupling: Retaining PUT Runner"
+        title = f"🔻 [PAPER TRADING] [{checkpoint_name}] Bearish Decoupling: Retaining PUT Runner"
     else:
         color = COLOR_SCRATCH
-        title = f"⚖️ [{checkpoint_name}] Market Indecisive: Flattening Both Legs (Scratch)"
+        title = f"⚖️ [PAPER TRADING] [{checkpoint_name}] Market Indecisive: Flattening Both Legs (Scratch)"
 
     embed = {
         "title": title,
@@ -162,7 +162,7 @@ def send_decoupling_alert(
             },
         ],
         "footer": {
-            "text": "NIFTY 50 Opening Straddle Selector • Monitoring Runner",
+            "text": "NIFTY 50 Opening Straddle • Paper Trading • Monitoring Runner",
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -240,12 +240,12 @@ def send_straddle_exit_summary(record: StraddleSessionRecord) -> bool:
         })
 
     embed = {
-        "title": f"{emoji} NIFTY 50 Opening Session Closed: {record.exit_reason.value}",
-        "description": f"**Trade Date:** `{record.trade_date}` | **ATM Strike:** `{record.atm_strike}`",
+        "title": f"{emoji} [PAPER TRADING] NIFTY 50 Opening Session Closed: {record.exit_reason.value}",
+        "description": f"**[Paper Trading • Virtual Execution]**\n**Trade Date:** `{record.trade_date}` | **ATM Strike:** `{record.atm_strike}`",
         "color": color,
         "fields": fields,
         "footer": {
-            "text": "NIFTY 50 Opening Straddle Selector • Daily Session Complete",
+            "text": "NIFTY 50 Opening Straddle • Paper Trading • Daily Session Complete",
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

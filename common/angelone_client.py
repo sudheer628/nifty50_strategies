@@ -176,6 +176,12 @@ def _get_nifty_spot_angel() -> dict:
             return {}
 
         item = fetched[0]
+        feed_time = (
+            item.get("exchFeedTime")
+            or item.get("feedTime")
+            or item.get("lastTradedTimestamp")
+            or item.get("timestamp")
+        )
         return {
             "ltp": float(item.get("ltp", 0) or 0),
             "open": float(item.get("open", 0) or 0),
@@ -183,6 +189,7 @@ def _get_nifty_spot_angel() -> dict:
             "high": float(item.get("high", 0) or 0),
             "low": float(item.get("low", 0) or 0),
             "source": "angelone",
+            "feed_time": feed_time,
         }
     except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
         logger.error("NIFTY spot fetch failed: %s", exc)
@@ -235,6 +242,7 @@ def _get_nifty_spot_from_feed(max_age_sec: Optional[int] = None) -> dict:
         "high": high_p,
         "low": low_p,
         "source": "upstox_feed",
+        "feed_time": quote.get("updated_at_epoch"),
     }
 
 
@@ -460,7 +468,7 @@ def get_option_ltp(exchange: str, trading_symbol: str, token: str) -> dict:
         return _get_single_option_ltp_from_upstox(trading_symbol)
 
 
-def get_option_ltps(option_infos: list) -> dict:
+def get_option_ltps(option_infos: list, mode: str = "LTP") -> dict:
     """Fetch several resolved option contracts in one Market Data request."""
     if not option_infos:
         return {}
@@ -481,33 +489,34 @@ def get_option_ltps(option_infos: list) -> dict:
 
     url = f"{ANGELONE_BASE_URL}/rest/secure/angelbroking/market/v1/quote/"
     payload = {
-        "mode": "LTP",
+        "mode": mode,
         "exchangeTokens": exchange_tokens,
     }
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         logger.info(
-            "Option batch LTP HTTP %s body=%s",
+            "Option batch quote (%s) HTTP %s body=%s",
+            mode,
             resp.status_code,
             resp.text[:500] if resp.text else "(empty)",
         )
         if resp.status_code != 200 or not resp.text.strip():
-            logger.warning("Option batch LTP HTTP %s; will attempt fallback", resp.status_code)
+            logger.warning("Option batch quote HTTP %s; will attempt fallback", resp.status_code)
             return {}
 
         try:
             body = resp.json()
         except Exception as exc:
-            logger.warning("Option batch LTP JSON decode failed: %s; will attempt fallback", exc)
+            logger.warning("Option batch quote JSON decode failed: %s; will attempt fallback", exc)
             return {}
 
         if not isinstance(body, dict):
-            logger.warning("Option batch LTP non-dict response (%s); will attempt fallback", type(body))
+            logger.warning("Option batch quote non-dict response (%s); will attempt fallback", type(body))
             return {}
 
         if body.get("status") is not True:
-            logger.warning("Option batch LTP API error: %s; will attempt fallback", body.get("message", body))
+            logger.warning("Option batch quote API error: %s; will attempt fallback", body.get("message", body))
             return {}
 
         quotes = {}
@@ -515,15 +524,31 @@ def get_option_ltps(option_infos: list) -> dict:
             if isinstance(item, dict):
                 token = str(item.get("symbolToken") or item.get("symboltoken") or "")
                 if token:
-                    quotes[token] = {
+                    q_data = {
                         "ltp": float(item.get("ltp", 0) or 0),
                     }
+                    depth = item.get("depth") or {}
+                    buys = depth.get("buy") or []
+                    sells = depth.get("sell") or []
+                    if buys and isinstance(buys, list) and isinstance(buys[0], dict):
+                        q_data["bid"] = float(buys[0].get("price", 0) or 0)
+                    if sells and isinstance(sells, list) and isinstance(sells[0], dict):
+                        q_data["ask"] = float(sells[0].get("price", 0) or 0)
+                    feed_time = (
+                        item.get("exchFeedTime")
+                        or item.get("feedTime")
+                        or item.get("lastTradedTimestamp")
+                        or item.get("timestamp")
+                    )
+                    if feed_time:
+                        q_data["feed_time"] = feed_time
+                    quotes[token] = q_data
 
         for item in (body.get("data") or {}).get("unfetched", []):
-            logger.warning("Option batch LTP unfetched: %s; will attempt fallback", item)
+            logger.warning("Option batch quote unfetched: %s; will attempt fallback", item)
         return quotes
     except Exception as exc:
-        logger.warning("Option batch LTP fetch failed: %s; will attempt fallback", exc)
+        logger.warning("Option batch quote fetch failed: %s; will attempt fallback", exc)
         return {}
 
 
@@ -880,10 +905,11 @@ def resolve_option_token(
 def get_nifty_option_chain(
     expiry_str: str,
     call_strike: int,
-    put_strike: int
+    put_strike: int,
+    mode: str = "LTP",
 ) -> dict:
     """
-    Fetch LTPs for both the chosen CALL and PUT strikes in one call.
+    Fetch LTPs (or FULL quote depth if mode="FULL") for both CALL and PUT strikes in one call.
 
     Falls back to Upstox Option Chain API if Angel One quotes return empty or zero.
 
@@ -891,16 +917,17 @@ def get_nifty_option_chain(
         expiry_str:   Expiry date in ``"DDMMMYYYY"`` format.
         call_strike:  CALL strike price.
         put_strike:   PUT strike price.
+        mode:         Angel One quote mode ("LTP" or "FULL"). Default is "LTP".
 
     Returns:
         Dictionary:
-            ``{"call": {ltp, token, ...}, "put": {ltp, token, ...}}``
+            ``{"call": {ltp, bid, ask, token, ...}, "put": {ltp, bid, ask, token, ...}}``
         Missing keys on failure.
     """
     call_info = resolve_option_token(expiry_str, call_strike, "CE")
     put_info = resolve_option_token(expiry_str, put_strike, "PE")
     resolved = [info for info in (call_info, put_info) if info]
-    quotes = get_option_ltps(resolved)
+    quotes = get_option_ltps(resolved, mode=mode)
 
     result = {}
     for key, info in (("call", call_info), ("put", put_info)):

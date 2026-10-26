@@ -111,6 +111,7 @@ def test_send_straddle_entry_alert_success(mock_post, monkeypatch, sample_intel)
     assert mock_post.called
     kwargs = mock_post.call_args[1]
     embed = kwargs["json"]["embeds"][0]
+    assert "[PAPER TRADING]" in embed["title"]
     assert "22400" in embed["description"]
     assert "300.00" in embed["fields"][0]["value"]
 

@@ -1,12 +1,17 @@
 """
-Backtest & Integration Simulation Engine for NIFTY 50 Opening Straddle Strategy (Phase 3).
+Synthetic Logic Simulator & Regression Suite for NIFTY 50 Opening Straddle Strategy (Phase 3).
 
-Simulates 15 realistic historical opening market regimes (09:14 - 10:00 AM):
+Simulates 15 hand-authored opening market regimes (09:14 - 10:00 AM) to verify engine logic:
   - Strong Trend Gap-and-Go (Bullish / Bearish)
   - Contrarian Reversals & False Traps
   - Tight Morning Consolidation & Whipsaws
   - Trailing Stop Peak Lock-ins & Hard Time Stops
   - Wide Spread Opening Aborts & Low Coverage Fallbacks
+
+Note:
+  This module serves as a deterministic FSM logic simulator and edge-case regression test suite.
+  For empirical backtesting with historical exchange quotes, tick observations persisted to
+  `opening_straddle_ticks` should be replayed.
 
 Compares 3 Model Configurations:
   1. Flagship: CDS-V2 / Contrarian-4 / Coverage-80
@@ -454,7 +459,7 @@ def run_full_backtest_suite() -> Dict[str, ModelEvaluationResult]:
 def print_backtest_report(results: Dict[str, ModelEvaluationResult]):
     """Prints a structured ASCII report of the backtest findings."""
     print("\n" + "=" * 80)
-    print("NIFTY 50 OPENING STRADDLE STRATEGY -- 15-SESSION COMPARATIVE BACKTEST REPORT")
+    print("NIFTY 50 OPENING STRADDLE STRATEGY -- 15-SCENARIO SYNTHETIC LOGIC SIMULATION REPORT")
     print("=" * 80)
 
     for key, res in results.items():

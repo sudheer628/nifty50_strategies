@@ -168,8 +168,17 @@ class StraddleLegQuote:
 
     @property
     def spread_pct(self) -> float:
+        import math
+        if (
+            not math.isfinite(self.ask)
+            or not math.isfinite(self.bid)
+            or self.ask <= 0
+            or self.bid <= 0
+            or self.ask < self.bid
+        ):
+            return 999.0
         mid = (self.ask + self.bid) / 2.0
-        if mid <= 0:
+        if not math.isfinite(mid) or mid <= 0:
             return 999.0
         return ((self.ask - self.bid) / mid) * 100.0
 
@@ -185,6 +194,7 @@ class TickObservation:
     put_ask: float
     call_ltp: Optional[float] = None
     put_ltp: Optional[float] = None
+    quote_age_sec: Optional[float] = None
 
 
 @dataclass

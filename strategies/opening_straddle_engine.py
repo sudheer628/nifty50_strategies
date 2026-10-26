@@ -142,8 +142,28 @@ def init_opening_straddle_db(db_path: str):
                 report_sent INTEGER DEFAULT 0
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS opening_straddle_ticks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                nifty_spot REAL NOT NULL,
+                call_bid REAL NOT NULL,
+                call_ask REAL NOT NULL,
+                put_bid REAL NOT NULL,
+                put_ask REAL NOT NULL,
+                combined_net_pnl_pct REAL NOT NULL,
+                quote_age_sec REAL,
+                state TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_straddle_ticks_date ON opening_straddle_ticks (trade_date)")
         try:
             conn.execute("ALTER TABLE opening_straddle_sessions ADD COLUMN report_sent INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE opening_straddle_ticks ADD COLUMN quote_age_sec REAL")
         except sqlite3.OperationalError:
             pass
         conn.commit()
@@ -206,6 +226,7 @@ class OpeningStraddleEngine:
         self.net_pnl_inr: float = 0.0
         self.net_roi_pct: float = 0.0
         self.status: str = "IN_PROGRESS"
+        self.tick_buffer: List[Dict[str, Any]] = []
 
         # Initialize SQLite table
         try:
@@ -228,8 +249,25 @@ class OpeningStraddleEngine:
         self.entry_ts = entry_ts if entry_ts is not None else time.time()
         self.atm_strike = int(round(spot_price / 50.0) * 50)
 
+        # Volatility Regime Calibration:
+        # Elevated VIX (> 18.0) experiences fast gamma moves; tighten trailing trigger from +2.0% to +1.5%.
+        if self.pre_market.vix_regime == VolatilityRegime.ELEVATED:
+            self.trailing_trigger_roi = 1.5
+            logger.info(
+                "Elevated VIX regime (%.2f > 18.0) detected: tightened trailing trigger from %.1f%% to %.1f%%.",
+                self.pre_market.vix,
+                DEFAULT_TRAILING_TRIGGER_ROI,
+                self.trailing_trigger_roi,
+            )
+        elif self.pre_market.vix_regime == VolatilityRegime.LOW_IV_CRUSH:
+            logger.info(
+                "Low IV Crush regime (%.2f < 11.5) detected: early scratch at 09:20:00 will be enforced if inconclusive.",
+                self.pre_market.vix,
+            )
+
         # 1. Spread Quality Gate (1.5% maximum spread)
         if call_quote.spread_pct > DEFAULT_MAX_SPREAD_PCT or put_quote.spread_pct > DEFAULT_MAX_SPREAD_PCT:
+            is_depth_missing = (call_quote.spread_pct >= 999.0 or put_quote.spread_pct >= 999.0)
             logger.warning(
                 "Execution quality gate breached: Call Spread=%.2f%%, Put Spread=%.2f%% (> %.2f%%). Aborting.",
                 call_quote.spread_pct,
@@ -238,7 +276,7 @@ class OpeningStraddleEngine:
             )
             self.state = StrategyState.ABORTED
             self.exit_reason = ExitReason.EXECUTION_ABORT
-            self.status = "ABORTED"
+            self.status = "ABORTED_NO_DEPTH" if is_depth_missing else "ABORTED"
             self._persist_session()
             return False
 
@@ -303,6 +341,40 @@ class OpeningStraddleEngine:
         self.call_leg.ask = tick.call_ask
         self.put_leg.bid = tick.put_bid
         self.put_leg.ask = tick.put_ask
+
+        # Compute live combined P&L and ROI for current tick
+        if self.state in (StrategyState.OBSERVATION, StrategyState.EXTENDED_OBSERVATION):
+            c_pnl = self.lot_size * (tick.call_bid - self.call_leg.entry_price)
+            p_pnl = self.lot_size * (tick.put_bid - self.put_leg.entry_price)
+            current_net_pnl = (c_pnl + p_pnl) - self.friction_inr
+        elif self.selected_runner == SelectedLeg.CALL:
+            c_pnl = self.lot_size * (tick.call_bid - self.call_leg.entry_price)
+            current_net_pnl = (self.put_leg.pnl_inr + c_pnl) - self.friction_inr
+        elif self.selected_runner == SelectedLeg.PUT:
+            p_pnl = self.lot_size * (tick.put_bid - self.put_leg.entry_price)
+            current_net_pnl = (self.call_leg.pnl_inr + p_pnl) - self.friction_inr
+        else:
+            current_net_pnl = 0.0
+
+        current_net_roi = (current_net_pnl / self.total_debit_inr * 100.0) if self.total_debit_inr > 0 else 0.0
+        self.net_pnl_inr = current_net_pnl
+        self.net_roi_pct = current_net_roi
+        if current_net_roi > self.peak_roi_pct:
+            self.peak_roi_pct = current_net_roi
+
+        # Buffer observation for batched database persistence
+        self.tick_buffer.append({
+            "trade_date": self.trade_date,
+            "ts": int(tick.ts),
+            "nifty_spot": float(tick.nifty_spot),
+            "call_bid": float(tick.call_bid),
+            "call_ask": float(tick.call_ask),
+            "put_bid": float(tick.put_bid),
+            "put_ask": float(tick.put_ask),
+            "combined_net_pnl_pct": round(float(self.net_roi_pct), 4),
+            "quote_age_sec": round(float(tick.quote_age_sec), 2) if tick.quote_age_sec is not None else None,
+            "state": self.state.value,
+        })
 
         # Track consecutive spot confirmation ticks
         current_spot_direction = 1 if r_n >= 0.08 else (-1 if r_n <= -0.08 else 0)
@@ -384,12 +456,20 @@ class OpeningStraddleEngine:
         else:
             # Inconclusive or conflicting
             if checkpoint_name == "09:20:00":
-                logger.info("09:20:00 Inconclusive / Choppy. Holding both legs into Extended Observation.")
-                self.state = StrategyState.EXTENDED_OBSERVATION
+                if self.pre_market.vix_regime == VolatilityRegime.LOW_IV_CRUSH:
+                    logger.info(
+                        "09:20:00 Low IV Crush regime (%.2f < 11.5) & inconclusive move. "
+                        "Executing immediate Scratch Exit to avoid theta bleed.",
+                        self.pre_market.vix,
+                    )
+                    self._execute_scratch_exit(tick, checkpoint_name="09:20:00")
+                else:
+                    logger.info("09:20:00 Inconclusive / Choppy. Holding both legs into Extended Observation.")
+                    self.state = StrategyState.EXTENDED_OBSERVATION
             else:
                 # 09:25:00 Final Checkpoint -> Scratch Exit
                 logger.info("09:25:00 Decoupling failed. Executing Scratch Exit on both legs.")
-                self._execute_scratch_exit(tick)
+                self._execute_scratch_exit(tick, checkpoint_name="09:25:00")
 
     def _is_leg_decoupling_eligible(
         self,
@@ -587,7 +667,7 @@ class OpeningStraddleEngine:
         self.net_roi_pct = (self.net_pnl_inr / self.total_debit_inr) * 100.0 if self.total_debit_inr > 0 else 0.0
         self.exit_reason = exit_reason
         self.state = StrategyState.CLOSED
-        self.status = "COMPLETED"
+        self.status = "PAPER_TRADING"
 
         logger.info(
             "Session Closed [%s]: Net P&L=INR %.2f | Net ROI=%.2f%% | Peak ROI=%.2f%%",
@@ -598,8 +678,8 @@ class OpeningStraddleEngine:
         )
         self._persist_session()
 
-    def _execute_scratch_exit(self, tick: TickObservation):
-        """Flattens both legs at 09:25:00 when decoupling is inconclusive."""
+    def _execute_scratch_exit(self, tick: TickObservation, checkpoint_name: str = "09:25:00"):
+        """Flattens both legs when decoupling is inconclusive (09:20:00 for Low IV Crush or 09:25:00 final)."""
         self.call_leg.exit_price = tick.call_bid
         self.call_leg.pnl_inr = self.lot_size * (tick.call_bid - self.call_leg.entry_price)
         self.call_leg.pnl_pct = ((tick.call_bid - self.call_leg.entry_price) / self.call_leg.entry_price) * 100.0
@@ -610,17 +690,18 @@ class OpeningStraddleEngine:
 
         self.selected_runner = SelectedLeg.SCRATCH
         self.closed_leg = SelectedLeg.SCRATCH
-        self.decision_time_str = "09:25:00"
+        self.decision_time_str = checkpoint_name
         self.exit_reason = ExitReason.SCRATCH
 
         gross_pnl = self.call_leg.pnl_inr + self.put_leg.pnl_inr
         self.net_pnl_inr = gross_pnl - self.friction_inr
         self.net_roi_pct = (self.net_pnl_inr / self.total_debit_inr) * 100.0 if self.total_debit_inr > 0 else 0.0
         self.state = StrategyState.CLOSED
-        self.status = "COMPLETED"
+        self.status = "PAPER_TRADING"
 
         logger.info(
-            "Scratch Exit Completed: Net P&L=INR %.2f | Net ROI=%.2f%%",
+            "Scratch Exit Completed [%s]: Net P&L=INR %.2f | Net ROI=%.2f%%",
+            checkpoint_name,
             self.net_pnl_inr,
             self.net_roi_pct,
         )
@@ -628,7 +709,7 @@ class OpeningStraddleEngine:
         if self.enable_alerts:
             try:
                 send_decoupling_alert(
-                    checkpoint_name="09:25:00",
+                    checkpoint_name=checkpoint_name,
                     selected_runner=SelectedLeg.SCRATCH,
                     closed_leg=SelectedLeg.SCRATCH,
                     closed_exit_price=0.0,
@@ -736,12 +817,44 @@ class OpeningStraddleEngine:
                 placeholders = ", ".join("?" for _ in record)
                 sql = f"INSERT OR REPLACE INTO opening_straddle_sessions ({cols}) VALUES ({placeholders})"
                 conn.execute(sql, list(record.values()))
+
+                if self.tick_buffer:
+                    tick_rows = [
+                        (
+                            t["trade_date"],
+                            t["ts"],
+                            t["nifty_spot"],
+                            t["call_bid"],
+                            t["call_ask"],
+                            t["put_bid"],
+                            t["put_ask"],
+                            t["combined_net_pnl_pct"],
+                            t["quote_age_sec"],
+                            t["state"],
+                        )
+                        for t in self.tick_buffer
+                    ]
+                    conn.executemany(
+                        """
+                        INSERT INTO opening_straddle_ticks (
+                            trade_date, ts, nifty_spot, call_bid, call_ask, put_bid, put_ask, combined_net_pnl_pct, quote_age_sec, state
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        tick_rows,
+                    )
+                    logger.info("Persisted %d ticks to opening_straddle_ticks in %s", len(tick_rows), self.db_path)
+                    self.tick_buffer.clear()
+
                 conn.commit()
             logger.info("Persisted session record to %s", self.db_path)
         except Exception as exc:
             logger.error("Failed to persist session record to %s: %s", self.db_path, exc)
 
-        if self.enable_alerts:
+        if (
+            self.enable_alerts
+            and self.state == StrategyState.CLOSED
+            and self.exit_reason != ExitReason.NONE
+        ):
             try:
                 sent = send_straddle_exit_summary(self.to_session_record())
                 if sent and self.db_path:
@@ -753,3 +866,9 @@ class OpeningStraddleEngine:
                         conn.commit()
             except Exception as exc:
                 logger.warning("Failed to dispatch exit summary alert: %s", exc)
+
+    def flush_interrupted_session(self):
+        """Orderly flush of buffered ticks and session state upon KeyboardInterrupt without false exit alerts."""
+        if self.state not in (StrategyState.CLOSED, StrategyState.ABORTED):
+            self.status = "INTERRUPTED"
+        self._persist_session()

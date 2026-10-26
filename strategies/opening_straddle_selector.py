@@ -16,7 +16,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from common.angelone_client import (
@@ -38,6 +38,68 @@ from strategies.premarket_intelligence import PreMarketIntelligenceLoader
 
 logger = logging.getLogger("nifty50_strategies.opening_straddle_selector")
 
+IST_TZ = timezone(timedelta(hours=5, minutes=30))
+MAX_QUOTE_AGE_SEC = 15.0   # Live tick quote must not be older than 15 seconds
+MAX_CLOCK_SKEW_SEC = 2.0   # Max acceptable future timestamp clock skew in seconds
+
+
+def parse_quote_age_sec(
+    feed_time: Any,
+    now_ts: Optional[float] = None,
+    max_skew_sec: float = MAX_CLOCK_SKEW_SEC,
+) -> Optional[float]:
+    """
+    Computes elapsed age in seconds from broker exchange quote timestamp/epoch.
+
+    Returns:
+        - elapsed seconds (>= 0.0) if parsed and within valid time bounds.
+        - 0.0 if future timestamp is within max_skew_sec clock-skew allowance.
+        - None if feed_time is missing, unparseable, or exceeds clock-skew allowance.
+    """
+    if feed_time is None:
+        return None
+    now_ts = now_ts or time.time()
+    ts = None
+    if isinstance(feed_time, (int, float)):
+        ts = feed_time / 1000.0 if feed_time > 1e11 else float(feed_time)
+    elif isinstance(feed_time, str):
+        feed_str = feed_time.strip()
+        if not feed_str:
+            return None
+        try:
+            val = float(feed_str)
+            ts = val / 1000.0 if val > 1e11 else val
+        except ValueError:
+            for fmt in (
+                "%d-%b-%Y %H:%M:%S",
+                "%Y-%m-%d %H:%M:%S",
+                "%d/%m/%Y %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S",
+            ):
+                try:
+                    dt = datetime.strptime(feed_str.split(".")[0], fmt)
+                    dt = dt.replace(tzinfo=IST_TZ)
+                    ts = dt.timestamp()
+                    break
+                except ValueError:
+                    pass
+
+    if ts is None:
+        return None
+
+    raw_diff = now_ts - ts
+    if raw_diff < -max_skew_sec:
+        logger.warning(
+            "Broker quote timestamp is in the future beyond clock skew allowance (future_by=%.2fs > %.1fs max_skew): %s",
+            -raw_diff,
+            max_skew_sec,
+            feed_time,
+        )
+        return None
+    if -max_skew_sec <= raw_diff < 0.0:
+        return 0.0
+    return raw_diff
+
 
 def setup_cli_logging(level: str = "INFO"):
     logging.basicConfig(
@@ -51,6 +113,7 @@ def run_opening_straddle(
     poll_interval_sec: float = 1.0,
     max_duration_sec: int = 2700,  # 45 minutes
     enable_alerts: bool = True,
+    allow_synthetic_spread: bool = False,
 ) -> int:
     """
     Main orchestrator running the daily opening straddle cycle from 09:14 to 10:00 AM.
@@ -95,7 +158,8 @@ def run_opening_straddle(
 
     # 4. Step 4: Resolve Option Chain Quotes & Execution Quality Gate
     logger.info("Step 4: Fetching option chain quotes for %s strike %d...", expiry_angel, atm_strike)
-    chain = get_nifty_option_chain(expiry_angel, atm_strike, atm_strike)
+    chain = get_nifty_option_chain(expiry_angel, atm_strike, atm_strike, mode="FULL")
+    t_entry_recv = time.time()
     call_info = chain.get("call") or {}
     put_info = chain.get("put") or {}
 
@@ -111,16 +175,98 @@ def run_opening_straddle(
         )
         return 1
 
+    # Validate opening quote freshness
+    spot_entry_age = parse_quote_age_sec(
+        spot_res.get("feed_time") if isinstance(spot_res, dict) else None,
+        now_ts=t_entry_recv,
+        max_skew_sec=MAX_CLOCK_SKEW_SEC,
+    )
+    ce_entry_age = parse_quote_age_sec(call_info.get("feed_time"), now_ts=t_entry_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
+    pe_entry_age = parse_quote_age_sec(put_info.get("feed_time"), now_ts=t_entry_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
+
+    entry_stale_reasons = []
+    if spot_entry_age is None:
+        if not allow_synthetic_spread:
+            entry_stale_reasons.append("Spot=missing_or_unverifiable_timestamp")
+    elif spot_entry_age > MAX_QUOTE_AGE_SEC:
+        entry_stale_reasons.append(f"Spot={spot_entry_age:.1f}s")
+
+    if ce_entry_age is None:
+        if not allow_synthetic_spread:
+            entry_stale_reasons.append("Call=missing_or_unverifiable_timestamp")
+    elif ce_entry_age > MAX_QUOTE_AGE_SEC:
+        entry_stale_reasons.append(f"Call={ce_entry_age:.1f}s")
+
+    if pe_entry_age is None:
+        if not allow_synthetic_spread:
+            entry_stale_reasons.append("Put=missing_or_unverifiable_timestamp")
+    elif pe_entry_age > MAX_QUOTE_AGE_SEC:
+        entry_stale_reasons.append(f"Put={pe_entry_age:.1f}s")
+
+    if entry_stale_reasons:
+        logger.error(
+            "Opening entry quotes failed freshness check (%s). Aborting entry.",
+            ", ".join(entry_stale_reasons),
+        )
+        return 1
+
     ce_token = str(call_info.get("token") or "")
     pe_token = str(put_info.get("token") or "")
     ce_symbol = str(call_info.get("trading_symbol") or f"NIFTY{atm_strike}CE")
     pe_symbol = str(put_info.get("trading_symbol") or f"NIFTY{atm_strike}PE")
 
-    # Bid/Ask from chain (or fallback to tight spread around LTP if depth unavailable)
-    ce_bid = float(call_info.get("bid") or (ce_ltp * 0.998))
-    ce_ask = float(call_info.get("ask") or (ce_ltp * 1.002))
-    pe_bid = float(put_info.get("bid") or (pe_ltp * 0.998))
-    pe_ask = float(put_info.get("ask") or (pe_ltp * 1.002))
+    # Bid/Ask from chain (requires positive bid and ask depth)
+    def _is_valid_price(p: Any) -> bool:
+        import math
+        try:
+            val = float(p)
+            return math.isfinite(val) and val > 0.0
+        except (TypeError, ValueError):
+            return False
+
+    raw_ce_bid = call_info.get("bid")
+    raw_ce_ask = call_info.get("ask")
+    raw_pe_bid = put_info.get("bid")
+    raw_pe_ask = put_info.get("ask")
+
+    has_depth = (
+        _is_valid_price(raw_ce_bid)
+        and _is_valid_price(raw_ce_ask)
+        and float(raw_ce_ask) >= float(raw_ce_bid)
+        and _is_valid_price(raw_pe_bid)
+        and _is_valid_price(raw_pe_ask)
+        and float(raw_pe_ask) >= float(raw_pe_bid)
+    )
+
+    if not has_depth:
+        if allow_synthetic_spread:
+            logger.warning(
+                "Opening market depth quotes unavailable from broker (CE bid=%s, ask=%s; PE bid=%s, ask=%s). "
+                "Synthesizing 0.4%% spread around LTP because --allow-synthetic-spread is enabled.",
+                raw_ce_bid, raw_ce_ask, raw_pe_bid, raw_pe_ask
+            )
+            ce_bid = ce_ltp * 0.998
+            ce_ask = ce_ltp * 1.002
+            pe_bid = pe_ltp * 0.998
+            pe_ask = pe_ltp * 1.002
+        else:
+            logger.error(
+                "Opening market depth quotes unavailable or non-finite (CE bid=%s, ask=%s; PE bid=%s, ask=%s). "
+                "Aborting entry to protect against unverified spread.",
+                raw_ce_bid,
+                raw_ce_ask,
+                raw_pe_bid,
+                raw_pe_ask,
+            )
+            ce_bid = float(raw_ce_bid) if _is_valid_price(raw_ce_bid) else 0.0
+            ce_ask = float(raw_ce_ask) if _is_valid_price(raw_ce_ask) else 0.0
+            pe_bid = float(raw_pe_bid) if _is_valid_price(raw_pe_bid) else 0.0
+            pe_ask = float(raw_pe_ask) if _is_valid_price(raw_pe_ask) else 0.0
+    else:
+        ce_bid = float(raw_ce_bid)
+        ce_ask = float(raw_ce_ask)
+        pe_bid = float(raw_pe_bid)
+        pe_ask = float(raw_pe_ask)
 
     call_leg = StraddleLegQuote(
         symbol=ce_symbol,
@@ -150,7 +296,7 @@ def run_opening_straddle(
     )
 
     if not engine.arm_entry(spot_price=spot_val, call_quote=call_leg, put_quote=put_leg):
-        logger.warning("Opening Straddle Entry Gate rejected or aborted.")
+        logger.warning("Opening Straddle Entry Gate rejected or aborted (Status=%s).", engine.status)
         return 1
 
     # 5. Step 5: Live Observation & Decoupling Loop (1 Hz polling)
@@ -158,33 +304,124 @@ def run_opening_straddle(
     start_time = time.time()
     try:
         while engine.state not in (StrategyState.CLOSED, StrategyState.ABORTED):
-            now_ts = time.time()
-            if (now_ts - start_time) > max_duration_sec:
+            loop_now = time.time()
+            if (loop_now - start_time) > max_duration_sec:
                 logger.info("Session max duration exceeded. Forcing hard time exit.")
                 break
 
-            # Fetch fresh quotes
+            # Fetch fresh quotes with freshness & latency tracking
+            t_req_start = time.time()
             fresh_spot_res = get_nifty_spot()
+            raw_spot = None
             if isinstance(fresh_spot_res, dict):
-                curr_spot = float(fresh_spot_res.get("ltp") or spot_val)
+                raw_spot = fresh_spot_res.get("ltp")
             elif fresh_spot_res is not None:
-                curr_spot = float(fresh_spot_res)
-            else:
-                curr_spot = spot_val
+                raw_spot = fresh_spot_res
 
-            chain_tick = get_nifty_option_chain(expiry_angel, atm_strike, atm_strike)
+            if not _is_valid_price(raw_spot):
+                logger.warning("Invalid or non-finite NIFTY spot quote received (%s). Skipping tick.", raw_spot)
+                time.sleep(poll_interval_sec)
+                continue
+            curr_spot = float(raw_spot)
+
+            chain_tick = get_nifty_option_chain(expiry_angel, atm_strike, atm_strike, mode="FULL")
+            t_recv = time.time()
+            latency_sec = t_recv - t_req_start
+            if latency_sec > 5.0:
+                logger.warning("Quote API round-trip latency exceeded threshold (%.2fs > 5.0s). Skipping stale tick.", latency_sec)
+                time.sleep(poll_interval_sec)
+                continue
+
             c_info = chain_tick.get("call") or {}
             p_info = chain_tick.get("put") or {}
 
-            c_ltp = float(c_info.get("ltp") or ce_ltp)
-            p_ltp = float(p_info.get("ltp") or pe_ltp)
-            c_bid = float(c_info.get("bid") or c_ltp)
-            c_ask = float(c_info.get("ask") or c_ltp)
-            p_bid = float(p_info.get("bid") or p_ltp)
-            p_ask = float(p_info.get("ask") or p_ltp)
+            raw_c_ltp = c_info.get("ltp")
+            raw_p_ltp = p_info.get("ltp")
+            if not _is_valid_price(raw_c_ltp) or not _is_valid_price(raw_p_ltp):
+                logger.warning("Option LTP missing/invalid on live tick (CE=%s, PE=%s). Skipping tick.", raw_c_ltp, raw_p_ltp)
+                time.sleep(poll_interval_sec)
+                continue
+
+            c_ltp = float(raw_c_ltp)
+            p_ltp = float(raw_p_ltp)
+
+            # Validate underlying market data freshness via broker feed timestamps
+            spot_age = parse_quote_age_sec(
+                fresh_spot_res.get("feed_time") if isinstance(fresh_spot_res, dict) else None,
+                now_ts=t_recv,
+                max_skew_sec=MAX_CLOCK_SKEW_SEC,
+            )
+            c_age = parse_quote_age_sec(c_info.get("feed_time"), now_ts=t_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
+            p_age = parse_quote_age_sec(p_info.get("feed_time"), now_ts=t_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
+
+            stale_reasons = []
+            if spot_age is None:
+                if not allow_synthetic_spread:
+                    stale_reasons.append("Spot=missing_or_unverifiable_timestamp")
+            elif spot_age > MAX_QUOTE_AGE_SEC:
+                stale_reasons.append(f"Spot={spot_age:.1f}s")
+
+            if c_age is None:
+                if not allow_synthetic_spread:
+                    stale_reasons.append("Call=missing_or_unverifiable_timestamp")
+            elif c_age > MAX_QUOTE_AGE_SEC:
+                stale_reasons.append(f"Call={c_age:.1f}s")
+
+            if p_age is None:
+                if not allow_synthetic_spread:
+                    stale_reasons.append("Put=missing_or_unverifiable_timestamp")
+            elif p_age > MAX_QUOTE_AGE_SEC:
+                stale_reasons.append(f"Put={p_age:.1f}s")
+
+            if stale_reasons:
+                logger.warning(
+                    "Stale or unverified market data detected (%s). Skipping tick.",
+                    ", ".join(stale_reasons),
+                )
+                time.sleep(poll_interval_sec)
+                continue
+
+            max_observed_age = max(
+                (a for a in (spot_age, c_age, p_age) if a is not None),
+                default=None,
+            )
+
+            # Strict Bid/Ask market depth validation
+            raw_c_bid = c_info.get("bid")
+            raw_c_ask = c_info.get("ask")
+            raw_p_bid = p_info.get("bid")
+            raw_p_ask = p_info.get("ask")
+
+            has_live_depth = (
+                _is_valid_price(raw_c_bid)
+                and _is_valid_price(raw_c_ask)
+                and float(raw_c_ask) >= float(raw_c_bid)
+                and _is_valid_price(raw_p_bid)
+                and _is_valid_price(raw_p_ask)
+                and float(raw_p_ask) >= float(raw_p_bid)
+            )
+
+            if not has_live_depth:
+                if allow_synthetic_spread:
+                    c_bid = c_ltp * 0.998
+                    c_ask = c_ltp * 1.002
+                    p_bid = p_ltp * 0.998
+                    p_ask = p_ltp * 1.002
+                else:
+                    logger.warning(
+                        "Live tick missing or invalid bid/ask depth (CE bid=%s, ask=%s; PE bid=%s, ask=%s). Skipping tick.",
+                        raw_c_bid, raw_c_ask, raw_p_bid, raw_p_ask,
+                    )
+                    time.sleep(poll_interval_sec)
+                    continue
+            else:
+                c_bid = float(raw_c_bid)
+                c_ask = float(raw_c_ask)
+                p_bid = float(raw_p_bid)
+                p_ask = float(raw_p_ask)
 
             tick = TickObservation(
-                ts=now_ts,
+                ts=t_recv,
                 nifty_spot=curr_spot,
                 call_bid=c_bid,
                 call_ask=c_ask,
@@ -192,13 +429,15 @@ def run_opening_straddle(
                 put_ask=p_ask,
                 call_ltp=c_ltp,
                 put_ltp=p_ltp,
+                quote_age_sec=max_observed_age,
             )
 
             engine.process_tick(tick)
             time.sleep(poll_interval_sec)
 
     except KeyboardInterrupt:
-        logger.info("Execution interrupted by user.")
+        logger.info("Execution interrupted by user. Flushing buffered ticks and session...")
+        engine.flush_interrupted_session()
         return 0
 
     logger.info("Session complete: State=%s, Status=%s", engine.state.value, engine.status)
@@ -250,8 +489,9 @@ def print_session_report(db_path: Optional[str] = None) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NIFTY 50 Opening Straddle Strategy (09:15 - 10:00 AM)")
+    parser = argparse.ArgumentParser(description="NIFTY 50 Opening Straddle Strategy [Paper Trading / Virtual Tracking] (09:15 - 10:00 AM)")
     parser.add_argument("--dry-run", action="store_true", default=True, help="Tracking mode (order placement is out of scope)")
+    parser.add_argument("--allow-synthetic-spread", action="store_true", help="Allow synthetic spread around LTP if market depth is unavailable (testing only)")
     parser.add_argument("--db-path", type=str, help="Custom SQLite database path")
     parser.add_argument("--no-alerts", action="store_true", help="Disable Discord webhook notifications")
     parser.add_argument("--report", action="store_true", help="Print recent strategy sessions from database and exit")
@@ -274,7 +514,11 @@ def main():
             return 1
 
     setup_cli_logging(args.log_level)
-    return run_opening_straddle(db_path=args.db_path, enable_alerts=not args.no_alerts)
+    return run_opening_straddle(
+        db_path=args.db_path,
+        enable_alerts=not args.no_alerts,
+        allow_synthetic_spread=args.allow_synthetic_spread,
+    )
 
 
 if __name__ == "__main__":

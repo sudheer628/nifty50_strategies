@@ -175,7 +175,7 @@ def test_aligned_call_decoupling_and_profit_target(mock_pre_market, temp_db):
     assert engine.state == StrategyState.CLOSED
     assert engine.exit_reason == ExitReason.PROFIT_TARGET
     assert engine.net_roi_pct >= 3.0
-    assert engine.status == "COMPLETED"
+    assert engine.status == "PAPER_TRADING"
 
 
 def test_contrarian_put_decoupling_with_two_tick_confirmation(temp_db):
@@ -280,7 +280,7 @@ def test_scratch_exit_at_0925(mock_pre_market, temp_db):
     assert engine.state == StrategyState.CLOSED
     assert engine.selected_runner == SelectedLeg.SCRATCH
     assert engine.exit_reason == ExitReason.SCRATCH
-    assert engine.status == "COMPLETED"
+    assert engine.status == "PAPER_TRADING"
 
 
 def test_trailing_stop_protection(mock_pre_market, temp_db):
@@ -353,3 +353,251 @@ def test_hard_time_stop_at_0955(mock_pre_market, temp_db):
     engine.process_tick(tick_955)
     assert engine.state == StrategyState.CLOSED
     assert engine.exit_reason == ExitReason.HARD_TIME_STOP
+
+
+def test_elevated_vix_tightens_trailing_trigger(temp_db):
+    """Elevated VIX (>18.0) must tighten the trailing stop trigger from 2.0% to 1.5%."""
+    high_vix_intel = PreMarketIntelligence(
+        cds=0.30,
+        coverage=0.85,
+        confidence=ConfidenceLevel.HIGH,
+        bias=BiasClassification.STRONG_BULLISH,
+        components={},
+        vix=21.5,
+        vix_regime=VolatilityRegime.ELEVATED,
+        timestamp_utc="2026-10-26T03:44:00Z",
+    )
+    engine = OpeningStraddleEngine(pre_market=high_vix_intel, db_path=temp_db)
+    call_q = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=100.0, ask=100.5, ltp=100.0)
+    put_q = StraddleLegQuote("NIFTY25000PE", "102", 25000, "PE", bid=100.0, ask=100.5, ltp=100.0)
+    engine.arm_entry(spot_price=25000.0, call_quote=call_q, put_quote=put_q)
+
+    assert engine.trailing_trigger_roi == 1.5
+
+
+def test_low_iv_crush_vix_early_scratch_at_0920(temp_db):
+    """Low IV Crush VIX (<11.5) must trigger immediate Scratch Exit at 09:20:00 if move is inconclusive."""
+    low_vix_intel = PreMarketIntelligence(
+        cds=0.05,
+        coverage=0.90,
+        confidence=ConfidenceLevel.HIGH,
+        bias=BiasClassification.NEUTRAL,
+        components={},
+        vix=10.8,
+        vix_regime=VolatilityRegime.LOW_IV_CRUSH,
+        timestamp_utc="2026-10-26T03:44:00Z",
+    )
+    start_ts = 1791957300.0
+    engine = OpeningStraddleEngine(pre_market=low_vix_intel, db_path=temp_db)
+    call_q = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=100.0, ask=100.5, ltp=100.0)
+    put_q = StraddleLegQuote("NIFTY25000PE", "102", 25000, "PE", bid=100.0, ask=100.5, ltp=100.0)
+    engine.arm_entry(spot_price=25000.0, call_quote=call_q, put_quote=put_q, entry_ts=start_ts)
+
+    # Inconclusive 09:20:00 tick (spot flat, legs slightly decaying)
+    tick_920 = TickObservation(
+        ts=start_ts + 301.0,
+        nifty_spot=25002.0,  # Spot flat (+0.008%)
+        call_bid=99.0, call_ask=99.5,
+        put_bid=99.0, put_ask=99.5,
+    )
+    engine.process_tick(tick_920)
+
+    # Must immediately scratch at 09:20:00 without extending to 09:25:00
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.SCRATCH
+    assert engine.decision_time_str == "09:20:00"
+
+
+def test_batched_tick_persistence_in_sqlite(mock_pre_market, temp_db):
+    """Verify 1 Hz observations are buffered and persisted to opening_straddle_ticks table."""
+    start_ts = 1791957300.0
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+    call_q = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=100.0, ask=100.5, ltp=100.0)
+    put_q = StraddleLegQuote("NIFTY25000PE", "102", 25000, "PE", bid=100.0, ask=100.5, ltp=100.0)
+    engine.arm_entry(spot_price=25000.0, call_quote=call_q, put_quote=put_q, entry_ts=start_ts)
+
+    # Process 5 ticks
+    for i in range(1, 6):
+        engine.process_tick(TickObservation(
+            ts=start_ts + i,
+            nifty_spot=25000.0 + i,
+            call_bid=100.0 + i * 0.5,
+            call_ask=100.5 + i * 0.5,
+            put_bid=100.0 - i * 0.3,
+            put_ask=100.5 - i * 0.3,
+        ))
+
+    assert len(engine.tick_buffer) == 5
+
+    # Decouple at 09:20:00
+    engine.process_tick(TickObservation(
+        ts=start_ts + 301.0,
+        nifty_spot=25025.0,
+        call_bid=104.0, call_ask=104.5,
+        put_bid=98.0, put_ask=98.5,
+    ))
+
+    # Conclude session with hard time stop at 09:55:00
+    engine.process_tick(TickObservation(
+        ts=start_ts + 2401.0,
+        nifty_spot=25010.0,
+        call_bid=105.0, call_ask=105.5,
+        put_bid=95.0, put_ask=95.5,
+    ))
+
+    assert engine.state == StrategyState.CLOSED
+    # Buffer should be cleared after persistence
+    assert len(engine.tick_buffer) == 0
+
+    # Verify rows in opening_straddle_ticks
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM opening_straddle_ticks").fetchone()[0]
+        assert count == 7  # 5 ticks + 1 decouple tick + 1 exit tick
+        # Verify combined_net_pnl_pct is recorded dynamically and non-zero
+        rois = [r[0] for r in conn.execute("SELECT combined_net_pnl_pct FROM opening_straddle_ticks").fetchall()]
+        assert any(r != 0.0 for r in rois)
+
+
+def test_missing_depth_quote_returns_high_spread_and_aborts(mock_pre_market, temp_db):
+    """Missing or non-positive bid/ask quotes must return spread_pct=999.0 and abort entry."""
+    # Zero bid
+    bad_quote = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=0.0, ask=100.0, ltp=100.0)
+    assert bad_quote.spread_pct == 999.0
+
+    # Inverted bid/ask
+    inverted_quote = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=105.0, ask=100.0, ltp=100.0)
+    assert inverted_quote.spread_pct == 999.0
+
+    # NaN bid/ask quotes
+    nan_quote = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=float("nan"), ask=100.0, ltp=100.0)
+    assert nan_quote.spread_pct == 999.0
+
+    # Ensure engine arm_entry aborts on missing depth and records ABORTED_NO_DEPTH
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+    valid_put = StraddleLegQuote("NIFTY25000PE", "102", 25000, "PE", bid=100.0, ask=100.5, ltp=100.0)
+    armed = engine.arm_entry(spot_price=25000.0, call_quote=bad_quote, put_quote=valid_put)
+    assert armed is False
+    assert engine.state == StrategyState.ABORTED
+    assert engine.status == "ABORTED_NO_DEPTH"
+
+    with sqlite3.connect(temp_db) as conn:
+        status_db = conn.execute("SELECT status FROM opening_straddle_sessions").fetchone()[0]
+        assert status_db == "ABORTED_NO_DEPTH"
+
+
+def test_interrupted_session_flushes_ticks_without_exit_alert(mock_pre_market, temp_db):
+    """Interrupted session must flush buffered ticks to DB but NOT send a misleading exit summary alert."""
+    start_ts = 1791957300.0
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db, enable_alerts=True)
+    call_q = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=100.0, ask=100.5, ltp=100.0)
+    put_q = StraddleLegQuote("NIFTY25000PE", "102", 25000, "PE", bid=100.0, ask=100.5, ltp=100.0)
+    engine.arm_entry(spot_price=25000.0, call_quote=call_q, put_quote=put_q, entry_ts=start_ts)
+
+    # Process 3 live ticks
+    for i in range(1, 4):
+        engine.process_tick(TickObservation(
+            ts=start_ts + i,
+            nifty_spot=25000.0 + i,
+            call_bid=100.0 + i * 0.2,
+            call_ask=100.5 + i * 0.2,
+            put_bid=100.0 - i * 0.2,
+            put_ask=100.5 - i * 0.2,
+        ))
+
+    assert len(engine.tick_buffer) == 3
+
+    from unittest.mock import patch
+    with patch("strategies.opening_straddle_engine.send_straddle_exit_summary") as mock_summary:
+        engine.flush_interrupted_session()
+        # Must NOT dispatch exit summary alert
+        assert not mock_summary.called
+
+    assert engine.status == "INTERRUPTED"
+    assert len(engine.tick_buffer) == 0
+
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM opening_straddle_ticks").fetchone()[0]
+        assert count == 3
+        status = conn.execute("SELECT status FROM opening_straddle_sessions").fetchone()[0]
+        assert status == "INTERRUPTED"
+
+
+def test_parse_quote_age_sec_and_tick_persistence(mock_pre_market, temp_db):
+    """Verify quote age parsing from timestamps and persistence in opening_straddle_ticks table."""
+    from strategies.opening_straddle_selector import parse_quote_age_sec, IST_TZ
+    from datetime import datetime
+
+    now_ts = 1791957300.0
+
+    # Numeric seconds & milliseconds
+    assert parse_quote_age_sec(now_ts - 2.5, now_ts=now_ts) == 2.5
+    assert round(parse_quote_age_sec((now_ts - 1.2) * 1000.0, now_ts=now_ts), 2) == 1.2
+    assert parse_quote_age_sec(None, now_ts=now_ts) is None
+
+    # Datetime string parsing
+    dt_str = datetime.fromtimestamp(now_ts - 5.0, tz=IST_TZ).strftime("%d-%b-%Y %H:%M:%S")
+    assert round(parse_quote_age_sec(dt_str, now_ts=now_ts), 1) == 5.0
+
+    # Clock skew handling: future timestamps
+    # Future timestamp within max_skew_sec (2.0s) clamps to 0.0
+    assert parse_quote_age_sec(now_ts + 0.8, now_ts=now_ts, max_skew_sec=2.0) == 0.0
+    # Future timestamp beyond max_skew_sec returns None (rejected)
+    assert parse_quote_age_sec(now_ts + 3.5, now_ts=now_ts, max_skew_sec=2.0) is None
+
+    # Unparseable, garbage or empty string inputs return None
+    assert parse_quote_age_sec("", now_ts=now_ts) is None
+    assert parse_quote_age_sec("invalid_format", now_ts=now_ts) is None
+    assert parse_quote_age_sec("2026-99-99 99:99:99", now_ts=now_ts) is None
+
+    # Engine tick recording with quote_age_sec
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+    call_q = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=100.0, ask=100.5, ltp=100.0)
+    put_q = StraddleLegQuote("NIFTY25000PE", "102", 25000, "PE", bid=100.0, ask=100.5, ltp=100.0)
+    engine.arm_entry(spot_price=25000.0, call_quote=call_q, put_quote=put_q, entry_ts=now_ts)
+
+    engine.process_tick(TickObservation(
+        ts=now_ts + 1.0,
+        nifty_spot=25000.0,
+        call_bid=100.0,
+        call_ask=100.5,
+        put_bid=100.0,
+        put_ask=100.5,
+        quote_age_sec=3.4,
+    ))
+    assert engine.tick_buffer[0]["quote_age_sec"] == 3.4
+
+
+def test_opening_straddle_selector_freshness_gating(mock_pre_market, temp_db):
+    """Verify run_opening_straddle aborts entry when market quotes lack valid freshness timestamps."""
+    from unittest.mock import patch
+    import time
+    from strategies.opening_straddle_selector import run_opening_straddle
+
+    with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls:
+        mock_loader = mock_loader_cls.return_value
+        mock_loader.load_intelligence.return_value = mock_pre_market
+
+        # 1. Quotes with missing feed_time -> must abort in live mode
+        mock_spot_no_time = {"ltp": 25000.0, "source": "angelone"}
+        mock_chain_no_time = {
+            "call": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "101", "trading_symbol": "NIFTY25000CE"},
+            "put": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "102", "trading_symbol": "NIFTY25000PE"},
+        }
+
+        with patch("strategies.opening_straddle_selector.get_nifty_spot", return_value=mock_spot_no_time), \
+             patch("strategies.opening_straddle_selector.get_nifty_option_chain", return_value=mock_chain_no_time):
+            code = run_opening_straddle(db_path=temp_db, enable_alerts=False, allow_synthetic_spread=False)
+            assert code == 1
+
+        # 2. Quotes with stale feed_time (> 15s) -> must abort in live mode
+        old_time = time.time() - 30.0
+        mock_spot_stale = {"ltp": 25000.0, "source": "angelone", "feed_time": old_time}
+        mock_chain_stale = {
+            "call": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "101", "trading_symbol": "NIFTY25000CE", "feed_time": old_time},
+            "put": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "102", "trading_symbol": "NIFTY25000PE", "feed_time": old_time},
+        }
+
+        with patch("strategies.opening_straddle_selector.get_nifty_spot", return_value=mock_spot_stale), \
+             patch("strategies.opening_straddle_selector.get_nifty_option_chain", return_value=mock_chain_stale):
+            code = run_opening_straddle(db_path=temp_db, enable_alerts=False, allow_synthetic_spread=False)
+            assert code == 1
