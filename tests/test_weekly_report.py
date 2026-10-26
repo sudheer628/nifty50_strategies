@@ -237,5 +237,297 @@ class WeeklyReportTests(unittest.TestCase):
 
 
 
+    def test_alpha_fsm_realized_pnl_takes_precedence_over_passive_hold_decay(self):
+        """When Alpha FSM is FLAT, summary and Discord report must report FSM locked profit, demoting passive decay."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "nifty50_weekly_data_20261021_20261027.db"
+            init_db(str(db_path))
+            insert_buy_snapshot(
+                str(db_path),
+                {
+                    "strategy_name": "nifty50_weekly_option_collector",
+                    "cycle_id": "20261021-212080e3",
+                    "week_start_date": "20261021",
+                    "expiry_date": "20261027",
+                    "call_strike": 22900,
+                    "put_strike": 23100,
+                    "call_buy_price": 303.6,
+                    "put_buy_price": 160.25,
+                    "captured_at": 1792500000,
+                },
+            )
+            # Row 1: Entry baseline
+            insert_record(
+                str(db_path),
+                {
+                    "strategy_name": "nifty50_weekly_option_collector",
+                    "collection_timestamp": 1792500000,
+                    "expiry_date": "20261027",
+                    "nifty_open": 23082.9,
+                    "nifty_ltp": 23082.9,
+                    "nifty_previous_close": 23050.0,
+                    "put_strike": 23100,
+                    "put_ltp": 160.25,
+                    "call_strike": 22900,
+                    "call_ltp": 303.6,
+                    "call_buy_price": 303.6,
+                    "put_buy_price": 160.25,
+                    "gainloss": 0.0,
+                    "cycle_id": "20261021-212080e3",
+                    "fsm_state": "DUAL_LONG",
+                    "fsm_call_status": "ACTIVE",
+                    "fsm_put_status": "ACTIVE",
+                    "fsm_total_gainloss": 0.0,
+                    "fsm_roi_pct": 0.0,
+                },
+            )
+            # Row 2: Final Monday close: raw unhedged decay = -89.45, but FSM locked at +302.0 pts
+            insert_record(
+                str(db_path),
+                {
+                    "strategy_name": "nifty50_weekly_option_collector",
+                    "collection_timestamp": 1792900000,
+                    "expiry_date": "20261027",
+                    "nifty_open": 23082.9,
+                    "nifty_ltp": 22753.2,
+                    "nifty_previous_close": 23050.0,
+                    "put_strike": 23100,
+                    "put_ltp": 334.0,
+                    "call_strike": 22900,
+                    "call_ltp": 40.4,
+                    "call_buy_price": 303.6,
+                    "put_buy_price": 160.25,
+                    "gainloss": -89.45,
+                    "cycle_id": "20261021-212080e3",
+                    "fsm_state": "FLAT",
+                    "fsm_call_status": "SALVAGED_CLOSED",
+                    "fsm_put_status": "HARVESTED_CLOSED",
+                    "fsm_call_exit_price": 151.8,
+                    "fsm_put_exit_price": 614.05,
+                    "fsm_realized_pnl": 302.0,
+                    "fsm_total_gainloss": 302.0,
+                    "fsm_roi_pct": 165.0,
+                },
+            )
+
+            rows, snapshot = load_report_data(db_path)
+            summary = calculate_summary(rows, snapshot, db_path)
+
+            # Single Source of Truth assertions
+            self.assertEqual(summary["realized_gainloss"], 302.0)
+            self.assertEqual(summary["latest_gainloss"], 302.0)
+            self.assertEqual(summary["realized_inr"], 302.0 * 65)  # ₹19,630.00
+            self.assertEqual(summary["exit_mode"], "ALPHA_FSM")
+            self.assertEqual(summary["passive_gainloss"], -89.45)
+            self.assertAlmostEqual(summary["alpha_saved_pts"], 391.45, places=2)
+            self.assertEqual(summary["fsm_state"], "FLAT")
+
+            # HTML Rendering assertions
+            chart_path = Path(temp_dir) / "report.png"
+            create_chart(rows, chart_path)
+            report_html = render_html(rows, summary, "report.png")
+            self.assertIn("+302.00 pts", report_html)
+            self.assertIn("STRATEGY LOCKED P&L", report_html)
+            self.assertIn("Alpha FSM (FLAT - Profit Locked ✓)", report_html)
+            self.assertIn("Counterfactual: Passive Unhedged Hold", report_html)
+            self.assertIn("-89.45 pts", report_html)
+
+            # Discord Alert payload assertions
+            with patch("scripts.send_weekly_report.send_discord_watchdog") as mock_watchdog:
+                mock_watchdog.return_value = True
+                success = send_weekly_report_discord(summary)
+                self.assertTrue(success)
+                self.assertTrue(mock_watchdog.called)
+
+                headline, embed = mock_watchdog.call_args[0]
+                self.assertIn("Locked P&L: **+302.00 pts", headline)
+                self.assertIn("(₹+19,630)", headline)
+                self.assertIn("🟢", headline)
+                self.assertEqual(embed["color"], 0x16a34a)
+                self.assertIn("PROFITABLE", embed["description"])
+
+                field_names = [f["name"] for f in embed["fields"]]
+                self.assertIn("📊 Strategy P&L (Alpha FSM Locked ✓)", field_names)
+                self.assertIn("⚡ FSM Leg Execution Breakdown", field_names)
+                self.assertIn("📉 Counterfactual: Passive Hold Decay", field_names)
+
+                pnl_field = next(f for f in embed["fields"] if f["name"] == "📊 Strategy P&L (Alpha FSM Locked ✓)")
+                self.assertIn("+302.00 pts", pnl_field["value"])
+                self.assertIn("₹+19,630", pnl_field["value"])
+
+                leg_field = next(f for f in embed["fields"] if f["name"] == "⚡ FSM Leg Execution Breakdown")
+                self.assertIn("₹151.80 (Salvage Stop Hit", leg_field["value"])
+                self.assertIn("₹614.05 (House Money Harvested ✓)", leg_field["value"])
+
+                counter_field = next(f for f in embed["fields"] if f["name"] == "📉 Counterfactual: Passive Hold Decay")
+                self.assertIn("-89.45 pts", counter_field["value"])
+                self.assertIn("+391.45 pts", counter_field["value"])
+
+    def test_partial_fsm_separates_realized_from_unrealized(self):
+        """When FSM is partial (SOLO_PUT), report breaks down closed leg realized vs open leg outcome."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "nifty50_weekly_data_20261021_20261027.db"
+            init_db(str(db_path))
+            insert_buy_snapshot(
+                str(db_path),
+                {
+                    "strategy_name": "nifty50_weekly_option_collector",
+                    "cycle_id": "CYCLE-PARTIAL-FSM",
+                    "week_start_date": "20261021",
+                    "expiry_date": "20261027",
+                    "call_strike": 22900,
+                    "put_strike": 23100,
+                    "call_buy_price": 200.0,
+                    "put_buy_price": 200.0,
+                    "captured_at": 1792500000,
+                },
+            )
+            # CE was salvaged at -100 pts (realized = -100). PE remains active and finishes at +150 pts.
+            insert_record(
+                str(db_path),
+                {
+                    "strategy_name": "nifty50_weekly_option_collector",
+                    "collection_timestamp": 1792900000,
+                    "expiry_date": "20261027",
+                    "nifty_open": 23000.0,
+                    "nifty_ltp": 22800.0,
+                    "nifty_previous_close": 23000.0,
+                    "put_strike": 23100,
+                    "put_ltp": 350.0,
+                    "call_strike": 22900,
+                    "call_ltp": 100.0,
+                    "call_buy_price": 200.0,
+                    "put_buy_price": 200.0,
+                    "gainloss": 50.0,
+                    "cycle_id": "CYCLE-PARTIAL-FSM",
+                    "fsm_state": "SOLO_PUT",
+                    "fsm_call_status": "SALVAGED_CLOSED",
+                    "fsm_put_status": "ACTIVE",
+                    "fsm_call_exit_price": 100.0,
+                    "fsm_realized_pnl": -100.0,
+                    "fsm_unrealized_pnl": 150.0,
+                    "fsm_total_gainloss": 50.0,
+                    "fsm_roi_pct": 12.5,
+                },
+            )
+
+            rows, snapshot = load_report_data(db_path)
+            summary = calculate_summary(rows, snapshot, db_path)
+
+            self.assertEqual(summary["exit_mode"], "ALPHA_FSM_PARTIAL")
+            self.assertEqual(summary["is_fsm_partial"], True)
+            self.assertEqual(summary["is_fsm_flat"], False)
+            self.assertEqual(summary["alpha_secured"], False)
+            self.assertEqual(summary["fsm_realized_pnl"], -100.0)
+            self.assertEqual(summary["fsm_unrealized_pnl"], 150.0)
+            self.assertEqual(summary["realized_gainloss"], 50.0)
+
+            # HTML card assertion
+            chart_path = Path(temp_dir) / "report.png"
+            create_chart(rows, chart_path)
+            report_html = render_html(rows, summary, "report.png")
+            self.assertIn("STRATEGY NET P&L (PARTIAL EXIT)", report_html)
+            self.assertIn("Net FSM Advantage vs Passive Hold", report_html)
+
+            with patch("scripts.send_weekly_report.send_discord_watchdog") as mock_watchdog:
+                mock_watchdog.return_value = True
+                send_weekly_report_discord(summary)
+                headline, embed = mock_watchdog.call_args[0]
+                self.assertIn("Net Cycle P&L: **+50.00 pts", headline)
+                pnl_field = next(f for f in embed["fields"] if f["name"] == "📊 Strategy P&L (Partial FSM Exit)")
+                self.assertIn("Closed Leg Realized: **-100.00 pts**", pnl_field["value"])
+                self.assertIn("Remaining Leg Mark (Cycle Close): **+150.00 pts**", pnl_field["value"])
+                counter_field = next(f for f in embed["fields"] if f["name"] == "📉 Counterfactual: Passive Hold Decay")
+                self.assertIn("Net FSM Advantage vs Passive Hold", counter_field["value"])
+
+    def test_peak_target_alert_noted_without_false_realized_claim(self):
+        """When 20% Peak Target was hit but no FSM exits triggered, report retains expiry close as actual outcome."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "nifty50_weekly_data_20261021_20261027.db"
+            init_db(str(db_path))
+            insert_buy_snapshot(
+                str(db_path),
+                {
+                    "strategy_name": "nifty50_weekly_option_collector",
+                    "cycle_id": "CYCLE-PEAK-TEST",
+                    "week_start_date": "20261021",
+                    "expiry_date": "20261027",
+                    "call_strike": 24800,
+                    "put_strike": 24600,
+                    "call_buy_price": 100.0,
+                    "put_buy_price": 100.0,
+                    "captured_at": 1792500000,
+                },
+            )
+            # Mid-week peak reaches +50 pts (+25%), expiry decays to -120 pts
+            insert_record(
+                str(db_path),
+                {
+                    "strategy_name": "nifty50_weekly_option_collector",
+                    "collection_timestamp": 1792600000,
+                    "expiry_date": "20261027",
+                    "nifty_open": 24700.0,
+                    "nifty_ltp": 24750.0,
+                    "nifty_previous_close": 24700.0,
+                    "put_strike": 24600,
+                    "put_ltp": 90.0,
+                    "call_strike": 24800,
+                    "call_ltp": 160.0,
+                    "call_buy_price": 100.0,
+                    "put_buy_price": 100.0,
+                    "gainloss": 50.0,
+                    "cycle_id": "CYCLE-PEAK-TEST",
+                },
+            )
+            insert_record(
+                str(db_path),
+                {
+                    "strategy_name": "nifty50_weekly_option_collector",
+                    "collection_timestamp": 1792900000,
+                    "expiry_date": "20261027",
+                    "nifty_open": 24700.0,
+                    "nifty_ltp": 24700.0,
+                    "nifty_previous_close": 24700.0,
+                    "put_strike": 24600,
+                    "put_ltp": 40.0,
+                    "call_strike": 24800,
+                    "call_ltp": 40.0,
+                    "call_buy_price": 100.0,
+                    "put_buy_price": 100.0,
+                    "gainloss": -120.0,
+                    "cycle_id": "CYCLE-PEAK-TEST",
+                },
+            )
+
+            rows, snapshot = load_report_data(db_path)
+            # Attach peak profit metadata
+            snapshot["peak_profit"] = {
+                "peak_pnl_pts": 50.0,
+                "peak_pnl_pct": 25.0,
+                "peak_pnl_inr": 3250.0,
+            }
+            summary = calculate_summary(rows, snapshot, db_path)
+
+            # Does not falsely claim +50 pts was realized
+            self.assertEqual(summary["realized_gainloss"], -120.0)
+            self.assertEqual(summary["exit_mode"], "HOLD_TO_EXPIRY")
+            self.assertEqual(summary["is_peak_target_hit"], True)
+            self.assertEqual(summary["peak_pnl_pts"], 50.0)
+
+            # Render HTML and assert 20% Target Alert annotation is present
+            chart_path = Path(temp_dir) / "report.png"
+            create_chart(rows, chart_path)
+            report_html = render_html(rows, summary, "report.png")
+            self.assertIn("🎯 20% Target Alert: +50.00 pts (+25.0%)", report_html)
+
+            # Render Discord embed and assert 20% Target Alert appears in Watermark Range
+            with patch("scripts.send_weekly_report.send_discord_watchdog") as mock_watchdog:
+                mock_watchdog.return_value = True
+                send_weekly_report_discord(summary)
+                headline, embed = mock_watchdog.call_args[0]
+                watermark_field = next(f for f in embed["fields"] if f["name"] == "🌊 Watermark Range")
+                self.assertIn("🎯 20% Target Alert: `+50.00 pts` (+25.0%)", watermark_field["value"])
+
+
 if __name__ == "__main__":
     unittest.main()
