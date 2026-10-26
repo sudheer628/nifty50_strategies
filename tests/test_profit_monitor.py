@@ -373,7 +373,8 @@ class ProfitMonitorTests(unittest.TestCase):
             {"DISCORD_URL": "https://discord.com/api/webhooks/test-webhook-url", "DISCORD_EXIT_5DAY": "", "DISCORD_URL_5DAY": ""},
             clear=False,
         ):
-            success = send_peak_alert_discord(event)
+            with patch("common.profit_monitor.DISCORD_EXIT_5DAY", ""):
+                success = send_peak_alert_discord(event)
             self.assertTrue(success)
             mock_post.assert_called_once()
             called_url = mock_post.call_args[0][0]
@@ -429,7 +430,8 @@ class ProfitMonitorTests(unittest.TestCase):
             {"DISCORD_URL": "https://discord.com/api/webhooks/test-webhook-url", "DISCORD_EXIT_5DAY": "", "DISCORD_URL_5DAY": ""},
             clear=False,
         ):
-            success = send_peak_alert_discord(event)
+            with patch("common.profit_monitor.DISCORD_EXIT_5DAY", ""):
+                success = send_peak_alert_discord(event)
             self.assertFalse(success)
 
     @patch("common.profit_monitor.requests.post", side_effect=Exception("Connection refused"))
@@ -462,7 +464,8 @@ class ProfitMonitorTests(unittest.TestCase):
             clear=False,
         ):
             # Should safely catch exception and return False
-            success = send_peak_alert_discord(event)
+            with patch("common.profit_monitor.DISCORD_EXIT_5DAY", ""):
+                success = send_peak_alert_discord(event)
             self.assertFalse(success)
 
     def test_send_peak_alert_discord_missing_url(self):
@@ -476,6 +479,7 @@ class ProfitMonitorTests(unittest.TestCase):
         }
         with patch.dict(os.environ, {"DISCORD_URL": "", "DISCORD_EXIT_5DAY": "", "DISCORD_URL_5DAY": ""}, clear=False):
             with patch("common.profit_monitor.DISCORD_URL", ""), patch("common.profit_monitor.DISCORD_EXIT_5DAY", ""):
+
                 success = send_peak_alert_discord(event)
                 self.assertFalse(success)
 
@@ -511,7 +515,8 @@ class ProfitMonitorTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"DISCORD_URL": "https://discord.com/mock"}), \
              patch("requests.post", side_effect=mock_post):
-            success = send_peak_alert_discord(event)
+            with patch("common.profit_monitor.DISCORD_EXIT_5DAY", ""):
+                success = send_peak_alert_discord(event)
             self.assertTrue(success)
             self.assertEqual(len(posted), 1)
             payload = posted[0]
