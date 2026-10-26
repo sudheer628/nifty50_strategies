@@ -47,16 +47,17 @@ def setup_cli_logging(level: str = "INFO"):
 
 
 def run_opening_straddle(
-    dry_run: bool = True,
     db_path: Optional[str] = None,
     poll_interval_sec: float = 1.0,
     max_duration_sec: int = 2700,  # 45 minutes
 ) -> int:
     """
     Main orchestrator running the daily opening straddle cycle from 09:14 to 10:00 AM.
+    Operates strictly as an analytical signal, paper-execution, and risk-tracking engine.
+    Order placement is completely out of scope.
     """
     logger.info("=" * 65)
-    logger.info("Starting NIFTY 50 Opening Straddle Selector [DryRun=%s]", dry_run)
+    logger.info("Starting NIFTY 50 Opening Straddle Strategy (Tracking Mode)")
     logger.info("=" * 65)
 
     # 1. Step 1: Pre-Market Multi-Source Ingestion (09:14:00 AM)
@@ -204,13 +205,13 @@ def run_opening_straddle(
 
 def main():
     parser = argparse.ArgumentParser(description="NIFTY 50 Opening Straddle Strategy (09:15 - 10:00 AM)")
-    parser.add_argument("--dry-run", action="store_true", default=True, help="Run in simulation/paper mode")
+    parser.add_argument("--dry-run", action="store_true", default=True, help="Tracking mode (order placement is out of scope)")
     parser.add_argument("--db-path", type=str, help="Custom SQLite database path")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
     setup_cli_logging(args.log_level)
-    return run_opening_straddle(dry_run=args.dry_run, db_path=args.db_path)
+    return run_opening_straddle(db_path=args.db_path)
 
 
 if __name__ == "__main__":
