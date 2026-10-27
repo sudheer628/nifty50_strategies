@@ -110,6 +110,30 @@ class WeeklyReportTests(unittest.TestCase):
             self.assertEqual(resolve_discord_url(), "https://discord.com/api/webhooks/test-url")
             self.assertEqual(resolve_discord_watchdog_url(), "https://discord.com/api/webhooks/test-url")
 
+    def test_resolve_discord_url_track_routing(self):
+        mock_env = {
+            "DISCORD_EXIT_3DAY": "https://discord.com/api/webhooks/mock-3day",
+            "DISCORD_EXIT_5DAY": "https://discord.com/api/webhooks/mock-5day",
+            "DISCORD_URL": "https://discord.com/api/webhooks/mock-fallback",
+        }
+        with patch.dict(os.environ, mock_env, clear=True):
+            self.assertEqual(resolve_discord_url("thursday"), "https://discord.com/api/webhooks/mock-3day")
+            self.assertEqual(resolve_discord_url("3day"), "https://discord.com/api/webhooks/mock-3day")
+            self.assertEqual(resolve_discord_url("3-day"), "https://discord.com/api/webhooks/mock-3day")
+            self.assertEqual(resolve_discord_url("weekly"), "https://discord.com/api/webhooks/mock-5day")
+            self.assertEqual(resolve_discord_url("5day"), "https://discord.com/api/webhooks/mock-5day")
+
+    def test_resolve_discord_url_candidate_env_precedence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_env_file = Path(tmpdir) / ".env"
+            fake_env_file.write_text("DISCORD_EXIT_3DAY=https://discord.com/api/webhooks/candidate-3day\n", encoding="utf-8")
+            # os.environ only has general DISCORD_URL
+            with patch.dict(os.environ, {"DISCORD_URL": "https://discord.com/api/webhooks/general-fallback"}, clear=True):
+                with patch("scripts.send_weekly_report.Path.exists", lambda p: str(p) == str(fake_env_file) or Path(p).name == ".env"):
+                    with patch("scripts.send_weekly_report.Path.open", side_effect=lambda *args, **kwargs: open(fake_env_file, *args, **kwargs)):
+                        resolved = resolve_discord_url("thursday")
+                        self.assertEqual(resolved, "https://discord.com/api/webhooks/candidate-3day")
+
     def test_send_discord_report_missing_url(self):
         with patch("scripts.send_weekly_report.resolve_discord_url", return_value=""):
             self.assertFalse(send_discord_report("Test message"))
@@ -152,10 +176,16 @@ class WeeklyReportTests(unittest.TestCase):
         self.assertTrue(res)
         self.assertTrue(mock_send.called)
         headline, embed = mock_send.call_args[0]
+        self.assertEqual(mock_send.call_args[1], {"track": "weekly"})
         self.assertIn("20260804-test", headline)
         self.assertIn("+16.00 pts", headline)
         self.assertEqual(embed["color"], 0x16a34a)
         self.assertGreaterEqual(len(embed["fields"]), 5)
+
+        # Test explicit Thursday track routing
+        res_thu = send_weekly_report_discord(summary, track="thursday")
+        self.assertTrue(res_thu)
+        self.assertEqual(mock_send.call_args[1], {"track": "thursday"})
 
     def _create_thursday_db(self, directory: str) -> Path:
         db_path = Path(directory) / "nifty50_thursday_data_20261008_20261013.db"

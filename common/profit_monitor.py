@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 import pytz
 import requests
@@ -93,6 +94,7 @@ def evaluate_peak_profit(
     fsm_total_gainloss: Optional[float] = None,
     snapshot_filepath: Optional[str] = None,
     track_label: str = "5-Day Tuesday Strategy",
+    track: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], bool, str]:
     """
     Evaluate current strangle profit against the cycle's high-water mark.
@@ -267,7 +269,7 @@ def evaluate_peak_profit(
         "fsm_total_gainloss": fsm_total_gainloss,
         "dry_run": dry_run,
         "track_label": track_label,
-        "track": "thursday" if ("3-day" in str(track_label).lower() or "thursday" in str(track_label).lower()) else "weekly",
+        "track": track or ("thursday" if ("3" in str(track_label).lower() or "thu" in str(track_label).lower()) else "weekly"),
     }
 
     dispatch_ok = on_new_peak(event)
@@ -331,31 +333,76 @@ def resolve_discord_peak_url(track: Optional[str] = None, track_label: Optional[
     """
     Resolve track-specific Discord Webhook URL for peak profit alerts.
     Priority:
-      3-Day Strategy: DISCORD_EXIT_3DAY -> DISCORD_URL_3DAY -> DISCORD_URL
-      5-Day Strategy: DISCORD_EXIT_5DAY -> DISCORD_URL_5DAY -> DISCORD_URL
+      3-Day Strategy: DISCORD_EXIT_3DAY -> DISCORD_URL_3DAY -> candidate .env -> DISCORD_URL
+      5-Day Strategy: DISCORD_EXIT_5DAY -> DISCORD_URL_5DAY -> candidate .env -> DISCORD_URL
     """
     is_3day = False
-    if track and "thu" in str(track).lower():
+    t = str(track or "").strip().lower()
+    tl = str(track_label or "").strip().lower()
+    if "thu" in t or "3" in t:
         is_3day = True
-    elif track_label and ("3-day" in str(track_label).lower() or "thursday" in str(track_label).lower()):
+    elif "3" in tl or "thu" in tl:
         is_3day = True
 
-    if is_3day:
-        return (
-            os.getenv("DISCORD_EXIT_3DAY", "").strip()
-            or os.getenv("DISCORD_URL_3DAY", "").strip()
-            or DISCORD_EXIT_3DAY
-            or os.getenv("DISCORD_URL", "").strip()
-            or DISCORD_URL
-        )
-    else:
-        return (
-            os.getenv("DISCORD_EXIT_5DAY", "").strip()
-            or os.getenv("DISCORD_URL_5DAY", "").strip()
-            or DISCORD_EXIT_5DAY
-            or os.getenv("DISCORD_URL", "").strip()
-            or DISCORD_URL
-        )
+    track_keys = ["DISCORD_EXIT_3DAY", "DISCORD_URL_3DAY"] if is_3day else ["DISCORD_EXIT_5DAY", "DISCORD_URL_5DAY"]
+    config_default = DISCORD_EXIT_3DAY if is_3day else DISCORD_EXIT_5DAY
+
+    # 1. Check track keys in os.environ or module config default
+    for k in track_keys:
+        val = os.getenv(k, "").strip()
+        if val:
+            return val
+    if config_default:
+        return config_default
+
+    # Candidate paths
+    home = os.path.expanduser("~")
+    base_dir = Path(__file__).resolve().parents[1]
+    candidate_paths = [
+        base_dir / ".env",
+        Path(home) / ".env",
+        Path(home) / "nifty50_strategies" / ".env",
+        Path(home) / "sentinel-hermes" / ".env",
+        Path(home) / "market_signal_agent" / ".env",
+        Path(home) / "news-analyzer-for-market-sentiment" / ".env",
+        Path(home) / "mcx_signal_features" / ".env",
+        Path(home) / "nifty_signal_features" / ".env",
+    ]
+
+    # 2. Check candidate files for track keys BEFORE fallback to DISCORD_URL
+    for k in track_keys:
+        for p in candidate_paths:
+            if p.exists():
+                try:
+                    with p.open("r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith(f"{k}="):
+                                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                if val:
+                                    return val
+                except Exception:
+                    pass
+
+    # 3. Fall back to DISCORD_URL in os.environ or config
+    env_val = os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
+    if env_val:
+        return env_val
+
+    # 4. Fall back to DISCORD_URL in candidate .env files
+    for p in candidate_paths:
+        if p.exists():
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("DISCORD_URL="):
+                            val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if val:
+                                return val
+            except Exception:
+                pass
+    return ""
 
 
 def send_peak_alert_discord(event: Dict[str, Any]) -> bool:

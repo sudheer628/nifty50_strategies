@@ -43,6 +43,8 @@ from config import (
     STRATEGY_NAME_THURSDAY,
     NIFTY_LOT_SIZE,
     DISCORD_URL,
+    DISCORD_EXIT_3DAY,
+    DISCORD_EXIT_5DAY,
 )
 
 
@@ -631,12 +633,28 @@ def send_email(subject: str, plain_body: str, html_body: str, chart_path: Path) 
     logger.info("Email notifications are disabled. Weekly report cards route to DISCORD_URL.")
 
 
-def resolve_discord_url() -> str:
-    """Resolve DISCORD_URL webhook URL from os.environ, config, or candidate .env files."""
-    env_val = os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
-    if env_val:
-        return env_val
+def resolve_discord_url(track: str = "weekly") -> str:
+    """Resolve track-specific Discord webhook URL from os.environ, config, or candidate .env files.
 
+    Track routing priority:
+      3-Day Track (thursday / 3-day): DISCORD_EXIT_3DAY -> DISCORD_URL_3DAY -> candidate .env -> DISCORD_URL
+      5-Day Track (weekly / 5-day):   DISCORD_EXIT_5DAY -> DISCORD_URL_5DAY -> candidate .env -> DISCORD_URL
+    Candidate .env files are scanned for the track-specific keys before falling back to DISCORD_URL.
+    """
+    t = str(track or "").strip().lower()
+    is_3day = "thu" in t or "3" in t
+    track_keys = ["DISCORD_EXIT_3DAY", "DISCORD_URL_3DAY"] if is_3day else ["DISCORD_EXIT_5DAY", "DISCORD_URL_5DAY"]
+    config_default = DISCORD_EXIT_3DAY if is_3day else DISCORD_EXIT_5DAY
+
+    # 1. Check track keys in os.environ or config default
+    for k in track_keys:
+        val = os.getenv(k, "").strip()
+        if val:
+            return val
+    if config_default:
+        return config_default
+
+    # Candidate paths
     home = os.path.expanduser("~")
     base_dir = Path(__file__).resolve().parents[1]
     candidate_paths = [
@@ -649,6 +667,28 @@ def resolve_discord_url() -> str:
         Path(home) / "mcx_signal_features" / ".env",
         Path(home) / "nifty_signal_features" / ".env",
     ]
+
+    # 2. Check candidate files for track keys BEFORE fallback to DISCORD_URL
+    for k in track_keys:
+        for p in candidate_paths:
+            if p.exists():
+                try:
+                    with p.open("r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith(f"{k}="):
+                                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                if val:
+                                    return val
+                except Exception:
+                    pass
+
+    # 3. Fallback to general DISCORD_URL in os.environ or config
+    env_val = os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
+    if env_val:
+        return env_val
+
+    # 4. Fallback to DISCORD_URL in candidate .env files
     for p in candidate_paths:
         if p.exists():
             try:
@@ -668,16 +708,19 @@ def resolve_discord_url() -> str:
 resolve_discord_watchdog_url = resolve_discord_url
 
 
-def send_discord_report(content: str, embed: Optional[Dict[str, Any]] = None) -> bool:
+def send_discord_report(
+    content: str, embed: Optional[Dict[str, Any]] = None, track: str = "weekly"
+) -> bool:
     """
-    Send a report notification to the dedicated DISCORD_URL channel.
+    Send a report notification to the track-specific Discord channel (fallback DISCORD_URL).
     Uses standard library urllib (zero external pip dependencies) and is wrapped
     in try/except so webhook issues never crash the script.
     """
-    webhook_url = resolve_discord_url()
+    webhook_url = resolve_discord_url(track=track)
     if not webhook_url:
         logger.warning(
-            "⚠️ [DISCORD_URL] Webhook URL not set in environment or .env; alert dropped: %s",
+            "⚠️ [DISCORD_URL] Webhook URL not set for track '%s' in environment or .env; alert dropped: %s",
+            track,
             content[:120],
         )
         return False
@@ -712,13 +755,15 @@ def send_discord_report(content: str, embed: Optional[Dict[str, Any]] = None) ->
         return False
 
 
-def send_discord_watchdog(content: str, embed: Optional[Dict[str, Any]] = None) -> bool:
-    """Send an operational notification to DISCORD_URL (alias for backward compatibility)."""
-    return send_discord_report(content, embed)
+def send_discord_watchdog(
+    content: str, embed: Optional[Dict[str, Any]] = None, track: str = "weekly"
+) -> bool:
+    """Send an operational notification to Discord (alias for backward compatibility)."""
+    return send_discord_report(content, embed, track=track)
 
 
 def send_weekly_report_discord(summary: Dict[str, Any], track: str = "weekly") -> bool:
-    """Send NIFTY50 weekly strangle close report card to DISCORD_URL."""
+    """Send NIFTY50 weekly strangle close report card to track-specific Discord channel."""
     cycle_id = summary.get("cycle_id", "UNKNOWN")
     realized_gain = summary.get("realized_gainloss", summary.get("latest_gainloss"))
     passive_gain = summary.get("passive_gainloss")
@@ -912,7 +957,7 @@ def send_weekly_report_discord(summary: Dict[str, Any], track: str = "weekly") -
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    return send_discord_watchdog(headline, embed)
+    return send_discord_watchdog(headline, embed, track=track)
 
 
 def main() -> int:
@@ -969,9 +1014,9 @@ def main() -> int:
             logger.info("Dry run complete; report card not sent")
             return 0
 
-        # Dispatch to DISCORD_URL channel
+        # Dispatch to Discord channel
         try:
-            logger.info("Dispatching %s report card to DISCORD_URL...", args.track)
+            logger.info("Dispatching %s report card to Discord...", args.track)
             success = send_weekly_report_discord(summary, track=args.track)
             if success:
                 logger.info("✓ Discord report dispatched successfully")

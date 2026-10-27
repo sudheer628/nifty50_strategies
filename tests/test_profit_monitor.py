@@ -695,6 +695,40 @@ class ProfitMonitorTests(unittest.TestCase):
         self.assertAlmostEqual(state2["peak_pnl_pct"], 20.05, places=1)
         self.assertEqual(mock_on_peak.call_count, 1)
 
+    def test_resolve_discord_peak_url_track_routing(self):
+        from common.profit_monitor import resolve_discord_peak_url
+        env_vars = {
+            "DISCORD_EXIT_3DAY": "https://discord.com/mock-3day",
+            "DISCORD_EXIT_5DAY": "https://discord.com/mock-5day",
+            "DISCORD_URL": "https://discord.com/mock-general",
+        }
+        with patch.dict(os.environ, env_vars, clear=True):
+            with patch("common.profit_monitor.DISCORD_EXIT_3DAY", ""), \
+                 patch("common.profit_monitor.DISCORD_EXIT_5DAY", ""), \
+                 patch("common.profit_monitor.DISCORD_URL", ""):
+                self.assertEqual(resolve_discord_peak_url(track="thursday"), "https://discord.com/mock-3day")
+                self.assertEqual(resolve_discord_peak_url(track="3day"), "https://discord.com/mock-3day")
+                self.assertEqual(resolve_discord_peak_url(track="3-day"), "https://discord.com/mock-3day")
+                self.assertEqual(resolve_discord_peak_url(track_label="3-Day Thursday Strategy"), "https://discord.com/mock-3day")
+                self.assertEqual(resolve_discord_peak_url(track="weekly"), "https://discord.com/mock-5day")
+                self.assertEqual(resolve_discord_peak_url(track="5day"), "https://discord.com/mock-5day")
+                self.assertEqual(resolve_discord_peak_url(track_label="5-Day Tuesday Strategy"), "https://discord.com/mock-5day")
+
+    def test_resolve_discord_peak_url_candidate_env_precedence(self):
+        import tempfile
+        from common.profit_monitor import resolve_discord_peak_url
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_env = Path(tmpdir) / ".env"
+            fake_env.write_text("DISCORD_EXIT_3DAY=https://discord.com/from-candidate-3day\n", encoding="utf-8")
+            with patch.dict(os.environ, {"DISCORD_URL": "https://discord.com/general-fallback"}, clear=True):
+                with patch("common.profit_monitor.DISCORD_EXIT_3DAY", ""), \
+                     patch("common.profit_monitor.DISCORD_EXIT_5DAY", ""), \
+                     patch("common.profit_monitor.DISCORD_URL", ""):
+                    with patch("common.profit_monitor.Path.exists", lambda p: str(p) == str(fake_env) or Path(p).name == ".env"):
+                        with patch("common.profit_monitor.Path.open", side_effect=lambda *args, **kwargs: open(fake_env, *args, **kwargs)):
+                            resolved = resolve_discord_peak_url(track="thursday")
+                            self.assertEqual(resolved, "https://discord.com/from-candidate-3day")
+
 
 if __name__ == "__main__":
     unittest.main()

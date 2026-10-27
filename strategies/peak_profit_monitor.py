@@ -158,6 +158,7 @@ def monitor_once(force: bool = False, no_alert: bool = False, no_email: bool = F
         if track.lower() == "thursday":
             eval_kwargs["snapshot_filepath"] = snapshot_file
             eval_kwargs["track_label"] = track_label
+            eval_kwargs["track"] = track
 
         peak_state, alert_triggered, peak_msg = evaluate_peak_profit(**eval_kwargs)
 
