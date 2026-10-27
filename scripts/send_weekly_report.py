@@ -633,28 +633,16 @@ def send_email(subject: str, plain_body: str, html_body: str, chart_path: Path) 
     logger.info("Email notifications are disabled. Weekly report cards route to DISCORD_URL.")
 
 
-def resolve_discord_url(track: str = "weekly") -> str:
+def resolve_discord_url(track: Optional[str] = None) -> str:
     """Resolve track-specific Discord webhook URL from os.environ, config, or candidate .env files.
 
     Track routing priority:
+      No track (None / watchdog):     DISCORD_URL
       3-Day Track (thursday / 3-day): DISCORD_EXIT_3DAY -> DISCORD_URL_3DAY -> candidate .env -> DISCORD_URL
       5-Day Track (weekly / 5-day):   DISCORD_EXIT_5DAY -> DISCORD_URL_5DAY -> candidate .env -> DISCORD_URL
-    Candidate .env files are scanned for the track-specific keys before falling back to DISCORD_URL.
+    Candidate .env files are scanned for the track-specific keys only if not defined in os.environ,
+    and before falling back to DISCORD_URL.
     """
-    t = str(track or "").strip().lower()
-    is_3day = "thu" in t or "3" in t
-    track_keys = ["DISCORD_EXIT_3DAY", "DISCORD_URL_3DAY"] if is_3day else ["DISCORD_EXIT_5DAY", "DISCORD_URL_5DAY"]
-    config_default = DISCORD_EXIT_3DAY if is_3day else DISCORD_EXIT_5DAY
-
-    # 1. Check track keys in os.environ or config default
-    for k in track_keys:
-        val = os.getenv(k, "").strip()
-        if val:
-            return val
-    if config_default:
-        return config_default
-
-    # Candidate paths
     home = os.path.expanduser("~")
     base_dir = Path(__file__).resolve().parents[1]
     candidate_paths = [
@@ -668,27 +656,57 @@ def resolve_discord_url(track: str = "weekly") -> str:
         Path(home) / "nifty_signal_features" / ".env",
     ]
 
-    # 2. Check candidate files for track keys BEFORE fallback to DISCORD_URL
-    for k in track_keys:
+    t = str(track or "").strip().lower()
+    if not t:
+        # Default / watchdog channel: resolve DISCORD_URL
+        if "DISCORD_URL" in os.environ:
+            return os.environ["DISCORD_URL"].strip()
         for p in candidate_paths:
             if p.exists():
                 try:
                     with p.open("r", encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
-                            if line.startswith(f"{k}="):
+                            if line.startswith("DISCORD_URL="):
                                 val = line.split("=", 1)[1].strip().strip('"').strip("'")
                                 if val:
                                     return val
                 except Exception:
                     pass
+        return os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
 
-    # 3. Fallback to general DISCORD_URL in os.environ or config
-    env_val = os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
-    if env_val:
-        return env_val
+    is_3day = "thu" in t or "3" in t
+    track_keys = ["DISCORD_EXIT_3DAY", "DISCORD_URL_3DAY"] if is_3day else ["DISCORD_EXIT_5DAY", "DISCORD_URL_5DAY"]
 
-    # 4. Fallback to DISCORD_URL in candidate .env files
+    # 1. Check if track keys are present in os.environ (highest precedence)
+    for k in track_keys:
+        if k in os.environ:
+            val = os.environ[k].strip()
+            if val:
+                return val
+
+    # 2. Check candidate .env files only if track keys are NOT defined in os.environ
+    track_keys_in_env = any(k in os.environ for k in track_keys)
+    if not track_keys_in_env:
+        for k in track_keys:
+            for p in candidate_paths:
+                if p.exists():
+                    try:
+                        with p.open("r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line.startswith(f"{k}="):
+                                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                    if val:
+                                        return val
+                    except Exception:
+                        pass
+
+    # 3. Fall back to general DISCORD_URL in os.environ
+    if "DISCORD_URL" in os.environ:
+        return os.environ["DISCORD_URL"].strip()
+
+    # 4. Fall back to DISCORD_URL in candidate .env files
     for p in candidate_paths:
         if p.exists():
             try:
@@ -701,7 +719,8 @@ def resolve_discord_url(track: str = "weekly") -> str:
                                 return val
             except Exception:
                 pass
-    return ""
+
+    return os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
 
 
 # Backwards compatibility alias

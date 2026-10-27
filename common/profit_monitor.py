@@ -345,64 +345,63 @@ def resolve_discord_peak_url(track: Optional[str] = None, track_label: Optional[
         is_3day = True
 
     track_keys = ["DISCORD_EXIT_3DAY", "DISCORD_URL_3DAY"] if is_3day else ["DISCORD_EXIT_5DAY", "DISCORD_URL_5DAY"]
-    config_default = DISCORD_EXIT_3DAY if is_3day else DISCORD_EXIT_5DAY
 
-    # 1. Check track keys in os.environ or module config default
+    # 1. Check if track keys are present in os.environ (highest precedence)
     for k in track_keys:
-        val = os.getenv(k, "").strip()
-        if val:
-            return val
-    if config_default:
-        return config_default
+        if k in os.environ:
+            val = os.environ[k].strip()
+            if val:
+                return val
 
-    # Candidate paths
-    home = os.path.expanduser("~")
-    base_dir = Path(__file__).resolve().parents[1]
-    candidate_paths = [
-        base_dir / ".env",
-        Path(home) / ".env",
-        Path(home) / "nifty50_strategies" / ".env",
-        Path(home) / "sentinel-hermes" / ".env",
-        Path(home) / "market_signal_agent" / ".env",
-        Path(home) / "news-analyzer-for-market-sentiment" / ".env",
-        Path(home) / "mcx_signal_features" / ".env",
-        Path(home) / "nifty_signal_features" / ".env",
-    ]
+    # 2. Check candidate .env files only if track keys are NOT defined in os.environ
+    track_keys_in_env = any(k in os.environ for k in track_keys)
+    if not track_keys_in_env:
+        home = os.path.expanduser("~")
+        base_dir = Path(__file__).resolve().parents[1]
+        candidate_paths = [
+            base_dir / ".env",
+            Path(home) / ".env",
+            Path(home) / "nifty50_strategies" / ".env",
+            Path(home) / "sentinel-hermes" / ".env",
+            Path(home) / "market_signal_agent" / ".env",
+            Path(home) / "news-analyzer-for-market-sentiment" / ".env",
+            Path(home) / "mcx_signal_features" / ".env",
+            Path(home) / "nifty_signal_features" / ".env",
+        ]
+        for k in track_keys:
+            for p in candidate_paths:
+                if p.exists():
+                    try:
+                        with p.open("r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line.startswith(f"{k}="):
+                                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                    if val:
+                                        return val
+                    except Exception:
+                        pass
 
-    # 2. Check candidate files for track keys BEFORE fallback to DISCORD_URL
-    for k in track_keys:
+    # 3. Fall back to general DISCORD_URL in os.environ
+    if "DISCORD_URL" in os.environ:
+        return os.environ["DISCORD_URL"].strip()
+
+    # 4. Fall back to DISCORD_URL in candidate .env files
+    if not track_keys_in_env:
         for p in candidate_paths:
             if p.exists():
                 try:
                     with p.open("r", encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
-                            if line.startswith(f"{k}="):
+                            if line.startswith("DISCORD_URL="):
                                 val = line.split("=", 1)[1].strip().strip('"').strip("'")
                                 if val:
                                     return val
                 except Exception:
                     pass
 
-    # 3. Fall back to DISCORD_URL in os.environ or config
-    env_val = os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
-    if env_val:
-        return env_val
-
-    # 4. Fall back to DISCORD_URL in candidate .env files
-    for p in candidate_paths:
-        if p.exists():
-            try:
-                with p.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith("DISCORD_URL="):
-                            val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                            if val:
-                                return val
-            except Exception:
-                pass
-    return ""
+    return os.getenv("DISCORD_URL", "").strip() or DISCORD_URL
 
 
 def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
