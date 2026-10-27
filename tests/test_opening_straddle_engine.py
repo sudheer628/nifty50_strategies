@@ -586,7 +586,13 @@ def test_opening_straddle_selector_freshness_gating(mock_pre_market, temp_db):
 
         with patch("strategies.opening_straddle_selector.get_nifty_spot", return_value=mock_spot_no_time), \
              patch("strategies.opening_straddle_selector.get_nifty_option_chain", return_value=mock_chain_no_time):
-            code = run_opening_straddle(db_path=temp_db, enable_alerts=False, allow_synthetic_spread=False)
+            code = run_opening_straddle(
+                db_path=temp_db,
+                enable_alerts=False,
+                allow_synthetic_spread=False,
+                wait_for_market_open=False,
+                entry_grace_timeout_sec=0.1,
+            )
             assert code == 1
 
         # 2. Quotes with stale feed_time (> 15s) -> must abort in live mode
@@ -599,5 +605,85 @@ def test_opening_straddle_selector_freshness_gating(mock_pre_market, temp_db):
 
         with patch("strategies.opening_straddle_selector.get_nifty_spot", return_value=mock_spot_stale), \
              patch("strategies.opening_straddle_selector.get_nifty_option_chain", return_value=mock_chain_stale):
-            code = run_opening_straddle(db_path=temp_db, enable_alerts=False, allow_synthetic_spread=False)
+            code = run_opening_straddle(
+                db_path=temp_db,
+                enable_alerts=False,
+                allow_synthetic_spread=False,
+                wait_for_market_open=False,
+                entry_grace_timeout_sec=0.1,
+            )
             assert code == 1
+
+
+def test_opening_straddle_entry_retry_success(mock_pre_market, temp_db):
+    """Verify entry retry loop acquires fresh quotes after an initial stale pre-market quote."""
+    from unittest.mock import patch, MagicMock
+    import time
+    from strategies.opening_straddle_selector import run_opening_straddle
+
+    now_t = time.time()
+    stale_spot = {"ltp": 25000.0, "source": "angelone", "feed_time": now_t - 180.0}
+    fresh_spot = {"ltp": 25000.0, "source": "angelone", "feed_time": now_t - 1.0}
+
+    stale_chain = {
+        "call": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "101", "trading_symbol": "NIFTY25000CE", "feed_time": now_t - 180.0},
+        "put": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "102", "trading_symbol": "NIFTY25000PE", "feed_time": now_t - 180.0},
+    }
+    fresh_chain = {
+        "call": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "101", "trading_symbol": "NIFTY25000CE", "feed_time": now_t - 1.0},
+        "put": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "102", "trading_symbol": "NIFTY25000PE", "feed_time": now_t - 1.0},
+    }
+
+    with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls:
+        mock_loader = mock_loader_cls.return_value
+        mock_loader.load_intelligence.return_value = mock_pre_market
+
+        # First call stale, second call fresh
+        mock_get_spot = MagicMock(side_effect=[stale_spot, fresh_spot, fresh_spot, fresh_spot, fresh_spot])
+        mock_get_chain = MagicMock(side_effect=[stale_chain, fresh_chain, fresh_chain, fresh_chain, fresh_chain])
+
+        with patch("strategies.opening_straddle_selector.get_nifty_spot", mock_get_spot), \
+             patch("strategies.opening_straddle_selector.get_nifty_option_chain", mock_get_chain), \
+             patch("strategies.opening_straddle_selector.OpeningStraddleEngine") as mock_engine_cls:
+            mock_engine = mock_engine_cls.return_value
+            mock_engine.arm_entry.return_value = True
+            mock_engine.state = StrategyState.CLOSED
+
+            code = run_opening_straddle(
+                db_path=temp_db,
+                enable_alerts=False,
+                wait_for_market_open=False,
+                entry_grace_timeout_sec=5.0,
+            )
+            assert code == 0
+            # Ensure arm_entry was called with the fresh quotes
+            assert mock_engine.arm_entry.called
+            call_arg = mock_engine.arm_entry.call_args[1]
+            assert call_arg["call_quote"].symbol == "NIFTY25000CE"
+            assert call_arg["spot_price"] == 25000.0
+
+
+def test_wait_for_market_open_timing():
+    """Verify compute_market_open_wait_sec accurately computes countdown to 09:15:05 AM IST."""
+    from datetime import datetime
+    from strategies.opening_straddle_selector import compute_market_open_wait_sec, IST_TZ
+
+    # 1. At 09:14:00 AM IST (65s before 09:15:05)
+    t_914 = datetime(2026, 10, 27, 9, 14, 0, tzinfo=IST_TZ)
+    assert round(compute_market_open_wait_sec(t_914), 1) == 65.0
+
+    # 2. At 09:14:35 AM IST (30s before 09:15:05)
+    t_91435 = datetime(2026, 10, 27, 9, 14, 35, tzinfo=IST_TZ)
+    assert round(compute_market_open_wait_sec(t_91435), 1) == 30.0
+
+    # 3. At 09:15:05 AM IST (exact target -> 0s)
+    t_91505 = datetime(2026, 10, 27, 9, 15, 5, tzinfo=IST_TZ)
+    assert compute_market_open_wait_sec(t_91505) == 0.0
+
+    # 4. Past market open (e.g. 09:15:10 AM IST) -> 0.0s (no wait)
+    t_91510 = datetime(2026, 10, 27, 9, 15, 10, tzinfo=IST_TZ)
+    assert compute_market_open_wait_sec(t_91510) == 0.0
+
+    # 5. Far before pre-market window (e.g. 08:30:00 AM IST) -> 0.0s
+    t_0830 = datetime(2026, 10, 27, 8, 30, 0, tzinfo=IST_TZ)
+    assert compute_market_open_wait_sec(t_0830) == 0.0
