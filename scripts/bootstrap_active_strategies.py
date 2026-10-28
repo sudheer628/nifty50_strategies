@@ -122,18 +122,42 @@ def bootstrap_from_snapshots(poll_now: bool = False, reset_mongo: bool = False) 
 
             logger.info("Found Thursday snapshot: %s | CE %s (₹%s) | PE %s (₹%s)", c_id, c_strike, c_buy, p_strike, p_buy)
 
-            init_or_rotate_cycle("3day_strategy", {
-                "cycle_id": c_id,
-                "start_date": start_date,
-                "expiry_date": expiry_date,
-                "call_strike": c_strike,
-                "put_strike": p_strike,
-                "moneyness": "ATM",
-                "entry_spot": spot,
-            })
+            # Check if Thursday snapshot is from a past expired cycle
+            exp_date_obj = None
+            if expiry_date:
+                clean_exp = str(expiry_date).replace("-", "").strip()
+                if len(clean_exp) == 8 and clean_exp.isdigit():
+                    try:
+                        from zoneinfo import ZoneInfo
+                        ist = ZoneInfo("Asia/Kolkata")
+                    except ImportError:
+                        import pytz
+                        ist = pytz.timezone("Asia/Kolkata")
+                    from datetime import datetime
+                    try:
+                        exp_date_obj = datetime.strptime(clean_exp, "%Y%m%d").date()
+                    except ValueError:
+                        pass
 
-            if c_buy is not None and p_buy is not None:
-                update_locked_prices("3day_strategy", call_buy=c_buy, put_buy=p_buy, spot=spot)
+            today_ist = datetime.now(ist).date()
+            if exp_date_obj and exp_date_obj < today_ist:
+                logger.info(
+                    "Thursday snapshot %s expired on %s (today is %s). Initializing 3day_strategy as 'pending_entry' awaiting Thursday morning start.",
+                    c_id, exp_date_obj, today_ist
+                )
+            else:
+                init_or_rotate_cycle("3day_strategy", {
+                    "cycle_id": c_id,
+                    "start_date": start_date,
+                    "expiry_date": expiry_date,
+                    "call_strike": c_strike,
+                    "put_strike": p_strike,
+                    "moneyness": "ATM",
+                    "entry_spot": spot,
+                })
+
+                if c_buy is not None and p_buy is not None:
+                    update_locked_prices("3day_strategy", call_buy=c_buy, put_buy=p_buy, spot=spot)
 
         except Exception as e:
             logger.error("Failed to read Thursday snapshot (%s): %s", THURSDAY_SNAPSHOT_FILE, e)

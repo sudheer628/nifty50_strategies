@@ -144,6 +144,19 @@ def poll_cycle_telemetry(track: str, strat_data: dict, force: bool = False, verb
             logger.info("[%s] Cycle is not active (%s, status=%s). Skipping.", track, cycle_id, status)
         return False
 
+    # Check if cycle has already expired
+    if expiry_date:
+        clean_exp = str(expiry_date).replace("-", "").strip()
+        if len(clean_exp) == 8 and clean_exp.isdigit():
+            try:
+                exp_dt = datetime.strptime(clean_exp, "%Y%m%d").date()
+                if exp_dt < datetime.now(IST).date():
+                    if verbose:
+                        logger.info("[%s] Cycle %s expired on %s. Skipping poll.", track, cycle_id, exp_dt)
+                    return False
+            except ValueError:
+                pass
+
     quotes = fetch_live_quotes(expiry_date, int(call_strike), int(put_strike))
     spot = quotes.get("spot")
     c_ltp = quotes.get("call_ltp")
