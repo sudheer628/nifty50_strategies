@@ -17,13 +17,6 @@ fi
 
 cd "${BASE_DIR}"
 
-# Source environment variables if .env exists
-if [ -f "${BASE_DIR}/.env" ]; then
-    set -a
-    source "${BASE_DIR}/.env"
-    set +a
-fi
-
 # Acquire lock to prevent duplicate runs
 exec 200>"${LOCK_FILE}"
 if ! flock -n 200; then
