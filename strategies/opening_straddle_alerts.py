@@ -179,69 +179,88 @@ def send_straddle_exit_summary(record: StraddleSessionRecord) -> bool:
     if record.exit_reason == ExitReason.PROFIT_TARGET:
         color = COLOR_PROFIT
         emoji = "🏆"
+        reason_label = "PROFIT TARGET REACHED"
     elif record.exit_reason == ExitReason.STOP_LOSS:
         color = COLOR_STOP_LOSS
         emoji = "🛑"
+        reason_label = "STOP LOSS TRIGGERED"
     elif record.exit_reason == ExitReason.TRAILING_STOP:
         color = COLOR_TRAILING
         emoji = "🔒"
+        reason_label = "TRAILING STOP (PROFIT PROTECTED)"
+    elif record.exit_reason == ExitReason.HARD_TIME_STOP:
+        color = COLOR_ENTRY
+        emoji = "⏰"
+        reason_label = "09:55 AM HARD TIME STOP"
     else:
         color = COLOR_SCRATCH
-        emoji = "🏁"
+        emoji = "⚖️"
+        reason_label = "SCRATCH EXIT (FLATTENED)"
+
+    atm = record.atm_strike
+    call_exit_val = None
+    call_pnl_val = 0.0
+    put_exit_val = None
+    put_pnl_val = 0.0
+
+    if record.selected_leg == SelectedLeg.CALL:
+        call_exit_val = f"₹{record.runner_exit_price:.2f}" if record.runner_exit_price is not None else "N/A"
+        call_pnl_val = record.runner_pnl_inr
+        put_exit_val = f"₹{record.closed_leg_exit_price:.2f}" if record.closed_leg_exit_price is not None else "N/A"
+        put_pnl_val = record.closed_leg_pnl_inr
+    elif record.selected_leg == SelectedLeg.PUT:
+        call_exit_val = f"₹{record.closed_leg_exit_price:.2f}" if record.closed_leg_exit_price is not None else "N/A"
+        call_pnl_val = record.closed_leg_pnl_inr
+        put_exit_val = f"₹{record.runner_exit_price:.2f}" if record.runner_exit_price is not None else "N/A"
+        put_pnl_val = record.runner_pnl_inr
+    else:
+        call_exit_val = f"₹{record.closed_leg_exit_price:.2f}" if record.closed_leg_exit_price is not None else "N/A"
+        call_pnl_val = record.closed_leg_pnl_inr
+        put_exit_val = f"₹{record.runner_exit_price:.2f}" if record.runner_exit_price is not None else "N/A"
+        put_pnl_val = record.runner_pnl_inr
+
+    call_pnl_str = f"₹{call_pnl_val:+,.2f}"
+    put_pnl_str = f"₹{put_pnl_val:+,.2f}"
+
+    net_sign = "+" if record.net_pnl_inr >= 0 else ""
+    net_pnl_str = f"₹{net_sign}{record.net_pnl_inr:,.2f}"
+    net_roi_str = f"{record.net_roi_pct:+.2f}%"
 
     fields = [
         {
-            "name": "💰 Net P&L",
-            "value": f"**`₹{record.net_pnl_inr:+,.2f}`**",
+            "name": "💰 Net Total P&L",
+            "value": f"**`{net_pnl_str}`** (`{net_roi_str}`)",
+            "inline": False,
+        },
+        {
+            "name": f"📞 CALL Leg (CE {atm})",
+            "value": f"Exit: `{call_exit_val}` ➔ **P&L: `{call_pnl_str}`**",
             "inline": True,
         },
         {
-            "name": "📊 Net Combined ROI",
-            "value": f"**`{record.net_roi_pct:+.2f}%`**",
-            "inline": True,
-        },
-        {
-            "name": "📈 Peak Session ROI",
-            "value": f"`{record.peak_roi_pct:+.2f}%`",
-            "inline": True,
-        },
-        {
-            "name": "🎯 Decision Time",
-            "value": f"`{record.decision_time or 'N/A'}` ({record.selected_leg.value})",
+            "name": f"📉 PUT Leg (PE {atm})",
+            "value": f"Exit: `{put_exit_val}` ➔ **P&L: `{put_pnl_str}`**",
             "inline": True,
         },
         {
             "name": "🚪 Exit Reason",
-            "value": f"`{record.exit_reason.value}`",
+            "value": f"`{reason_label}`",
             "inline": True,
         },
         {
-            "name": "🧭 Pre-Market Prior",
-            "value": f"CDS `{record.pre_market.cds:+.3f}` ({record.pre_market.bias.value})\nCoverage: `{record.pre_market.coverage * 100:.1f}%`",
+            "name": "⏱️ Decision / Exit Time",
+            "value": f"`{record.decision_time or '09:20:00'}`",
             "inline": True,
         },
     ]
 
-    if record.selected_leg in (SelectedLeg.CALL, SelectedLeg.PUT):
-        closed_label = "PE (Put)" if record.selected_leg == SelectedLeg.CALL else "CE (Call)"
-        runner_label = "CE (Call)" if record.selected_leg == SelectedLeg.CALL else "PE (Put)"
-        closed_exit_val = f"₹{record.closed_leg_exit_price:.2f}" if record.closed_leg_exit_price is not None else "N/A"
-        runner_exit_val = f"₹{record.runner_exit_price:.2f}" if record.runner_exit_price is not None else "N/A"
-
-        fields.append({
-            "name": f"🚪 Closed Leg [{closed_label}]",
-            "value": f"Exit: `{closed_exit_val}`\nP&L: `₹{record.closed_leg_pnl_inr:+,.2f}`",
-            "inline": True,
-        })
-        fields.append({
-            "name": f"🏃 Runner Leg [{runner_label}]",
-            "value": f"Exit: `{runner_exit_val}`\nP&L: `₹{record.runner_pnl_inr:+,.2f}`",
-            "inline": True,
-        })
-
     embed = {
         "title": f"{emoji} [PAPER TRADING] NIFTY 50 Opening Session Closed: {record.exit_reason.value}",
-        "description": f"**[Paper Trading • Virtual Execution]**\n**Trade Date:** `{record.trade_date}` | **ATM Strike:** `{record.atm_strike}`",
+        "description": (
+            f"**[Paper Trading • Virtual Execution]**\n"
+            f"**Trade Date:** `{record.trade_date}` | **ATM Strike:** `{atm}`\n"
+            f"**Result:** `{call_pnl_str}` (CE) + `{put_pnl_str}` (PE) = **`{net_pnl_str}`**"
+        ),
         "color": color,
         "fields": fields,
         "footer": {
