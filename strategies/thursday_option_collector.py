@@ -506,6 +506,28 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         # Archives the previous Thursday snapshot (if any) before overwriting
         save_active_snapshot(snapshot, filepath=THURSDAY_SNAPSHOT_FILE)
         insert_buy_snapshot(db_path, snapshot)
+
+        # Sync to unified active_strategies.json (3day_strategy) & MongoDB
+        try:
+            from common.unified_strategy_store import init_or_rotate_cycle, update_locked_prices
+            init_or_rotate_cycle("3day_strategy", {
+                "cycle_id": cycle_id,
+                "start_date": cycle_start_date.strftime("%Y-%m-%d"),
+                "expiry_date": expiry_date.strftime("%Y-%m-%d"),
+                "call_strike": call_strike,
+                "put_strike": put_strike,
+                "moneyness": "ATM",
+                "entry_spot": nifty_ltp,
+            })
+            update_locked_prices(
+                "3day_strategy",
+                call_buy=call_buy_price,
+                put_buy=put_buy_price,
+                spot=nifty_ltp,
+                timestamp=_now_utc_ts(),
+            )
+        except Exception as exc:
+            logger.warning("Failed to sync unified 3day_strategy store: %s", exc)
         logger.info(
             "[Thursday Track] Cycle %s locked with buy prices: CALL=%d (₹%.2f)  PUT=%d (₹%.2f)",
             cycle_id, call_strike, call_buy_price, put_strike, put_buy_price
@@ -602,6 +624,13 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         fsm_data=fsm_data,
     )
     insert_record(db_path, record)
+
+    # Sync latest LTP to unified active_strategies.json & MongoDB
+    try:
+        from common.unified_strategy_store import update_latest_ltp
+        update_latest_ltp("3day_strategy", spot=nifty_ltp, call_ltp=call_ltp, put_ltp=put_ltp)
+    except Exception as e_ltp:
+        logger.debug("Failed to sync latest LTP to unified store: %s", e_ltp)
 
     # ------------------------------------------------------------------
     # Evaluate Peak-Profit High-Water Mark & Alert Trigger (labeled)

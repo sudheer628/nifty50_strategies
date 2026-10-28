@@ -84,6 +84,12 @@ MONGODB_COLLECTION_DERIVATIVE_MASTER = os.getenv(
 MONGODB_COLLECTION_DERIVATIVE_PREDICTIONS = os.getenv(
     "MONGODB_COLLECTION_DERIVATIVE_PREDICTIONS", "derivative_predictions"
 )
+MONGODB_COLLECTION_DERIVATIVE_ACTIVE_CYCLES = os.getenv(
+    "MONGODB_COLLECTION_DERIVATIVE_ACTIVE_CYCLES", "derivative_active_cycles"
+)
+MONGODB_COLLECTION_DERIVATIVE_CYCLE_LIVE_LOGS = os.getenv(
+    "MONGODB_COLLECTION_DERIVATIVE_CYCLE_LIVE_LOGS", "derivative_cycle_live_logs"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +112,12 @@ ACTIVE_SNAPSHOT_FILE = os.path.join(
 # Active 3-day buy-price snapshot JSON file (Parallel Thursday track)
 THURSDAY_SNAPSHOT_FILE = os.path.join(
     SNAPSHOT_DIR, "current_thursday_buy.json"
+)
+
+# Unified active strategies JSON file (Master Tuesday & Parallel Thursday tracks)
+ACTIVE_STRATEGIES_JSON = os.getenv(
+    "ACTIVE_STRATEGIES_JSON",
+    os.path.join(SNAPSHOT_DIR, "active_strategies.json")
 )
 
 

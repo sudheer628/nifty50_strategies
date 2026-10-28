@@ -527,6 +527,26 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
                 "✅ Peak-profit alert Discord notification successfully dispatched (HTTP %d)",
                 response.status_code,
             )
+            # Post-Discord Hook: Persist exit event to MongoDB & active_strategies.json
+            try:
+                from common.unified_strategy_store import record_exit_signal_and_sync_mongo
+                track = "3day_strategy" if event.get("track") == "thursday" else "5day_strategy"
+                record_exit_signal_and_sync_mongo(
+                    track=track,
+                    exit_category="peak_20pct",
+                    signal_data={
+                        "symbol": "20% PEAK PROFIT REACHED",
+                        "simple_action": "20% PEAK PROFIT REACHED",
+                        "peak_pnl_pct": event.get("combined_pnl_pct"),
+                        "peak_pnl_pts": event.get("combined_pnl_pts"),
+                        "peak_pnl_inr": event.get("combined_pnl_inr"),
+                        "timestamp": event.get("timestamp_epoch") or int(time.time()),
+                        "time_ist": event.get("timestamp"),
+                        "details": f"Peak profit reached +{event.get('combined_pnl_pct', 0.0):.2f}% (+{event.get('combined_pnl_pts', 0.0):.2f} pts / ₹{event.get('combined_pnl_inr', 0.0):.2f})",
+                    },
+                )
+            except Exception as e_hook:
+                logger.warning("Failed to record peak exit to unified strategy store: %s", e_hook)
             return True
         else:
             logger.error(
