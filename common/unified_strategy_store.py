@@ -48,7 +48,9 @@ from config import (
     MONGODB_COLLECTION_DERIVATIVE_ACTIVE_CYCLES,
     MONGODB_COLLECTION_DERIVATIVE_CYCLE_LIVE_LOGS,
     NIFTY_LOT_SIZE,
+    get_redis_client,
 )
+from common.fno_keys import build_leg_enabled_key, normalize_expiry
 
 try:
     from zoneinfo import ZoneInfo
@@ -657,24 +659,117 @@ def update_latest_ltp(
     return active
 
 
+def publish_exit_authorization_to_redis(
+    track: str,
+    call_exit: bool,
+    put_exit: bool,
+    strategy_data: Dict[str, Any],
+    redis_client: Optional[Any] = None,
+    broker: str = "upstox",
+) -> List[str]:
+    """
+    Publish canonical Redis authorization keys and activate the fast Redis gate
+    for the specified strategy cycle legs.
+
+    Keys written:
+      fno:{broker}:enabled:{cycle}:{expiry_iso}:{strike}:{option_type} -> {"enabled": true, "qty": target_qty}
+      ORDERS_LIVE_TUE -> "1" (for 5day / Tuesday)
+      ORDERS_LIVE_THU -> "1" (for 3day / Thursday)
+    TTL: 7 days (604,800s) to safeguard against multi-day holds while allowing
+    reconciliation to cleanly retire the key when positions close.
+    """
+    published_keys = []
+    r = redis_client
+    if r is None:
+        try:
+            r = get_redis_client()
+        except Exception as e_redis:
+            logger.warning("Could not connect to Redis: %s", e_redis)
+            return []
+
+    if not r:
+        return []
+
+    cycle = "tue" if normalize_track(track) == "5day_strategy" else "thu"
+    lot_size = int(os.getenv("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
+    lots_env = "LOTS_TUESDAY" if cycle == "tue" else "LOTS_THURSDAY"
+    default_lots = 2 if cycle == "tue" else 1
+    lots = int(strategy_data.get("lots") or os.getenv(lots_env, str(default_lots)))
+    target_qty = lots * lot_size
+
+    expiry_raw = strategy_data.get("expiry_date") or strategy_data.get("expiry")
+    expiry_iso = normalize_expiry(expiry_raw)
+
+    try:
+        if call_exit and strategy_data.get("call_strike"):
+            c_strike = int(strategy_data.get("call_strike"))
+            c_key = build_leg_enabled_key(cycle, expiry_iso, c_strike, "CE", broker=broker)
+            c_val = json.dumps({"enabled": True, "qty": target_qty})
+            r.set(c_key, c_val, ex=604800)
+            published_keys.append(c_key)
+            logger.info("Published Redis authorization key: %s (qty=%d)", c_key, target_qty)
+
+        if put_exit and strategy_data.get("put_strike"):
+            p_strike = int(strategy_data.get("put_strike"))
+            p_key = build_leg_enabled_key(cycle, expiry_iso, p_strike, "PE", broker=broker)
+            p_val = json.dumps({"enabled": True, "qty": target_qty})
+            r.set(p_key, p_val, ex=604800)
+            published_keys.append(p_key)
+            logger.info("Published Redis authorization key: %s (qty=%d)", p_key, target_qty)
+
+        if published_keys:
+            gate_key = "ORDERS_LIVE_TUE" if cycle == "tue" else "ORDERS_LIVE_THU"
+            r.set(gate_key, "1")
+            alias_key = f"fno:orders_live:{'tuesday' if cycle == 'tue' else 'thursday'}"
+            r.set(alias_key, "1")
+            logger.info("Activated fast Redis safety gate: %s = 1", gate_key)
+    except Exception as exc:
+        logger.error("Failed to publish F&O exit authorization to Redis: %s", exc)
+
+    return published_keys
+
+
 def record_exit_signal_and_sync_mongo(
     track: str,
     exit_category: str,
     signal_data: Dict[str, Any],
     filepath: Optional[str] = None,
+    redis_client: Optional[Any] = None,
 ) -> bool:
     """
-    Record an exit alert immediately after Discord dispatch.
+    Record an exit alert and authorize live F&O exit orders in Redis.
 
-    Enforces single-trigger idempotency (first exit event is preserved).
-    Saves to active_strategies.json, pushes discrete EXIT row to MongoDB,
-    and updates active cycles state.
+    Enforces leg-specific idempotency (CALL exit does not block subsequent PUT exit).
+    Saves to active_strategies.json, publishes canonical keys to Redis, pushes
+    discrete EXIT row to MongoDB, and updates active cycles state.
     """
     norm = normalize_track(track)
     cat = str(exit_category).lower().strip()
     if cat not in ("peak_20pct", "alpha_fsm", "ai_inference"):
         logger.warning("Unknown exit category '%s' provided to record_exit_signal", exit_category)
         return False
+
+    raw_action = signal_data.get("action") or signal_data.get("action_raw") or cat
+    leg = signal_data.get("leg")
+    simple_action = signal_data.get("simple_action") or to_simple_action(raw_action, leg=leg)
+
+    # Determine which leg(s) are exiting
+    call_exit = False
+    put_exit = False
+    raw_upper = str(raw_action or "").upper()
+    simple_upper = str(simple_action or "").upper()
+    leg_upper = str(leg or "").upper()
+
+    if "CALL" in raw_upper or "CALL" in simple_upper or leg_upper == "CALL":
+        call_exit = True
+    if "PUT" in raw_upper or "PUT" in simple_upper or leg_upper == "PUT":
+        put_exit = True
+    if "BOTH" in raw_upper or "BOTH" in simple_upper or leg_upper == "BOTH" or raw_upper in ("EXIT", "EXIT_BOTH"):
+        call_exit = True
+        put_exit = True
+    if cat == "peak_20pct":
+        call_exit = True
+        put_exit = True
 
     target = filepath or ACTIVE_STRATEGIES_JSON
 
@@ -684,20 +779,46 @@ def record_exit_signal_and_sync_mongo(
         exits = strat.setdefault("exit_signals", {})
         entry = exits.setdefault(cat, {})
 
-        # Single-alert idempotency: if already triggered, skip re-triggering
-        if entry.get("triggered"):
-            logger.info(
-                "Exit category '%s' already triggered for %s cycle %s. Preserving original exit event.",
-                cat, norm, strat.get("cycle_id")
-            )
-            return False
+        # Leg-specific idempotency for Alpha FSM
+        if cat == "alpha_fsm":
+            call_trig = bool(entry.get("call_triggered"))
+            put_trig = bool(entry.get("put_triggered"))
+            if call_exit and not put_exit:
+                if call_trig:
+                    logger.info(
+                        "Alpha FSM CALL exit already triggered for %s cycle %s. Preserving original exit event.",
+                        norm, strat.get("cycle_id")
+                    )
+                    return False
+                entry["call_triggered"] = True
+            elif put_exit and not call_exit:
+                if put_trig:
+                    logger.info(
+                        "Alpha FSM PUT exit already triggered for %s cycle %s. Preserving original exit event.",
+                        norm, strat.get("cycle_id")
+                    )
+                    return False
+                entry["put_triggered"] = True
+            elif call_exit and put_exit:
+                if call_trig and put_trig:
+                    logger.info(
+                        "Alpha FSM BOTH exits already triggered for %s cycle %s. Preserving original exit event.",
+                        norm, strat.get("cycle_id")
+                    )
+                    return False
+                entry["call_triggered"] = True
+                entry["put_triggered"] = True
+        else:
+            # Single-alert idempotency: if already triggered, skip re-triggering
+            if entry.get("triggered"):
+                logger.info(
+                    "Exit category '%s' already triggered for %s cycle %s. Preserving original exit event.",
+                    cat, norm, strat.get("cycle_id")
+                )
+                return False
 
         ts = signal_data.get("timestamp") or _now_utc_ts()
         time_ist = signal_data.get("time_ist") or _format_ist_ts(ts) or _now_ist_str()
-
-        raw_action = signal_data.get("action") or signal_data.get("action_raw") or cat
-        leg = signal_data.get("leg")
-        simple_action = signal_data.get("simple_action") or to_simple_action(raw_action, leg=leg)
 
         entry["status"] = "TRIGGERED"
         entry["triggered"] = True
@@ -726,6 +847,16 @@ def record_exit_signal_and_sync_mongo(
         save_active_strategies(active, filepath=target)
 
     sync_active_cycles_to_mongodb(active)
+
+    # Publish Redis exit authorization strictly for Alpha FSM exits
+    if cat == "alpha_fsm":
+        publish_exit_authorization_to_redis(
+            track=norm,
+            call_exit=call_exit,
+            put_exit=put_exit,
+            strategy_data=strat,
+            redis_client=redis_client,
+        )
 
     # Get latest pricing context for event log row
     latest = strat.get("latest_ltp") or {}

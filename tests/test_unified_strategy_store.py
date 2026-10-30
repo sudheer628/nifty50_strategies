@@ -150,8 +150,9 @@ class UnifiedStrategyStoreTests(unittest.TestCase):
         self.assertAlmostEqual(latest["combined_pnl_pct"], round(20.0 / 450.0 * 100, 2))
         self.assertEqual(latest["combined_pnl_inr"], round(20.0 * 65, 2))
 
+    @patch("common.unified_strategy_store.get_redis_client", return_value=None)
     @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
-    def test_record_exit_signal_simplified_and_idempotent(self, mock_mongo):
+    def test_record_exit_signal_simplified_and_idempotent(self, mock_mongo, mock_redis):
         init_or_rotate_cycle(
             "5day_strategy",
             {"cycle_id": "CYCLE-TUE-20261027", "call_strike": 22900, "put_strike": 23100},
@@ -201,6 +202,218 @@ class UnifiedStrategyStoreTests(unittest.TestCase):
         data_after = load_active_strategies(filepath=self.test_json)
         self.assertEqual(data_after["5day_strategy"]["exit_signals"]["alpha_fsm"]["timestamp"], 1700001000)
         self.assertEqual(data_after["5day_strategy"]["exit_signals"]["alpha_fsm"]["simple_action"], "CALL ONLY EXIT")
+
+    @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
+    def test_record_exit_signal_separate_call_and_put_exits(self, mock_mongo):
+        """Verify CALL exit and PUT exit are tracked independently and publish canonical Redis keys."""
+        mock_redis = MagicMock()
+        init_or_rotate_cycle(
+            "5day_strategy",
+            {
+                "cycle_id": "CYCLE-TUE-20261027",
+                "call_strike": 22900,
+                "put_strike": 23100,
+                "expiry_date": "2026-11-03",
+            },
+            filepath=self.test_json,
+        )
+
+        # 1. First trigger: CALL exit
+        res1 = record_exit_signal_and_sync_mongo(
+            "5day_strategy",
+            "alpha_fsm",
+            {
+                "action": "TAKE_PROFIT_CALL",
+                "leg": "CALL",
+                "realized_pnl_pts": 50.0,
+                "timestamp": 1700001000,
+                "time_ist": "2026-10-28 11:30:00 IST",
+                "details": "Harvest rule covered risk",
+            },
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        self.assertTrue(res1)
+
+        # Verify Redis calls for CALL exit
+        call_key = "fno:upstox:enabled:tue:2026-11-03:22900:CE"
+        mock_redis.set.assert_any_call(call_key, json.dumps({"enabled": True, "qty": 130}), ex=604800)
+        mock_redis.set.assert_any_call("ORDERS_LIVE_TUE", "1")
+        mock_redis.set.assert_any_call("fno:orders_live:tuesday", "1")
+
+        # Verify PUT key was NOT written
+        put_key = "fno:upstox:enabled:tue:2026-11-03:23100:PE"
+        set_keys = [call[0][0] for call in mock_redis.set.call_args_list]
+        self.assertIn(call_key, set_keys)
+        self.assertNotIn(put_key, set_keys)
+
+        # 2. Second trigger: PUT exit (must NOT be suppressed by earlier CALL exit!)
+        mock_redis.reset_mock()
+        res2 = record_exit_signal_and_sync_mongo(
+            "5day_strategy",
+            "alpha_fsm",
+            {
+                "action": "STOP_LOSS_PUT",
+                "leg": "PUT",
+                "realized_pnl_pts": -20.0,
+                "timestamp": 1700002000,
+                "time_ist": "2026-10-28 12:15:00 IST",
+                "details": "FSM stop breach",
+            },
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        self.assertTrue(res2)
+        mock_redis.set.assert_any_call(put_key, json.dumps({"enabled": True, "qty": 130}), ex=604800)
+        mock_redis.set.assert_any_call("ORDERS_LIVE_TUE", "1")
+
+        # 3. Third trigger: Duplicate CALL exit (must be suppressed!)
+        res3 = record_exit_signal_and_sync_mongo(
+            "5day_strategy",
+            "alpha_fsm",
+            {
+                "action": "STOP_LOSS_CALL",
+                "leg": "CALL",
+                "realized_pnl_pts": 10.0,
+                "timestamp": 1700003000,
+            },
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        self.assertFalse(res3)
+
+        # 4. Fourth trigger: Duplicate PUT exit (must be suppressed!)
+        res4 = record_exit_signal_and_sync_mongo(
+            "5day_strategy",
+            "alpha_fsm",
+            {
+                "action": "TAKE_PROFIT_PUT",
+                "leg": "PUT",
+                "realized_pnl_pts": -15.0,
+                "timestamp": 1700004000,
+            },
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        self.assertFalse(res4)
+
+    @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
+    def test_record_exit_signal_both_legs_exit(self, mock_mongo):
+        """Verify EXIT_BOTH authorizes both CALL and PUT canonical keys simultaneously."""
+        mock_redis = MagicMock()
+        init_or_rotate_cycle(
+            "5day_strategy",
+            {
+                "cycle_id": "CYCLE-TUE-20261027",
+                "call_strike": 22900,
+                "put_strike": 23100,
+                "expiry_date": "2026-11-03",
+            },
+            filepath=self.test_json,
+        )
+
+        res = record_exit_signal_and_sync_mongo(
+            "5day_strategy",
+            "alpha_fsm",
+            {
+                "action": "EXIT_BOTH",
+                "timestamp": 1700005000,
+                "time_ist": "2026-10-28 14:00:00 IST",
+                "details": "Double leg exit",
+            },
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        self.assertTrue(res)
+
+        call_key = "fno:upstox:enabled:tue:2026-11-03:22900:CE"
+        put_key = "fno:upstox:enabled:tue:2026-11-03:23100:PE"
+        mock_redis.set.assert_any_call(call_key, json.dumps({"enabled": True, "qty": 130}), ex=604800)
+        mock_redis.set.assert_any_call(put_key, json.dumps({"enabled": True, "qty": 130}), ex=604800)
+        mock_redis.set.assert_any_call("ORDERS_LIVE_TUE", "1")
+
+        # Subsequent exit should be suppressed
+        res_dup = record_exit_signal_and_sync_mongo(
+            "5day_strategy",
+            "alpha_fsm",
+            {"action": "EXIT_BOTH", "timestamp": 1700006000},
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        self.assertFalse(res_dup)
+
+    @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
+    def test_record_exit_signal_thursday_track(self, mock_mongo):
+        """Verify Thursday track writes 'thu' keys and 65 qty (1 lot)."""
+        mock_redis = MagicMock()
+        init_or_rotate_cycle(
+            "3day_strategy",
+            {
+                "cycle_id": "CYCLE-THU-20261029",
+                "call_strike": 23000,
+                "put_strike": 23000,
+                "expiry_date": "2026-11-03",
+            },
+            filepath=self.test_json,
+        )
+
+        res = record_exit_signal_and_sync_mongo(
+            "3day_strategy",
+            "alpha_fsm",
+            {
+                "action": "TAKE_PROFIT_CALL",
+                "leg": "CALL",
+                "timestamp": 1700007000,
+            },
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        self.assertTrue(res)
+
+        thu_call_key = "fno:upstox:enabled:thu:2026-11-03:23000:CE"
+        mock_redis.set.assert_any_call(thu_call_key, json.dumps({"enabled": True, "qty": 65}), ex=604800)
+        mock_redis.set.assert_any_call("ORDERS_LIVE_THU", "1")
+        mock_redis.set.assert_any_call("fno:orders_live:thursday", "1")
+
+    @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
+    def test_peak_exit_does_not_publish_redis_authorization(self, mock_mongo):
+        """Verify peak_20pct exit does NOT publish Redis authorization keys or activate safety gates."""
+        mock_redis = MagicMock()
+        init_or_rotate_cycle(
+            "5day_strategy",
+            {
+                "cycle_id": "CYCLE-TUE-20261027",
+                "call_strike": 22900,
+                "put_strike": 23100,
+                "expiry_date": "2026-11-03",
+            },
+            filepath=self.test_json,
+        )
+
+        res = record_exit_signal_and_sync_mongo(
+            "5day_strategy",
+            "peak_20pct",
+            {
+                "action": "PEAK_20PCT",
+                "peak_pnl_pct": 21.5,
+                "peak_pnl_pts": 95.0,
+                "peak_pnl_inr": 6175.0,
+                "timestamp": 1700008000,
+                "time_ist": "2026-10-28 14:30:00 IST",
+                "details": "20% Peak Target Achieved",
+            },
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        self.assertTrue(res)
+
+        # Ensure Redis was NEVER called to set keys or activate gates
+        mock_redis.set.assert_not_called()
+        self.assertEqual(len(mock_redis.set.mock_calls), 0)
+
+        # JSON should still reflect the peak exit
+        data = load_active_strategies(filepath=self.test_json)
+        self.assertTrue(data["5day_strategy"]["exit_signals"]["peak_20pct"]["triggered"])
 
     def test_strategy_lock_reentrant(self):
         """Verify strategy_lock is re-entrant and does not self-deadlock."""
