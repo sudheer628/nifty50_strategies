@@ -29,6 +29,12 @@ class VolatilityRegime(str, Enum):
     LOW_IV_CRUSH = "LOW_IV_CRUSH"  # VIX < 11.5 (High premium decay risk)
 
 
+class StraddleExecutionMode(str, Enum):
+    """Execution mode for opening straddle strategy."""
+    BUY_STRADDLE = "BUY_STRADDLE"    # Option A: Long Straddle + 09:20 losing leg cut + independent runner
+    SELL_STRADDLE = "SELL_STRADDLE"  # Short Straddle: Sell CE + Sell PE with per-leg SL
+
+
 class StrategyState(str, Enum):
     """Finite State Machine states for the opening straddle trade."""
     PRE_MARKET_INGESTION = "PRE_MARKET_INGESTION"
@@ -217,6 +223,8 @@ class StraddleSessionRecord:
     net_pnl_inr: float = 0.0
     net_roi_pct: float = 0.0
     peak_roi_pct: float = 0.0
+    runner_peak_roi_pct: float = 0.0
     spot_confirmed_ticks: int = 0
     exit_reason: ExitReason = ExitReason.NONE
+    execution_mode: str = "BUY_STRADDLE"
     status: str = "COMPLETED"

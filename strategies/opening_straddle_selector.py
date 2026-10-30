@@ -132,6 +132,10 @@ def run_opening_straddle(
     allow_synthetic_spread: bool = False,
     wait_for_market_open: bool = True,
     entry_grace_timeout_sec: float = 25.0,
+    runner_profit_target_pct: float = 35.0,
+    runner_stop_loss_pct: float = -10.0,
+    runner_trailing_trigger_pct: float = 15.0,
+    runner_trailing_drop_pct: float = 8.0,
 ) -> int:
     """
     Main orchestrator running the daily opening straddle cycle from 09:14 to 10:00 AM.
@@ -344,6 +348,10 @@ def run_opening_straddle(
         trade_date=datetime.now().strftime("%Y-%m-%d"),
         expiry_date=target_expiry.strftime("%Y-%m-%d"),
         db_path=db_path,
+        runner_profit_target_pct=runner_profit_target_pct,
+        runner_stop_loss_pct=runner_stop_loss_pct,
+        runner_trailing_trigger_pct=runner_trailing_trigger_pct,
+        runner_trailing_drop_pct=runner_trailing_drop_pct,
         enable_alerts=enable_alerts,
     )
 
@@ -549,6 +557,10 @@ def main():
     parser.add_argument("--no-alerts", action="store_true", help="Disable Discord webhook notifications")
     parser.add_argument("--report", action="store_true", help="Print recent strategy sessions from database and exit")
     parser.add_argument("--send-report", action="store_true", help="Send Discord completion report to DISCORD_OPENING_STRADDLE")
+    parser.add_argument("--runner-stop-loss", type=float, default=-10.0, help="Individual runner stop loss percent (default: -10.0%%)")
+    parser.add_argument("--runner-profit-target", type=float, default=35.0, help="Individual runner profit target percent (default: +35.0%%)")
+    parser.add_argument("--runner-trailing-trigger", type=float, default=15.0, help="Runner trailing stop activation trigger percent (default: +15.0%%)")
+    parser.add_argument("--runner-trailing-drop", type=float, default=8.0, help="Runner trailing stop drop distance from peak (default: 8.0%%)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -572,6 +584,10 @@ def main():
         enable_alerts=not args.no_alerts,
         allow_synthetic_spread=args.allow_synthetic_spread,
         wait_for_market_open=not args.no_wait,
+        runner_profit_target_pct=args.runner_profit_target,
+        runner_stop_loss_pct=args.runner_stop_loss,
+        runner_trailing_trigger_pct=args.runner_trailing_trigger,
+        runner_trailing_drop_pct=args.runner_trailing_drop,
     )
 
 

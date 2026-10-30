@@ -687,3 +687,190 @@ def test_wait_for_market_open_timing():
     # 5. Far before pre-market window (e.g. 08:30:00 AM IST) -> 0.0s
     t_0830 = datetime(2026, 10, 27, 8, 30, 0, tzinfo=IST_TZ)
     assert compute_market_open_wait_sec(t_0830) == 0.0
+
+
+def test_runner_not_aborted_by_closed_leg_loss_runs_till_955(mock_pre_market, temp_db):
+    """
+    Counterfactual Simulation of 2026-10-29:
+      - 09:15:05 AM: Enter Long Straddle (CE 22650 @ 193.40, PE 22650 @ 173.25).
+      - 09:20:00 AM: Nifty trends up (+0.10%). PE falls to 139.25 (-19.6%), CE rises to 206.85 (+6.9%).
+      - In the old design, combined net ROI was -5.00% <= -3.0%, which prematurely killed the Call runner.
+      - In Option A, PE is sold @ 139.25 (loss capped at -1,699.75 INR) and CALL runner is retained!
+      - CALL runner continues autonomously until 09:55:00 AM hard time stop.
+    """
+    start_ts = 1791957300.0  # 09:15:05 AM reference
+    engine = OpeningStraddleEngine(
+        pre_market=mock_pre_market,
+        trade_date="2026-10-29",
+        db_path=temp_db,
+    )
+
+    call_q = StraddleLegQuote("NIFTY22650CE", "201", 22650, "CE", bid=193.0, ask=193.40, ltp=193.40)
+    put_q = StraddleLegQuote("NIFTY22650PE", "202", 22650, "PE", bid=173.0, ask=173.25, ltp=173.25)
+    armed = engine.arm_entry(spot_price=22648.0, call_quote=call_q, put_quote=put_q, entry_ts=start_ts)
+    assert armed is True
+    assert engine.total_debit_inr == 65 * (193.40 + 173.25)
+
+    # Tick at 09:20:00 (301 seconds elapsed) - Decoupling checkpoint
+    tick_920 = TickObservation(
+        ts=start_ts + 301.0,
+        nifty_spot=22648.0 * 1.0010,  # Spot up +0.10%
+        call_bid=206.85,              # CE up +6.95%
+        call_ask=207.25,
+        put_bid=139.25,               # PE down -19.62%
+        put_ask=139.75,
+    )
+    state = engine.process_tick(tick_920)
+
+    # Verify PUT is sold and CALL runner is retained
+    assert state == StrategyState.CALL_RUNNER
+    assert engine.selected_runner == SelectedLeg.CALL
+    assert engine.closed_leg == SelectedLeg.PUT
+    assert engine.put_leg.exit_price == 139.25
+    assert round(engine.put_leg.pnl_inr, 2) == round(65 * (139.25 - 173.25), 2)  # -2210.0 INR
+    assert engine.runner_peak_roi_pct >= 6.9
+
+    # CRUCIAL CHECK: Runner MUST NOT be stopped out even though basket net ROI is negative!
+    assert engine.state == StrategyState.CALL_RUNNER
+    assert engine.exit_reason == ExitReason.NONE
+
+    # Tick at 09:35:00 (1200 seconds elapsed): Market continues rally, Call expands to 225.0
+    tick_935 = TickObservation(
+        ts=start_ts + 1200.0,
+        nifty_spot=22690.0,
+        call_bid=225.0, call_ask=225.5,
+        put_bid=125.0, put_ask=125.5,
+    )
+    engine.process_tick(tick_935)
+    assert engine.state == StrategyState.CALL_RUNNER
+    assert engine.runner_peak_roi_pct >= 16.0
+
+    # Tick at 09:55:01 (2401 seconds elapsed): Hard time exit closes runner at full session runway
+    tick_955 = TickObservation(
+        ts=start_ts + 2401.0,
+        nifty_spot=22710.0,
+        call_bid=235.0, call_ask=235.5,
+        put_bid=115.0, put_ask=115.5,
+    )
+    engine.process_tick(tick_955)
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.HARD_TIME_STOP
+    assert engine.call_leg.exit_price == 235.0
+    assert engine.call_leg.pnl_inr == 65 * (235.0 - 193.40)  # +2704.0 INR
+    # Final Net P&L = +2704.0 - 2210.0 - 150 = +344.0 INR (Turned a losing trade into profit!)
+    assert engine.net_pnl_inr > 0.0
+
+
+def test_runner_individual_stop_loss(mock_pre_market, temp_db):
+    """
+    Verify runner exits on STOP_LOSS when its own return drops below runner_stop_loss_pct (-10.0%),
+    preventing further loss on a complete intraday reversal.
+    """
+    start_ts = 1791957300.0
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+
+    call_q = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=100.0, ask=100.5, ltp=100.0)
+    put_q = StraddleLegQuote("NIFTY25000PE", "102", 25000, "PE", bid=100.0, ask=100.5, ltp=100.0)
+    engine.arm_entry(spot_price=25000.0, call_quote=call_q, put_quote=put_q, entry_ts=start_ts)
+
+    # 09:20:00 Decouple Call runner
+    engine.process_tick(TickObservation(
+        ts=start_ts + 301.0,
+        nifty_spot=25025.0,
+        call_bid=103.5, call_ask=104.0,
+        put_bid=98.0, put_ask=98.5,
+    ))
+    assert engine.state == StrategyState.CALL_RUNNER
+
+    # At 09:30:00, severe adverse reversal: Call drops to 89.0 (-11.4% from entry 100.5)
+    tick_reversal = TickObservation(
+        ts=start_ts + 900.0,
+        nifty_spot=24920.0,
+        call_bid=89.0, call_ask=89.5,
+        put_bid=115.0, put_ask=115.5,
+    )
+    engine.process_tick(tick_reversal)
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.STOP_LOSS
+    assert engine.call_leg.exit_price == 89.0
+
+
+def test_runner_individual_profit_target(mock_pre_market, temp_db):
+    """
+    Verify runner exits on PROFIT_TARGET when its own return hits runner_profit_target_pct (+35.0%).
+    """
+    start_ts = 1791957300.0
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+
+    call_q = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=100.0, ask=100.5, ltp=100.0)
+    put_q = StraddleLegQuote("NIFTY25000PE", "102", 25000, "PE", bid=100.0, ask=100.5, ltp=100.0)
+    engine.arm_entry(spot_price=25000.0, call_quote=call_q, put_quote=put_q, entry_ts=start_ts)
+
+    # Decouple Call runner at 09:20:00
+    engine.process_tick(TickObservation(
+        ts=start_ts + 301.0,
+        nifty_spot=25025.0,
+        call_bid=104.0, call_ask=104.5,
+        put_bid=98.0, put_ask=98.5,
+    ))
+    assert engine.state == StrategyState.CALL_RUNNER
+
+    # Surge tick at 09:35:00: Call surges to 136.0 (+35.3% on entry 100.5)
+    tick_surge = TickObservation(
+        ts=start_ts + 1200.0,
+        nifty_spot=25150.0,
+        call_bid=136.0, call_ask=136.5,
+        put_bid=85.0, put_ask=85.5,
+    )
+    engine.process_tick(tick_surge)
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.PROFIT_TARGET
+    assert engine.call_leg.exit_price == 136.0
+
+
+def test_runner_individual_trailing_stop(mock_pre_market, temp_db):
+    """
+    Verify runner trailing stop: runner gains >= +15.0% (trigger), then drops >= 8.0 pp below its peak.
+    """
+    start_ts = 1791957300.0
+    # Set high basket thresholds so only runner individual trail is tested
+    engine = OpeningStraddleEngine(
+        pre_market=mock_pre_market,
+        profit_target_roi=50.0,
+        trailing_trigger_roi=50.0,
+        db_path=temp_db,
+    )
+
+    call_q = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=100.0, ask=100.0, ltp=100.0)
+    put_q = StraddleLegQuote("NIFTY25000PE", "102", 25000, "PE", bid=100.0, ask=100.0, ltp=100.0)
+    engine.arm_entry(spot_price=25000.0, call_quote=call_q, put_quote=put_q, entry_ts=start_ts)
+
+    # Decouple Call runner at 09:20:00
+    engine.process_tick(TickObservation(
+        ts=start_ts + 301.0,
+        nifty_spot=25025.0,
+        call_bid=104.0, call_ask=104.5,
+        put_bid=98.0, put_ask=98.5,
+    ))
+    assert engine.state == StrategyState.CALL_RUNNER
+
+    # Peak tick: Call reaches 120.0 (+20.0% gain >= 15.0% trigger)
+    engine.process_tick(TickObservation(
+        ts=start_ts + 600.0,
+        nifty_spot=25070.0,
+        call_bid=120.0, call_ask=120.5,
+        put_bid=92.0, put_ask=92.5,
+    ))
+    assert engine.state == StrategyState.CALL_RUNNER
+    assert engine.runner_peak_roi_pct == 20.0
+
+    # Drop tick: Call drops to 111.0 (+11.0% gain). Drop from peak = 20.0 - 11.0 = 9.0 pp >= 8.0 pp trail!
+    engine.process_tick(TickObservation(
+        ts=start_ts + 750.0,
+        nifty_spot=25040.0,
+        call_bid=111.0, call_ask=111.5,
+        put_bid=95.0, put_ask=95.5,
+    ))
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.TRAILING_STOP
+    assert engine.call_leg.exit_price == 111.0

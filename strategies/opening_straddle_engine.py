@@ -29,6 +29,7 @@ from strategies.opening_straddle_models import (
     PreMarketIntelligence,
     SelectedLeg,
     StrategyState,
+    StraddleExecutionMode,
     StraddleLegQuote,
     StraddleSessionRecord,
     TickObservation,
@@ -40,13 +41,20 @@ logger = logging.getLogger("nifty50_strategies.opening_straddle_engine")
 # ---------------------------------------------------------------------------
 # Default Operational Parameters
 # ---------------------------------------------------------------------------
+# Combined Basket Fallback Parameters
 DEFAULT_PROFIT_TARGET_ROI = 3.0       # +3.0% net combined ROI
-DEFAULT_STOP_LOSS_ROI = -3.0           # -3.0% net combined ROI
-DEFAULT_TRAILING_TRIGGER_ROI = 2.0    # Peak >= +2.0% enables trailing stop
-DEFAULT_TRAILING_DROP_ROI = 1.0       # Exit if ROI drops 1.0 pp below peak
+DEFAULT_STOP_LOSS_ROI = -3.0          # -3.0% net combined ROI (only during dual-leg holding)
+DEFAULT_TRAILING_TRIGGER_ROI = 2.0    # Peak >= +2.0% enables combined trailing stop
+DEFAULT_TRAILING_DROP_ROI = 1.0       # Exit if combined ROI drops 1.0 pp below peak
 DEFAULT_MAX_SPREAD_PCT = 1.5          # 1.5% maximum opening bid-ask spread
 DEFAULT_ESTIMATED_FRICTION_INR = 150.0  # Estimated round-trip friction for 1-lot straddle
 DEFAULT_LOT_SIZE = 65                 # Nifty lot size per NSE contract specs
+
+# Independent Runner Management Parameters (Option A)
+DEFAULT_RUNNER_PROFIT_TARGET_PCT = 35.0    # +35.0% on runner premium
+DEFAULT_RUNNER_STOP_LOSS_PCT = -10.0       # -10.0% on runner premium (individual stop)
+DEFAULT_RUNNER_TRAILING_TRIGGER_PCT = 15.0 # Runner Peak >= +15.0% enables trailing stop
+DEFAULT_RUNNER_TRAILING_DROP_PCT = 8.0     # Trail 8.0% behind runner peak
 
 # Checkpoint time thresholds (seconds from 09:15:00 AM open)
 SEC_920_CHECKPOINT = 300              # 5 minutes in (09:20:00)
@@ -163,6 +171,14 @@ def init_opening_straddle_db(db_path: str):
         except sqlite3.OperationalError:
             pass
         try:
+            conn.execute("ALTER TABLE opening_straddle_sessions ADD COLUMN execution_mode TEXT DEFAULT 'BUY_STRADDLE'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE opening_straddle_sessions ADD COLUMN runner_peak_roi_pct REAL DEFAULT 0.0")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE opening_straddle_ticks ADD COLUMN quote_age_sec REAL")
         except sqlite3.OperationalError:
             pass
@@ -186,6 +202,11 @@ class OpeningStraddleEngine:
         stop_loss_roi: float = DEFAULT_STOP_LOSS_ROI,
         trailing_trigger_roi: float = DEFAULT_TRAILING_TRIGGER_ROI,
         trailing_drop_roi: float = DEFAULT_TRAILING_DROP_ROI,
+        runner_profit_target_pct: float = DEFAULT_RUNNER_PROFIT_TARGET_PCT,
+        runner_stop_loss_pct: float = DEFAULT_RUNNER_STOP_LOSS_PCT,
+        runner_trailing_trigger_pct: float = DEFAULT_RUNNER_TRAILING_TRIGGER_PCT,
+        runner_trailing_drop_pct: float = DEFAULT_RUNNER_TRAILING_DROP_PCT,
+        execution_mode: StraddleExecutionMode = StraddleExecutionMode.BUY_STRADDLE,
         enable_alerts: bool = False,
     ):
         self.pre_market = pre_market
@@ -197,6 +218,15 @@ class OpeningStraddleEngine:
         self.stop_loss_roi = stop_loss_roi
         self.trailing_trigger_roi = trailing_trigger_roi
         self.trailing_drop_roi = trailing_drop_roi
+        self.runner_profit_target_pct = runner_profit_target_pct
+        self.runner_stop_loss_pct = runner_stop_loss_pct
+        self.runner_trailing_trigger_pct = runner_trailing_trigger_pct
+        self.runner_trailing_drop_pct = runner_trailing_drop_pct
+        self.execution_mode = (
+            execution_mode
+            if isinstance(execution_mode, StraddleExecutionMode)
+            else StraddleExecutionMode(execution_mode)
+        )
         self.enable_alerts = enable_alerts
 
         default_db = os.path.join(
@@ -218,6 +248,7 @@ class OpeningStraddleEngine:
         self.closed_leg: SelectedLeg = SelectedLeg.NONE
         self.decision_time_str: Optional[str] = None
         self.peak_roi_pct: float = 0.0
+        self.runner_peak_roi_pct: float = 0.0
         self.spot_confirmed_ticks: int = 0
         self.last_spot_direction: int = 0          # +1 for up, -1 for down, 0 for flat
 
@@ -250,14 +281,17 @@ class OpeningStraddleEngine:
         self.atm_strike = int(round(spot_price / 50.0) * 50)
 
         # Volatility Regime Calibration:
-        # Elevated VIX (> 18.0) experiences fast gamma moves; tighten trailing trigger from +2.0% to +1.5%.
+        # Elevated VIX (> 18.0) experiences fast gamma moves; tighten trailing triggers.
         if self.pre_market.vix_regime == VolatilityRegime.ELEVATED:
             self.trailing_trigger_roi = 1.5
+            self.runner_trailing_trigger_pct = 10.0
+            self.runner_trailing_drop_pct = 5.0
             logger.info(
-                "Elevated VIX regime (%.2f > 18.0) detected: tightened trailing trigger from %.1f%% to %.1f%%.",
+                "Elevated VIX regime (%.2f > 18.0) detected: tightened trailing triggers (basket=%.1f%%, runner=%.1f%%/%.1f%%).",
                 self.pre_market.vix,
-                DEFAULT_TRAILING_TRIGGER_ROI,
                 self.trailing_trigger_roi,
+                self.runner_trailing_trigger_pct,
+                self.runner_trailing_drop_pct,
             )
         elif self.pre_market.vix_regime == VolatilityRegime.LOW_IV_CRUSH:
             logger.info(
@@ -544,7 +578,7 @@ class OpeningStraddleEngine:
         exit_price: float,
         checkpoint_name: str,
     ):
-        """Sells the losing leg and activates the runner."""
+        """Sells the losing leg and activates the autonomous runner (Option A)."""
         self.selected_runner = runner
         self.closed_leg = closed_leg
         self.decision_time_str = checkpoint_name
@@ -554,8 +588,15 @@ class OpeningStraddleEngine:
             self.put_leg.pnl_inr = self.lot_size * (exit_price - self.put_leg.entry_price)
             self.put_leg.pnl_pct = ((exit_price - self.put_leg.entry_price) / self.put_leg.entry_price) * 100.0
             self.state = StrategyState.CALL_RUNNER
+            initial_runner_roi = (
+                ((self.call_leg.bid - self.call_leg.entry_price) / self.call_leg.entry_price) * 100.0
+                if self.call_leg and self.call_leg.entry_price
+                else 0.0
+            )
+            self.runner_peak_roi_pct = max(0.0, initial_runner_roi)
             logger.info(
-                "DECOUPLED: Retaining CALL Runner | PUT Closed at %.2f (P&L: INR %.2f, %.2f%%)",
+                "DECOUPLED: Retaining CALL Runner (Initial ROI: %.2f%%) | PUT Closed at %.2f (P&L: INR %.2f, %.2f%%)",
+                initial_runner_roi,
                 exit_price,
                 self.put_leg.pnl_inr,
                 self.put_leg.pnl_pct,
@@ -565,8 +606,15 @@ class OpeningStraddleEngine:
             self.call_leg.pnl_inr = self.lot_size * (exit_price - self.call_leg.entry_price)
             self.call_leg.pnl_pct = ((exit_price - self.call_leg.entry_price) / self.call_leg.entry_price) * 100.0
             self.state = StrategyState.PUT_RUNNER
+            initial_runner_roi = (
+                ((self.put_leg.bid - self.put_leg.entry_price) / self.put_leg.entry_price) * 100.0
+                if self.put_leg and self.put_leg.entry_price
+                else 0.0
+            )
+            self.runner_peak_roi_pct = max(0.0, initial_runner_roi)
             logger.info(
-                "DECOUPLED: Retaining PUT Runner | CALL Closed at %.2f (P&L: INR %.2f, %.2f%%)",
+                "DECOUPLED: Retaining PUT Runner (Initial ROI: %.2f%%) | CALL Closed at %.2f (P&L: INR %.2f, %.2f%%)",
+                initial_runner_roi,
                 exit_price,
                 self.call_leg.pnl_inr,
                 self.call_leg.pnl_pct,
@@ -590,9 +638,10 @@ class OpeningStraddleEngine:
 
     def _monitor_runner_pnl(self, tick: TickObservation, elapsed_sec: float):
         """
-        Monitors total straddle P&L safeguards while holding the runner leg.
+        Monitors runner leg with autonomous profit protection (Option A).
+        The runner is independent of the closed leg's past loss and runs until 09:55 AM.
         """
-        # Hard Time Stop: 09:55:00 AM
+        # Hard Time Stop: 09:55:00 AM (2400 seconds)
         if elapsed_sec >= SEC_955_HARD_EXIT:
             logger.info("09:55:00 Hard Time Stop reached. Liquidating runner.")
             runner_bid = tick.call_bid if self.selected_runner == SelectedLeg.CALL else tick.put_bid
@@ -601,14 +650,28 @@ class OpeningStraddleEngine:
             )
             return
 
-        # Calculate Combined Session Net P&L & Net ROI
+        # Runner-specific return & P&L
         if self.selected_runner == SelectedLeg.CALL:
+            runner_bid = tick.call_bid
+            runner_entry = self.call_leg.entry_price
             realized_pnl = self.put_leg.pnl_inr
             unrealized_pnl = self.lot_size * (tick.call_bid - self.call_leg.entry_price)
         else:
+            runner_bid = tick.put_bid
+            runner_entry = self.put_leg.entry_price
             realized_pnl = self.call_leg.pnl_inr
             unrealized_pnl = self.lot_size * (tick.put_bid - self.put_leg.entry_price)
 
+        # Runner individual return from entry
+        runner_roi_pct = (
+            ((runner_bid - runner_entry) / runner_entry) * 100.0
+            if runner_entry and runner_entry > 0
+            else 0.0
+        )
+        if runner_roi_pct > self.runner_peak_roi_pct:
+            self.runner_peak_roi_pct = runner_roi_pct
+
+        # Combined Session Net P&L & Net ROI (for auditing and total basket profit taking)
         gross_pnl = realized_pnl + unrealized_pnl
         net_pnl = gross_pnl - self.friction_inr
         net_roi = (net_pnl / self.total_debit_inr) * 100.0 if self.total_debit_inr > 0 else 0.0
@@ -616,39 +679,70 @@ class OpeningStraddleEngine:
         if net_roi > self.peak_roi_pct:
             self.peak_roi_pct = net_roi
 
-        # 1. Profit Target Exit
-        if net_roi >= self.profit_target_roi:
-            logger.info("Profit Target Secured: Net ROI=%.2f%% >= %.2f%%", net_roi, self.profit_target_roi)
-            runner_bid = tick.call_bid if self.selected_runner == SelectedLeg.CALL else tick.put_bid
+        # 1. Profit Target Exit:
+        # Triggered if Runner reaches individual target (+35.0%) OR total basket reaches combined target (+3.0%)
+        if runner_roi_pct >= self.runner_profit_target_pct:
+            logger.info(
+                "Runner Profit Target Secured: Runner ROI=%.2f%% >= %.2f%% (Net ROI=%.2f%%)",
+                runner_roi_pct,
+                self.runner_profit_target_pct,
+                net_roi,
+            )
             self._close_runner_and_finish(
                 exit_price=runner_bid, exit_reason=ExitReason.PROFIT_TARGET
             )
             return
 
-        # 2. Stop Loss Exit
-        if net_roi <= self.stop_loss_roi:
-            logger.info("Stop Loss Triggered: Net ROI=%.2f%% <= %.2f%%", net_roi, self.stop_loss_roi)
-            runner_bid = tick.call_bid if self.selected_runner == SelectedLeg.CALL else tick.put_bid
+        if net_roi >= self.profit_target_roi:
+            logger.info(
+                "Combined Basket Profit Target Secured: Net ROI=%.2f%% >= %.2f%% (Runner ROI=%.2f%%)",
+                net_roi,
+                self.profit_target_roi,
+                runner_roi_pct,
+            )
+            self._close_runner_and_finish(
+                exit_price=runner_bid, exit_reason=ExitReason.PROFIT_TARGET
+            )
+            return
+
+        # 2. Runner Stop Loss Exit:
+        # Evaluated purely on the runner's own performance to prevent early liquidation from the closed leg's past loss!
+        if runner_roi_pct <= self.runner_stop_loss_pct:
+            logger.info(
+                "Runner Stop Loss Triggered: Runner ROI=%.2f%% <= %.2f%%",
+                runner_roi_pct,
+                self.runner_stop_loss_pct,
+            )
             self._close_runner_and_finish(
                 exit_price=runner_bid, exit_reason=ExitReason.STOP_LOSS
             )
             return
 
-        # 3. Trailing Peak Protection
-        if self.peak_roi_pct >= self.trailing_trigger_roi:
-            trailing_stop_level = self.peak_roi_pct - self.trailing_drop_roi
-            if net_roi <= trailing_stop_level:
-                logger.info(
-                    "Trailing Stop Triggered: Peak=%.2f%%, Current=%.2f%% <= Level=%.2f%%",
-                    self.peak_roi_pct,
-                    net_roi,
-                    trailing_stop_level,
-                )
-                runner_bid = tick.call_bid if self.selected_runner == SelectedLeg.CALL else tick.put_bid
-                self._close_runner_and_finish(
-                    exit_price=runner_bid, exit_reason=ExitReason.TRAILING_STOP
-                )
-                return
+        # 3. Trailing Peak Protection:
+        # Triggers if runner individual peak triggers trail OR basket peak triggers trail
+        runner_trail_triggered = (
+            self.runner_peak_roi_pct >= self.runner_trailing_trigger_pct
+            and runner_roi_pct <= (self.runner_peak_roi_pct - self.runner_trailing_drop_pct)
+        )
+        basket_trail_triggered = (
+            self.peak_roi_pct >= self.trailing_trigger_roi
+            and net_roi <= (self.peak_roi_pct - self.trailing_drop_roi)
+        )
+
+        if runner_trail_triggered or basket_trail_triggered:
+            trigger_source = "Runner" if runner_trail_triggered else "Combined Basket"
+            logger.info(
+                "Trailing Stop Triggered (%s): Runner Peak=%.2f%%, Curr=%.2f%% | Basket Peak=%.2f%%, Curr=%.2f%%",
+                trigger_source,
+                self.runner_peak_roi_pct,
+                runner_roi_pct,
+                self.peak_roi_pct,
+                net_roi,
+            )
+            self._close_runner_and_finish(
+                exit_price=runner_bid, exit_reason=ExitReason.TRAILING_STOP
+            )
+            return
 
     def _close_runner_and_finish(self, exit_price: float, exit_reason: ExitReason):
         """Liquidates the runner leg, calculates final P&L, and persists session."""
@@ -761,8 +855,10 @@ class OpeningStraddleEngine:
             net_pnl_inr=self.net_pnl_inr,
             net_roi_pct=self.net_roi_pct,
             peak_roi_pct=self.peak_roi_pct,
+            runner_peak_roi_pct=self.runner_peak_roi_pct,
             spot_confirmed_ticks=self.spot_confirmed_ticks,
             exit_reason=self.exit_reason,
+            execution_mode=self.execution_mode.value,
             status=self.status,
         )
 
@@ -806,8 +902,10 @@ class OpeningStraddleEngine:
             "net_pnl_inr": self.net_pnl_inr,
             "net_roi_pct": self.net_roi_pct,
             "peak_roi_pct": self.peak_roi_pct,
+            "runner_peak_roi_pct": self.runner_peak_roi_pct,
             "spot_confirmed_ticks": self.spot_confirmed_ticks,
             "exit_reason": self.exit_reason.value,
+            "execution_mode": self.execution_mode.value,
             "status": self.status,
         }
 
