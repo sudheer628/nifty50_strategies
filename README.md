@@ -29,11 +29,13 @@ This strategy:
 - Persistent storage in SQLite (per-cycle DBs) and MongoDB Atlas synchronization
 - Automated post-market weekly close orchestration and HTML/chart reporting
 
+- **Upstox Live F&O Trailing Stop-Loss Order Execution**: Dedicated exit managers (`Tuesday-Fno-Exit-Orders-V1.py` and `Thursday-Fno-Exit-Orders-V1.py`) managing Stop-Loss Market (SL-M) orders on Upstox, triggered strictly when Alpha FSM exit signals trigger in `sentinel-hermes`
+
 ### Out of scope
 
-- Real-money order placement to broker (all execution is simulated / paper / shadow)
-- Real-time order execution engine for external brokerage accounts
-- Live broker margin / funds management
+- Real-money entry/BUY order placement (the system strictly manages trailing stop-loss exit orders; all entries are placed manually or via external tools)
+- Live broker margin / funds auto-allocation
+- General equity or cash market order execution
 
 ---
 
@@ -52,9 +54,12 @@ nifty50_strategies/
 │   ├── ai_strike_selector.py            # Dynamic AI strike selector (VIX, ATR, Greeks)
 │   ├── calendar_utils.py                # Holiday detection via Upstox API & cycle calendar
 │   ├── entry_gate.py                    # Smart Entry Gate (deferral & shadow logging)
+│   ├── fno_keys.py                      # Canonical Redis key building, multi-format expiry normalization & parsing
 │   ├── fsm_strategy.py                  # Decoupled FSM (harvest, trailing stop, salvage)
 │   ├── profit_monitor.py                # Peak-profit alert engine & future broker execution seam
-│   └── storage.py                       # SQLite persistence, JSON snapshot & migrations
+│   ├── storage.py                       # SQLite persistence, JSON snapshot & migrations
+│   ├── unified_strategy_store.py        # Centralized MongoDB Atlas & Redis store + exit order authorization
+│   └── upstox_feed_reader.py            # Upstox market data feed reader for spot & options
 ├── strategies/
 │   ├── __init__.py
 │   ├── weekly_option_collector.py       # Master weekly strategy entry point (runs :01 & :31)
@@ -62,21 +67,39 @@ nifty50_strategies/
 │   ├── monday_gamma_sniper.py           # Monday afternoon gamma scalper (runs every 10m)
 │   └── peak_profit_monitor.py           # Standalone 15-min peak monitor (runs :16/:46 & :17/:47)
 ├── scripts/
+│   ├── Tuesday-Fno-Exit-Orders-V1.py    # Dedicated Tuesday 5-day cycle Upstox trailing SL manager (tag: TUE-SL)
+│   ├── Thursday-Fno-Exit-Orders-V1.py   # Dedicated Thursday 3-day cycle Upstox trailing SL manager (tag: THU-SL)
 │   ├── run_weekly_close.py              # Master weekly close orchestrator (runs Mon 15:37)
 │   ├── run_thursday_close.py            # Thursday cycle close orchestrator (runs Mon 15:38)
 │   ├── send_weekly_report.py            # Monday HTML email + chart generator (supports --track)
 │   ├── compare_ai_vs_static_benchmark.py # Retrospective side-by-side P&L comparison
+│   ├── compare_entry_timing_counterfactuals.py # Counterfactual entry timing evaluation
+│   ├── monitor_live_options_5min.py     # High-frequency 5-min live options monitor
+│   ├── run_5min_options_monitor.sh      # Cron wrapper script for 5-min options monitor
 │   └── sync_to_mongodb.py               # MongoDB Atlas derivatives synchronization CLI (supports --track)
-├── tests/                               # 74 automated pytest unit tests
+├── tests/                               # 260 automated pytest unit tests
+│   ├── test_ai_strike_selector.py
 │   ├── test_angelone_resolution.py
 │   ├── test_calendar_utils.py
 │   ├── test_entry_gate.py
+│   ├── test_fno_keys.py                 # Expiry normalization, key formatting, parsing & year-boundary tests
 │   ├── test_fsm_strategy.py
 │   ├── test_gamma_sniper.py
+│   ├── test_monitor_live_options_5min.py
+│   ├── test_nifty_spot_feed.py
+│   ├── test_opening_straddle_alerts.py
+│   ├── test_opening_straddle_backtest.py
+│   ├── test_opening_straddle_engine.py
+│   ├── test_premarket_intelligence.py
 │   ├── test_profit_monitor.py
 │   ├── test_standalone_peak_monitor.py
 │   ├── test_storage.py
+│   ├── test_thursday_fno_exit.py        # Thursday exit manager unit tests (29 tests)
 │   ├── test_thursday_strategy.py
+│   ├── test_timing_counterfactuals.py
+│   ├── test_tuesday_fno_exit.py         # Tuesday exit manager unit tests (29 tests)
+│   ├── test_unified_strategy_store.py   # Strategy store & exit authorization tests (12 tests)
+│   ├── test_upstox_feed_reader.py
 │   ├── test_weekly_collector.py
 │   └── test_weekly_report.py
 └── cron/
@@ -93,13 +116,18 @@ nifty50_strategies/
 | `common/ai_strike_selector.py` | AI Strike Selector: optimizes strikes on standard 50-pt grid using VIX, ATR, Greeks ($\Delta \approx 0.35$), and IV skew via OpenRouter with asymmetric technical fallback |
 | `common/calendar_utils.py` | NSE holiday calendar resolution via Upstox API with in-process caching, strategy start/closing day detection (Tuesday master & Thursday 3-day), and Monday-holiday deferred close handling |
 | `common/entry_gate.py` | Smart Entry Gate: checks trend, ATR, and momentum filters at cycle open to gate entry; writes counterfactual shadow records on deferral |
+| `common/fno_keys.py` | Canonical Redis key builder (`fno:{broker}:enabled:{cycle}:{expiry_iso}:{strike}:{option_type}`), multi-format expiry normalization (ISO, Upstox format, Angel One format, compact format, yearless `4AUG`), and key parser |
 | `common/fsm_strategy.py` | Decoupled Finite State Machine trade manager: tracks trailing stop ladders by days-to-expiry (25% buffer for >5 DTE, 18% for 1.5–5 DTE), harvest rules (+50% leg profit), and capital salvage stop rules |
 | `common/profit_monitor.py` | Peak-profit alert engine & future broker execution seam; parameterized with `snapshot_filepath` and `track_label` for track-isolated high-water marks |
 | `common/storage.py` | SQLite persistence layer: `init_db()`, `build_thursday_db_path()`, auto-migrations for integer timestamps and FSM columns, trade updating, and active/archive JSON snapshot management (`filepath` parameterized) |
+| `common/unified_strategy_store.py` | Centralized MongoDB Atlas and Redis store; publishes exit order authorization to Redis (`publish_exit_authorization_to_redis()`) with strict Alpha-only exit gating (`cat == "alpha_fsm"`), 7-day TTL, and fast gate keys (`ORDERS_LIVE_TUE`, `ORDERS_LIVE_THU`) |
+| `common/upstox_feed_reader.py` | Upstox market data feed reader for spot indices and option strike pricing |
 | `strategies/weekly_option_collector.py` | Cron-invoked master collector (:01 & :31): handles Tuesday cycle initialization, Smart Gate evaluation, option LTP capture, FSM state updates, and counterfactual logging |
 | `strategies/thursday_option_collector.py` | Cron-invoked standalone Thursday collector (:02 & :32): manages parallel 3-day strangle (Thu–Mon), evaluates Smart Gate, selects strikes, updates 18% trailing stop FSM, and logs to `current_thursday_buy.json` |
 | `strategies/monday_gamma_sniper.py` | Monday afternoon gamma scalper (13:15–15:00 IST): evaluates 5-min VWAP and volume surges ($\ge 1.5\times$) with target (+75%), stop-loss (-35%), and 15:10 IST time-stop |
 | `strategies/peak_profit_monitor.py` | Standalone 15-minute peak monitor (runs :16 & :46 for weekly; :17 & :47 for thursday via `--track thursday`): checks floating strangle profits against high-water marks |
+| `scripts/Tuesday-Fno-Exit-Orders-V1.py` | Dedicated Tuesday 5-day cycle trailing Stop-Loss Market (SL-M) order manager for Upstox; enforces `tag="TUE-SL"`, cross-process distributed lock (`fno_execution_lock()`) with heartbeat auto-renewal, 15:30:00 IST exact-second cutoff, NSE exchange holiday checks, pre-mutation lock/time validation, two-phase cancel confirmation, and order slicing |
+| `scripts/Thursday-Fno-Exit-Orders-V1.py` | Dedicated Thursday 3-day cycle trailing Stop-Loss Market (SL-M) order manager for Upstox; enforces `tag="THU-SL"`, `LOTS_THURSDAY=1` (65 qty default), isolated fast gate `ORDERS_LIVE_THU`, and identical distributed locking, holiday/market-hours guards, and short-position safeguards |
 | `scripts/run_weekly_close.py` | Unified master weekly orchestrator (Mon 15:37 IST / Tue 09:07 deferred): closes active cycle upfront, runs report email, benchmark scoring, SQLite merge, and skill generation |
 | `scripts/run_thursday_close.py` | Dedicated Thursday cycle close orchestrator (Mon 15:38 IST / Tue 09:08 deferred): marks Thursday snapshot closed, sends Thursday report email, and syncs to MongoDB Atlas (skips LLM skill generation) |
 | `scripts/compare_ai_vs_static_benchmark.py` | Reconstructs static $\pm 100$ strike LTPs from `signals_data_*.db` `option_chain_surface` to compute side-by-side outperformance delta vs AI strategy |
@@ -320,6 +348,72 @@ While the baseline strategy holds both option legs blindly until the final Monda
 > **FSM is an active risk manager, not a zero-loss guarantee.**
 > - The explicit purpose of the Salvage Stop is **loss mitigation**: selling a collapsing leg at $-50\%$ recovers $\sim 50\%$ of the leg's premium rather than letting it decay passively to ₹0 ($-100\%$ total wipeout).
 > - In range-bound, sideways markets where neither leg breaks out, theta decay burns extrinsic value on both sides. Legs can trigger Salvage Stops or exit below entry price, resulting in a **controlled net negative P&L**.
+
+### 4.10 Dedicated F&O Trailing Stop-Loss Order Managers (Upstox Live Execution)
+
+To execute live broker exit orders while maintaining strict separation of concerns, the repository provides two dedicated, isolated trailing stop-loss managers:
+- **Tuesday 5-Day Strategy Exit Manager**: [`scripts/Tuesday-Fno-Exit-Orders-V1.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/scripts/Tuesday-Fno-Exit-Orders-V1.py)
+- **Thursday 3-Day Strategy Exit Manager**: [`scripts/Thursday-Fno-Exit-Orders-V1.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/scripts/Thursday-Fno-Exit-Orders-V1.py)
+
+#### 1. Core Architecture & Signal Decoupling
+
+The execution engine decouples signal generation from high-frequency order trailing:
+1. **Signal Generation (Low Frequency)**: `sentinel-hermes` inference runner and `nifty50_strategies` collectors evaluate market conditions every 30 minutes (or on live ticks). When the Alpha FSM triggers a leg exit (e.g. `CALL_HARVEST`, `PUT_STOP_LOSS`, `SALVAGE_STOP`), [`common/unified_strategy_store.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/unified_strategy_store.py) publishes an authorization record to Redis Cloud with a 7-day TTL and trips the fast gate (`ORDERS_LIVE_TUE=1` or `ORDERS_LIVE_THU=1`).
+2. **Order Trailing & Management (High Frequency, 1-Min Cron)**: The standalone exit managers run every minute during market hours via cron. They verify gate status in <1ms, scan open broker positions, match against active strategy strikes and expiries, dynamically trail Stop-Loss Market (SL-M) orders as option LTP expands, and modify trigger prices strictly upwards (never loosening risk downward).
+3. **Broker Safety**: The exit managers **NEVER place BUY orders**. They operate strictly as long-exit order managers (selling to close existing long contracts). If broker net quantity is zero or negative, no order is placed.
+
+#### 2. Complete Operational Track Isolation
+
+The Tuesday and Thursday strategies operate under complete isolation to ensure zero cross-contamination:
+
+| Dimension | Tuesday 5-Day Strategy Track | Thursday 3-Day Strategy Track |
+|---|---|---|
+| **Script Path** | `scripts/Tuesday-Fno-Exit-Orders-V1.py` | `scripts/Thursday-Fno-Exit-Orders-V1.py` |
+| **Order Tag** | `tag="TUE-SL"` | `tag="THU-SL"` |
+| **Redis Gate Key** | `ORDERS_LIVE_TUE` | `ORDERS_LIVE_THU` |
+| **Active Cycle Snapshot** | `current_week_buy.json` | `current_thursday_buy.json` |
+| **Environment Flag** | `LIVE_EXIT_TRIGGER_TUESDAY=true` | `LIVE_EXIT_TRIGGER_THURSDAY=true` |
+| **Configured Lot Size** | `LOTS_TUESDAY=2` (130 qty) | `LOTS_THURSDAY=1` (65 qty) |
+| **Redis Token Fallback** | `fno:upstox:access_token:tuesday` | `fno:upstox:access_token:thursday` |
+| **Pending Order Reservation** | Ignores `THU-SL` orders when checking pending qty | Ignores `TUE-SL` orders when checking pending qty |
+| **Trailing Stop Trait** | Trailing stop buffer adapts across 5 DTE | Starts directly in tighter 18% DTE bracket |
+
+#### 3. Canonical Expiry-Aware Redis Authorization Contract
+
+To prevent key collision across concurrent weekly expiries or rollover weeks, all authorization keys strictly include the normalized contract expiry date ([`common/fno_keys.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/fno_keys.py)):
+
+```text
+fno:{broker}:enabled:{cycle}:{expiry_iso}:{strike}:{option_type}
+```
+*Example*: `fno:upstox:enabled:tuesday:2026-11-03:24200:PE`
+
+- **Multi-Format Normalization**: `normalize_expiry()` converts ISO (`2026-11-03`), Upstox format (`03NOV26`), Angel One format (`03NOV2026`), compact (`20261103`), and yearless symbols (`4AUG` resolved against the active cycle's year, including calendar-year crossovers).
+- **Alpha-Only Gating**: Authorization keys are published **exclusively** when Alpha FSM exit signals trigger (`cat == "alpha_fsm"`). Milestone peak-profit alerts ($\ge 20\%$) do **not** enable live order placement.
+- **7-Day TTL (`604800s`)**: Authorizations remain valid through the full lifecycle of the weekly option contract and automatically expire after 7 days, eliminating stale key pollution.
+- **Expiry-Filtered Cleanup**: When a leg closes, reconciliation retires only the specific expiry's high-water mark and stop keys (`fno:{broker}:hwm:{cycle}:{expiry}:*`), ensuring adjacent expiries holding identical strikes are never purged.
+
+#### 4. Distributed Cross-Process Lock with Heartbeat Daemon
+
+To prevent race conditions between Tuesday and Thursday scripts accessing the Upstox API concurrently:
+- **Distributed Mutex**: Both scripts acquire `lock:fno_execution_runner` in Redis before performing position queries or order mutations.
+- **Fail-Closed Acquisition**: If the lock cannot be acquired within 10 seconds, the script exits immediately with zero broker API calls.
+- **Auto-Renewal Heartbeat Daemon**: A background daemon thread sends heartbeat renewals every `timeout / 3` seconds (20s on a 60s lease).
+- **Thread Abort Signal**: If the heartbeat thread loses lock ownership or encounters a fatal Redis error, it flags `abort_event.set()`.
+- **Pre-Mutation Guards**: Both `abort_event` and `is_market_hours_ist()` are re-checked **immediately before** every order placement (`place_exit_order_slm`), modification (`modify_exit_order_slm`), and cancellation (`cancel_order`), preventing delayed network responses from placing orders without valid lock ownership.
+
+#### 5. Strict Market Hours & Exchange Holiday Enforcement
+
+The execution managers enforce strict fail-safe market boundary guards:
+- **NSE Trading Holidays**: Integrates with [`calendar_utils.check_nse_holiday()`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/calendar_utils.py) via Upstox API. On NSE holidays (e.g., Diwali, Dussehra), the script aborts immediately with zero broker calls.
+- **Exact-Second 15:30:00 IST Cutoff**: Market hours are defined strictly as `09:15:00` to `15:29:59` IST. At `15:30:00` or later, the market is treated as closed.
+- **Re-Check Before Mutations**: The market hours check is re-evaluated immediately before any broker network call to eliminate race conditions if quote-fetching experiences network latency near the closing bell.
+
+#### 6. Order Execution & Protection Invariants
+
+- **Stop-Loss Market (SL-M)**: Orders are placed with `order_type="SL-M"` to ensure immediate market fill once the trigger price is breached.
+- **Two-Phase Cancel Confirmation**: To prevent duplicate cancel requests on high-latency networks, pending cancellations record `cancel_requested: <order_id>` in Redis before calling the broker API.
+- **Exchange Freeze Slicing**: Orders exceeding the exchange freeze limit (1,800 contracts for NIFTY) are automatically sliced into compliant batch sizes.
+- **Short-Position Safeguard**: If net broker quantity <= 0, the script refuses to place exit orders, preventing inadvertent naked short positions.
 
 ---
 
@@ -574,6 +668,29 @@ The active snapshot persists the current cycle's entry buy prices, FSM state (`a
 - [x] `send_daily_report.py` (in `market_signal_agent`) queries using integer range comparison
 - [x] `send_weekly_report.py` handles both integer and legacy TEXT timestamps via `_parse_timestamp()`
 
+
+### Phase 5: Dynamic AI Strike Selection, Parallel 3-Day Track & Real-Time Alerts (COMPLETE)
+
+- [x] Dynamic AI Strike Selection via OpenRouter LLMs (`common/ai_strike_selector.py`)
+- [x] Asymmetric technical fallback rule and retrospective benchmark comparison (`scripts/compare_ai_vs_static_benchmark.py`)
+- [x] Parallel 3-Day Thursday Strategy Track (`strategies/thursday_option_collector.py`)
+- [x] Smart Entry Gate with counterfactual shadow logging (`common/entry_gate.py`)
+- [x] Decoupled Finite State Machine risk engine (`common/fsm_strategy.py`)
+- [x] Standalone 15-minute Peak Profit Monitor (`strategies/peak_profit_monitor.py`) with anti-spam deduplication
+- [x] Monday Gamma Sniper scalper (`strategies/monday_gamma_sniper.py`)
+- [x] MongoDB Atlas strategy synchronization (`scripts/sync_to_mongodb.py`)
+
+### Phase 6: Dedicated Upstox Live F&O Trailing Stop-Loss Order Managers (COMPLETE)
+
+- [x] Expiry-aware canonical Redis authorization keys (`common/fno_keys.py`)
+- [x] Decoupled Alpha-only exit authorization publisher (`common/unified_strategy_store.py`)
+- [x] Dedicated Tuesday 5-Day Exit Manager (`scripts/Tuesday-Fno-Exit-Orders-V1.py`, `tag="TUE-SL"`)
+- [x] Dedicated Thursday 3-Day Exit Manager (`scripts/Thursday-Fno-Exit-Orders-V1.py`, `tag="THU-SL"`)
+- [x] Distributed cross-process mutex with auto-renewing heartbeat daemon (`fno_execution_lock()`)
+- [x] Strict 15:30:00 IST cutoff and NSE exchange holiday gating
+- [x] Pre-broker-mutation atomic lock and market-hours rechecks
+- [x] Order slicing, cross-cycle quantity reservation, and two-phase cancel confirmation
+- [x] Full unit test coverage: 260 automated pytest tests passing
 ---
 
 ## 12. Setup & Running
@@ -680,6 +797,48 @@ python scripts/run_thursday_close.py --force
 python scripts/run_thursday_close.py --morning-holiday-check
 ```
 
+#### 6. Tuesday F&O Exit Order Manager (`scripts/Tuesday-Fno-Exit-Orders-V1.py`)
+
+Manages live Upstox Stop-Loss Market (SL-M) trailing exit orders for active Tuesday 5-day cycle legs once authorized by Alpha FSM exits:
+
+```bash
+# Dry-run check (inspects positions and Redis authorization without calling broker order endpoints)
+python scripts/Tuesday-Fno-Exit-Orders-V1.py --dry-run
+
+# Mock mode (simulates Upstox positions, orders, and quotes offline without broker credentials)
+python scripts/Tuesday-Fno-Exit-Orders-V1.py --mock
+
+# Live execution mode (requires UPSTOX_ACCESS_TOKEN and LIVE_EXIT_TRIGGER_TUESDAY=true)
+python scripts/Tuesday-Fno-Exit-Orders-V1.py --execute
+
+# Override configured lot allocation (default: 2 lots = 130 qty)
+python scripts/Tuesday-Fno-Exit-Orders-V1.py --execute --lots 2
+
+# Force execution outside market hours / holidays (testing/verification only)
+python scripts/Tuesday-Fno-Exit-Orders-V1.py --mock --force
+```
+
+#### 7. Thursday F&O Exit Order Manager (`scripts/Thursday-Fno-Exit-Orders-V1.py`)
+
+Manages live Upstox Stop-Loss Market (SL-M) trailing exit orders for active Thursday 3-day cycle legs once authorized by Alpha FSM exits:
+
+```bash
+# Dry-run check (inspects Thursday positions and Redis authorization)
+python scripts/Thursday-Fno-Exit-Orders-V1.py --dry-run
+
+# Mock mode (simulates Upstox positions, orders, and quotes offline)
+python scripts/Thursday-Fno-Exit-Orders-V1.py --mock
+
+# Live execution mode (requires UPSTOX_ACCESS_TOKEN and LIVE_EXIT_TRIGGER_THURSDAY=true)
+python scripts/Thursday-Fno-Exit-Orders-V1.py --execute
+
+# Override configured lot allocation (default: 1 lot = 65 qty)
+python scripts/Thursday-Fno-Exit-Orders-V1.py --execute --lots 1
+
+# Force execution outside market hours / holidays (testing/verification only)
+python scripts/Thursday-Fno-Exit-Orders-V1.py --mock --force
+```
+
 ### Production Crontab Entries
 
 All production crontab schedules execute in **UTC** on AWS EC2:
@@ -725,6 +884,19 @@ All production crontab schedules execute in **UTC** on AWS EC2:
 
 # Tuesday Deferred Close for Thursday Track (Runs Tuesday 09:08 IST = 03:38 UTC if Monday was an exchange holiday)
 38 3 * * 2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_thursday_close.py --morning-holiday-check >> /home/ubuntu/logs/thursday_close_$(date +\%F).log 2>&1
+
+# ============================================================================
+# UPSTOX LIVE F&O TRAILING STOP-LOSS EXIT MANAGERS (Every 1 Minute, UTC)
+# Trading Window: 09:15 to 15:29 IST = 03:45 to 09:59 UTC (Ends strictly before 15:30:00 IST)
+# Pre-creation: 'mkdir -p logs' ensures shell redirection never fails on fresh VMs.
+# ============================================================================
+# Tuesday 5-Day Exit Manager (Tag: TUE-SL, Lots: 2 = 130 qty)
+45-59 3 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Tuesday-Fno-Exit-Orders-V1.py --execute >> logs/tue_exit_$(date +\%F).log 2>&1
+* 4-9 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Tuesday-Fno-Exit-Orders-V1.py --execute >> logs/tue_exit_$(date +\%F).log 2>&1
+
+# Thursday 3-Day Exit Manager (Tag: THU-SL, Lots: 1 = 65 qty)
+45-59 3 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Thursday-Fno-Exit-Orders-V1.py --execute >> logs/thu_exit_$(date +\%F).log 2>&1
+* 4-9 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Thursday-Fno-Exit-Orders-V1.py --execute >> logs/thu_exit_$(date +\%F).log 2>&1
 ```
 
 ### Weekly Monday email report
@@ -891,7 +1063,9 @@ This project interacts with external brokerage, AI, database, and email services
 | :--- | :--- | :--- | :--- | :--- |
 | **Angel One SmartAPI** | Brokerage & Market Data | • `common/angelone_client.py` (NIFTY spot LTP, daily option scrip master, CALL/PUT quotes) | `ANGELONE_API_KEY`<br>*(Prioritizes Redis key `angelone_jwt_feed`)* | Free API access. Rate-limited. Managed at [smartapi.angelbroking.com](https://smartapi.angelbroking.com/) |
 | **OpenRouter** | LLM Gateway | • `common/ai_strike_selector.py` (Dynamic Tuesday strike optimization via DeepSeek/Claude) | `OPENROUTER_API_KEY`<br>*(Reads model list from Redis `finance_llm_models`)* | Prepaid USD credit. Volume: ~1–4 calls/week (1 entry call + up to 3 shadow counterfactual calls). Managed at [openrouter.ai/credits](https://openrouter.ai/credits) |
-| **Upstox API** | Market Calendar | • `common/calendar_utils.py` (Fetches live NSE holiday calendar for deferred closes) | None (Public API: `api.upstox.com/v2/market/holidays`) | Free public endpoint. Cached in-process to minimize network calls. |
+| **Upstox API** | Market Calendar & F&O Exit Execution | • `common/calendar_utils.py` (NSE holiday calendar)<br>• `scripts/Tuesday-Fno-Exit-Orders-V1.py` & `scripts/Thursday-Fno-Exit-Orders-V1.py` (Live F&O trailing stop-loss execution) | `UPSTOX_ACCESS_TOKEN`<br>*(Prioritizes Redis keys `fno:upstox:access_token:*`)* | API trading access. Exit managers place SL-M market trailing stops strictly when Alpha FSM exit signals trigger. |
 | **MongoDB Atlas** | Cloud NoSQL DB | • `scripts/sync_to_mongodb.py` (Persists weekly dossiers in `derivative_strategies` & `derivative_master`) | `MONGODB_URI` | Free M0 cluster (512MB storage). Managed at [cloud.mongodb.com](https://cloud.mongodb.com/) |
 | **Gmail SMTP** | Email Notifications | • `scripts/send_weekly_report.py` (Dispatches Monday weekly performance reports & charts) | `EMAIL_SENDER`, `EMAIL_APP_PASSWORD`<br>`EMAIL_SMTP_SERVER`, `EMAIL_SMTP_PORT` | Daily sending limit (500/day). |
+
+
 
