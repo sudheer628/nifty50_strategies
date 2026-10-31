@@ -1188,6 +1188,670 @@ def test_angelone_cancel_order_payload():
         assert payload["orderid"] == "ANGEL_ORPHAN_999"
 
 
+class MockRedis:
+    def __init__(self):
+        self.data = {}
+    def get(self, key):
+        return self.data.get(key)
+    def set(self, key, value):
+        self.data[key] = str(value)
+        return True
+    def delete(self, *keys):
+        for k in keys:
+            self.data.pop(k, None)
+        return True
+    def pipeline(self):
+        return self
+    def execute(self):
+        return True
+    def scan_iter(self, match=None, count=None):
+        return [k for k in self.data.keys() if match is None or match.replace("*", "") in k]
+    def expire(self, key, seconds):
+        return True
+    def sadd(self, key, *values):
+        s = self.data.setdefault(key, set())
+        if isinstance(s, set):
+            for v in values:
+                s.add(str(v))
+        return True
+    def smembers(self, key):
+        return self.data.get(key, set())
+
+
+def test_angelone_place_order_market_payload():
+    """Verify AngelOne place_exit_order_market constructs valid SmartAPI MARKET sell payload."""
+    pos = {
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "exchange": "NFO",
+        "producttype": "CARRYFORWARD",
+    }
+    with patch("requests.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": True, "data": {"orderid": "angel_mkt_123"}}
+        mock_post.return_value = mock_resp
+
+        res = thu_module.place_exit_order_market(
+            token="JWT_TOKEN",
+            position=pos,
+            target_qty=65,
+            product="CARRYFORWARD",
+            tag="THU-SL",
+            broker="angelone",
+        )
+
+        assert res.get("success") is True
+        assert res.get("order_id") == "angel_mkt_123"
+        payload = mock_post.call_args[1]["json"]
+        assert payload["quantity"] == "65"
+        assert payload["producttype"] == "CARRYFORWARD"
+        assert payload["duration"] == "DAY"
+        assert payload["ordertype"] == "MARKET"
+        assert payload["transactiontype"] == "SELL"
+        assert payload["price"] == "0"
+        assert payload["triggerprice"] == "0"
+        assert payload["variety"] == "NORMAL"
+        assert payload["symboltoken"] == "53750"
+
+
+def test_thursday_exit_immediately_places_market_order_and_skips_ltp_and_slm():
+    """Verify exit_immediately=True skips fetch_ltp, skips SL-M, and places MARKET sell order."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+    orders = []
+
+    with patch.object(thu_module, "fetch_ltp") as mock_ltp, \
+         patch.object(thu_module, "place_exit_order_slm") as mock_place_slm, \
+         patch.object(thu_module, "modify_exit_order_slm") as mock_modify_slm, \
+         patch.object(thu_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(thu_module, "place_exit_order_market", return_value={"success": True, "order_id": "angel_mkt_999"}) as mock_place_market:
+
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        mock_ltp.assert_not_called()
+        mock_place_slm.assert_not_called()
+        mock_modify_slm.assert_not_called()
+
+        mock_place_market.assert_called_once()
+        assert res.get("placed") == 1
+        action = res["actions"][0]
+        assert action["status"] == "place_market"
+        assert action["mode"] == "immediate"
+        assert action["order_id"] == "angel_mkt_999"
+
+        assert mock_redis.get(keys["mode"]) == "immediate"
+        assert mock_redis.get(keys["market_order_id"]) == "angel_mkt_999"
+        assert "angel_mkt_999" in mock_redis.smembers("fno:angelone:managed_order_ids")
+
+
+def test_thursday_exit_immediately_cancels_existing_slm_before_market_sell():
+    """Verify an open SL-M is cancelled and confirmed before submitting the MARKET sell order."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+    orders = [{
+        "order_id": "angel_slm_12345",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transactiontype": "SELL",
+        "transaction_type": "SELL",
+        "status": "trigger_pending",
+        "ordertype": "STOPLOSS_MARKET",
+        "order_type": "STOPLOSS_MARKET",
+        "variety": "STOPLOSS",
+        "quantity": 65,
+        "pending_quantity": 65,
+        "tag": "THU-SL",
+    }]
+
+    terminal_orders = [{
+        "order_id": "angel_slm_12345",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transactiontype": "SELL",
+        "status": "cancelled",
+        "ordertype": "STOPLOSS_MARKET",
+        "variety": "STOPLOSS",
+        "tag": "THU-SL",
+    }]
+
+    with patch.object(thu_module, "cancel_order", return_value={"success": True, "action": "cancel"}) as mock_cancel, \
+         patch.object(thu_module, "fetch_order_book", return_value=terminal_orders), \
+         patch.object(thu_module, "fetch_positions", return_value={"data": positions}), \
+         patch.object(thu_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(thu_module, "place_exit_order_market", return_value={"success": True, "order_id": "angel_mkt_777"}) as mock_place_market:
+
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        mock_cancel.assert_called_once_with("REAL_TOKEN", "angel_slm_12345", broker="angelone", variety="STOPLOSS")
+        mock_place_market.assert_called_once()
+        assert res.get("placed") == 1
+        assert res["actions"][0]["status"] == "place_market"
+        assert res["actions"][0]["order_id"] == "angel_mkt_777"
+
+
+def test_thursday_exit_immediately_defers_market_order_if_slm_cancel_missing_from_order_book():
+    """Verify that if follow-up order book omits the cancelled SL-M order, market order is deferred."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+    mock_redis.set(keys["order_id"], "angel_slm_12345")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+    orders = [{
+        "order_id": "angel_slm_12345",
+        "orderid": "angel_slm_12345",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transaction_type": "SELL",
+        "transactiontype": "SELL",
+        "status": "trigger pending",
+        "order_type": "STOPLOSS_MARKET",
+        "ordertype": "STOPLOSS_MARKET",
+        "tag": "THU-SL",
+        "quantity": 65,
+        "pending_quantity": 65,
+    }]
+
+    with patch.object(thu_module, "cancel_order", return_value={"success": True, "action": "cancel"}) as mock_cancel, \
+         patch.object(thu_module, "fetch_order_book", return_value=[]), \
+         patch.object(thu_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(thu_module, "place_exit_order_market") as mock_place_market:
+
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        mock_cancel.assert_called_once_with("REAL_TOKEN", "angel_slm_12345", broker="angelone", variety="STOPLOSS")
+        mock_place_market.assert_not_called()
+        assert res.get("placed") == 0
+        assert res["actions"][0]["status"] == "cancel_slm_missing"
+        assert res["actions"][0]["order_id"] == "angel_slm_12345"
+        # Redis state is preserved
+        assert mock_redis.get(keys["order_id"]) == "angel_slm_12345"
+
+
+def test_thursday_exit_immediately_defers_market_order_if_slm_cancel_has_unknown_status():
+    """Verify that if follow-up order book returns an unknown status, market order is deferred."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+    mock_redis.set(keys["order_id"], "angel_slm_12345")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+    orders = [{
+        "order_id": "angel_slm_12345",
+        "orderid": "angel_slm_12345",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transaction_type": "SELL",
+        "transactiontype": "SELL",
+        "status": "trigger pending",
+        "order_type": "STOPLOSS_MARKET",
+        "ordertype": "STOPLOSS_MARKET",
+        "tag": "THU-SL",
+        "quantity": 65,
+        "pending_quantity": 65,
+    }]
+
+    unrecognized_orders = [{
+        "order_id": "angel_slm_12345",
+        "orderid": "angel_slm_12345",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transaction_type": "SELL",
+        "status": "broker_sync_wait",  # Unrecognized status
+        "order_type": "STOPLOSS_MARKET",
+        "tag": "THU-SL",
+    }]
+
+    with patch.object(thu_module, "cancel_order", return_value={"success": True, "action": "cancel"}) as mock_cancel, \
+         patch.object(thu_module, "fetch_order_book", return_value=unrecognized_orders), \
+         patch.object(thu_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(thu_module, "place_exit_order_market") as mock_place_market:
+
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        mock_cancel.assert_called_once_with("REAL_TOKEN", "angel_slm_12345", broker="angelone", variety="STOPLOSS")
+        mock_place_market.assert_not_called()
+        assert res.get("placed") == 0
+        assert res["actions"][0]["status"] == "cancel_slm_unknown_status"
+        assert res["actions"][0]["order_id"] == "angel_slm_12345"
+
+
+def test_thursday_exit_immediately_defers_market_order_if_prior_stored_slm_missing_from_order_book():
+    """Verify that if existing is None but Redis has prior SL-M that is missing from order book, market order is deferred."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+    mock_redis.set(keys["order_id"], "prior_angel_slm_888")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+    orders = []  # Prior SL-M is missing from initial order book
+
+    with patch.object(thu_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(thu_module, "place_exit_order_market") as mock_place_market:
+
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        mock_place_market.assert_not_called()
+        assert res.get("placed") == 0
+        assert res["actions"][0]["status"] == "cancel_slm_missing"
+        assert res["actions"][0]["order_id"] == "prior_angel_slm_888"
+
+
+def test_thursday_exit_immediately_manual_sell_conflict():
+    """Verify that an untagged manual open SELL order prevents market sell order placement."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+    orders = [{
+        "order_id": "manual_sell_888",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transaction_type": "SELL",
+        "transactiontype": "SELL",
+        "status": "open",
+        "order_type": "LIMIT",
+        "ordertype": "LIMIT",
+        "tag": "",  # Manual untagged order
+        "quantity": 65,
+        "pending_quantity": 65,
+    }]
+
+    with patch.object(thu_module, "place_exit_order_market") as mock_place_market:
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        mock_place_market.assert_not_called()
+        action = res["actions"][0]
+        assert action["status"] == "manual_sell_conflict"
+        assert action["mode"] == "immediate"
+
+
+def test_thursday_exit_immediately_persists_across_runs_via_redis():
+    """Verify that once immediate mode is recorded in Redis, subsequent runs without CLI flag keep immediate mode."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+    mock_redis.set(keys["mode"], "immediate")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+    orders = []
+
+    with patch.object(thu_module, "fetch_ltp") as mock_ltp, \
+         patch.object(thu_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(thu_module, "place_exit_order_market", return_value={"success": True, "order_id": "angel_mkt_888"}) as mock_place_market:
+
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=False,  # CLI flag omitted!
+            redis_client=mock_redis,
+        )
+
+        mock_ltp.assert_not_called()
+        mock_place_market.assert_called_once()
+        assert res["actions"][0]["mode"] == "immediate"
+        assert res["actions"][0]["status"] == "place_market"
+
+
+def test_thursday_exit_immediately_prevents_duplicate_in_flight_market_order():
+    """Verify that if a market order is already in-flight in order book, duplicate placement is prevented."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+    mock_redis.set(keys["mode"], "immediate")
+    mock_redis.set(keys["market_order_id"], "angel_mkt_in_flight_001")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+    orders = [{
+        "order_id": "angel_mkt_in_flight_001",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transactiontype": "SELL",
+        "transaction_type": "SELL",
+        "status": "open",
+        "ordertype": "MARKET",
+        "order_type": "MARKET",
+        "tag": "THU-SL",
+        "quantity": 65,
+        "pending_quantity": 65,
+    }]
+
+    with patch.object(thu_module, "place_exit_order_market") as mock_place_market:
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        mock_place_market.assert_not_called()
+        action = res["actions"][0]
+        assert action["status"] == "market_order_in_flight"
+        assert action["order_id"] == "angel_mkt_in_flight_001"
+
+
+def test_thursday_exit_immediately_dry_run():
+    """Verify dry-run mode (--dry-run or execute=False) reports place_market without API calls."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+    orders = []
+
+    with patch.object(thu_module, "place_exit_order_market") as mock_place_market:
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=False,  # Dry run
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        mock_place_market.assert_not_called()
+        assert res.get("dry_run") is True
+        action = res["actions"][0]
+        assert action["status"] == "place_market"
+        assert action["mode"] == "immediate"
+        assert action["dry_run"] is True
+        assert action["action_needed"] is True
+
+
+def test_thursday_exit_immediately_partial_fill_retry_reconciles_quantity_when_position_stale():
+    """Verify that when a prior market order was partially filled (40 filled, 25 cancelled)
+    and the position snapshot is still stale at 65, the manager submits a retry for only the
+    remaining 25 contracts, preventing a short position."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+    mock_redis.set(keys["mode"], "immediate")
+    mock_redis.set(keys["market_order_id"], "angel_mkt_partial_001")
+
+    # Position snapshot is STILL STALE at 65
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 65,
+        "netqty": "65",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+
+    # Prior market order: 40 filled, 25 cancelled (terminal)
+    orders = [{
+        "order_id": "angel_mkt_partial_001",
+        "orderid": "angel_mkt_partial_001",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transaction_type": "SELL",
+        "transactiontype": "SELL",
+        "status": "cancelled",
+        "ordertype": "MARKET",
+        "order_type": "MARKET",
+        "tag": "THU-SL",
+        "quantity": 65,
+        "filled_quantity": 40,
+        "pending_quantity": 0,
+        "cancelsize": 25,
+    }]
+
+    with patch.object(thu_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(thu_module, "fetch_positions", return_value={"data": positions}), \
+         patch.object(thu_module, "place_exit_order_market", return_value={"success": True, "order_id": "angel_mkt_retry_002"}) as mock_place_market:
+
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            target_lots=1,
+            lot_size=65,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        # MUST submit only the remaining 25 contracts, NOT 65
+        mock_place_market.assert_called_once()
+        call_args = mock_place_market.call_args
+        submitted_qty = call_args[1].get("target_qty") or call_args[0][2]
+        assert submitted_qty == 25, f"Expected 25 qty to be submitted, but got {submitted_qty}"
+
+        assert res.get("placed") == 1
+        action = res["actions"][0]
+        assert action["status"] == "place_market"
+        assert action["quantity"] == 25
+        assert action["order_id"] == "angel_mkt_retry_002"
+        # Redis market_order_id updated to the retry order
+        assert mock_redis.get(keys["market_order_id"]) == "angel_mkt_retry_002"
+
+
+def test_thursday_exit_immediately_partial_fill_retry_with_updated_position_snapshot():
+    """Verify that when a prior market order was partially filled (40 filled out of 65)
+    and the broker position snapshot has already updated to 25, the manager submits a retry
+    for exactly the remaining 25 contracts, not skipping the exit."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+    mock_redis.set(keys["mode"], "immediate")
+    mock_redis.set(keys["market_order_id"], "angel_mkt_partial_001")
+
+    # Position snapshot has ALREADY UPDATED to 25 long
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 25,
+        "netqty": "25",
+        "average_price": 100.0,
+        "cfbuyavgprice": "100.0",
+        "last_price": 110.0,
+    }]
+
+    # Prior market order: 40 filled, 25 cancelled (terminal)
+    orders = [{
+        "order_id": "angel_mkt_partial_001",
+        "orderid": "angel_mkt_partial_001",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transaction_type": "SELL",
+        "transactiontype": "SELL",
+        "status": "cancelled",
+        "ordertype": "MARKET",
+        "order_type": "MARKET",
+        "tag": "THU-SL",
+        "quantity": 65,
+        "filled_quantity": 40,
+        "pending_quantity": 0,
+        "cancelsize": 25,
+    }]
+
+    with patch.object(thu_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(thu_module, "fetch_positions", return_value={"data": positions}), \
+         patch.object(thu_module, "place_exit_order_market", return_value={"success": True, "order_id": "angel_mkt_retry_003"}) as mock_place_market:
+
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            target_lots=1,
+            lot_size=65,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        # MUST submit retry for remaining 25 contracts, NOT skip
+        mock_place_market.assert_called_once()
+        call_args = mock_place_market.call_args
+        submitted_qty = call_args[1].get("target_qty") or call_args[0][2]
+        assert submitted_qty == 25, f"Expected 25 qty to be submitted, but got {submitted_qty}"
+
+        assert res.get("placed") == 1
+        action = res["actions"][0]
+        assert action["status"] == "place_market"
+        assert action["quantity"] == 25
+        assert action["order_id"] == "angel_mkt_retry_003"
+        assert mock_redis.get(keys["market_order_id"]) == "angel_mkt_retry_003"
+
+
 
 
 

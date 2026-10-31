@@ -425,6 +425,29 @@ The execution managers enforce strict fail-safe market boundary guards:
 - **Exchange Freeze Slicing**: Orders exceeding the exchange freeze limit (1,800 contracts for NIFTY) are automatically sliced into compliant batch sizes.
 - **Short-Position Safeguard**: If net broker quantity <= 0, the script refuses to place exit orders, preventing inadvertent naked short positions.
 
+#### 7. Immediate Square-Off Mode (`--exit-immediately`) & Anti-Short Invariants
+
+In addition to standard 20% trailing SL-M orders, both managers support immediate market square-off when `--exit-immediately` or `EXIT_IMMEDIATELY_*=true` is supplied:
+
+- **Bypass Trailing SL Calculations**: When immediate mode is active, the manager bypasses `fetch_ltp` network calls, initial stop math, and ratchet logic, submitting a broker-segregated **MARKET** sell order for only the Alpha-authorized leg.
+- **Pre-Existing SL-M Cancellation Verification**:
+  - If a managed SL-M order is already open, the manager requests cancellation first via `cancel_order()`.
+  - Re-checks the broker order book 0.5s later. Proceeding with a market order requires the order ID to be **explicitly confirmed terminal** (`cancelled`, `canceled`, `rejected`, or `expired`).
+  - If the order ID is missing from the follow-up order book (broker latency/omission) or returns an unrecognized status, the manager retains Redis state, reports `status: "cancel_slm_missing"` or `"cancel_slm_unknown_status"`, and defers market order placement until the order ID reappears with confirmed terminal status.
+  - Cross-run checks enforce the same verification if a stored SL-M ID exists in Redis but is absent from the current open-order list.
+- **Partial-Fill & Position Snapshot Reconciliation**:
+  - The manager tracks cumulative fills across all managed market SELL orders for the contract: `total_market_filled = sum(filled)`.
+  - It computes the remaining authorized exit target: `remaining_authorized = max(0, leg_target_qty - total_market_filled)`.
+  - If `remaining_authorized <= 0` (the entire authorized quantity has filled), it flags `market_order_already_filled`, places **0 orders**, and awaits position settlement.
+  - If a prior market order was partially filled (e.g., 40 filled, 25 cancelled out of 65 authorized):
+    - When the broker position snapshot is **updated** (shows 25): it submits a retry order for `min(25, 25) = 25`.
+    - When the broker position snapshot is **stale** (still shows 65): it submits a retry order for `min(65, 25) = 25`.
+    - Both paths guarantee exactly 25 contracts are retried, completely preventing over-selling into an accidental naked short.
+- **Single Execution & Idle Zero-Broker-Call Cycles**:
+  - Immediate mode state is persisted in Redis (`{base}:mode = "immediate"` and `{base}:market_order_id = <order_id>`).
+  - Once all authorized legs for the cycle reach 0 quantity and orders are terminal, `reconcile_cycle_legs()` purges the leg keys and `_check_and_reset_orders_live` resets `ORDERS_LIVE_TUE = 0` / `ORDERS_LIVE_THU = 0`.
+  - On all subsequent 1-minute cron iterations, Step 2 reads `ORDERS_LIVE_* == 0` and terminates in **<1ms with ZERO broker API calls**.
+
 ---
 
 ## 5. Data Collected
@@ -821,6 +844,9 @@ python scripts/Tuesday-Fno-Exit-Orders-V1.py --mock
 # Live execution mode (requires UPSTOX_ACCESS_TOKEN and LIVE_EXIT_TRIGGER_TUESDAY=true)
 python scripts/Tuesday-Fno-Exit-Orders-V1.py --execute
 
+# Immediate square-off mode (submits MARKET sell order; cancels open SL-M first; persists in Redis)
+python scripts/Tuesday-Fno-Exit-Orders-V1.py --execute --exit-immediately
+
 # Override configured lot allocation (default: 2 lots = 130 qty)
 python scripts/Tuesday-Fno-Exit-Orders-V1.py --execute --lots 2
 
@@ -841,6 +867,9 @@ python scripts/Thursday-Fno-Exit-Orders-V1.py --mock
 
 # Live execution mode (requires AngelOne JWT via angelone_jwt_feed / ANGELONE_JWT_TOKEN and LIVE_EXIT_TRIGGER_THURSDAY=true)
 python scripts/Thursday-Fno-Exit-Orders-V1.py --execute
+
+# Immediate square-off mode (submits MARKET sell order; cancels open SL-M first; persists in Redis)
+python scripts/Thursday-Fno-Exit-Orders-V1.py --execute --exit-immediately
 
 # Override configured lot allocation (default: 1 lot = 65 qty)
 python scripts/Thursday-Fno-Exit-Orders-V1.py --execute --lots 1
