@@ -31,6 +31,8 @@ Scope & Operational Rules:
 ================================================================================
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -41,8 +43,8 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
