@@ -30,11 +30,14 @@ from strategies.opening_straddle_models import (
     BiasClassification,
     ConfidenceLevel,
     ExitReason,
+    OrderAction,
     PreMarketIntelligence,
     SelectedLeg,
+    StraddleExecutionMode,
     StrategyState,
     StraddleLegQuote,
     TickObservation,
+    TradeLeg,
     VolatilityRegime,
 )
 
@@ -453,6 +456,287 @@ def run_full_backtest_suite() -> Dict[str, ModelEvaluationResult]:
         "v2_flagship": config_v2,
         "v1_baseline": config_v1,
         "price_only": config_price_only,
+    }
+
+
+@dataclass
+class SingleLegScalpScenario:
+    """A synthetic single-leg directional scalp session profile."""
+    name: str
+    scenario_type: str  # BUY_CALL_WIN, SELL_CALL_WIN, SELL_PUT_WIN, TRAILING_LOCK, STOP_LOSS, VIX_SKIP, CHOP_SKIP, HARD_STOP
+    initial_spot: float
+    pre_market: PreMarketIntelligence
+    trade_leg: TradeLeg
+    order_action: OrderAction
+    strike: int
+    quote_bid: float
+    quote_ask: float
+    ticks: List[TickObservation]
+
+
+def build_single_leg_scenarios() -> List[SingleLegScalpScenario]:
+    """
+    Builds synthetic single-leg scalp scenarios covering Rules 1, 2, 3 and user priorities.
+    """
+    base_ts = 1793418365.0  # 2026-10-31 09:16:05 IST
+    scenarios: List[SingleLegScalpScenario] = []
+
+    def make_scalp_intel(cms: float, vix: float = 14.5, vix_skip: bool = False, vix_skip_reason: Optional[str] = None) -> PreMarketIntelligence:
+        bias = BiasClassification.STRONG_BULLISH if cms >= 0.25 else (
+            BiasClassification.STRONG_BEARISH if cms <= -0.25 else BiasClassification.NEUTRAL
+        )
+        return PreMarketIntelligence(
+            cds=cms,
+            coverage=0.90,
+            confidence=ConfidenceLevel.HIGH,
+            bias=bias,
+            components={},
+            vix=vix,
+            vix_regime=VolatilityRegime.NORMAL if vix <= 18.0 else VolatilityRegime.ELEVATED,
+            timestamp_utc="2026-10-31T03:44:00Z",
+            nifty_prev_close=25000.0,
+            nifty_spot=25000.0,
+            composite_morning_score=cms,
+            vix_skip=vix_skip,
+            vix_skip_reason=vix_skip_reason,
+        )
+
+    # 1. Strong Bullish Breakout: BUY CALL ATM (25000 CE), hits target at 09:18:05
+    scenarios.append(SingleLegScalpScenario(
+        name="Day 01: Bullish Breakout (BUY CALL ATM Target Hit)",
+        scenario_type="BUY_CALL_WIN",
+        initial_spot=25000.0,
+        pre_market=make_scalp_intel(0.35),
+        trade_leg=TradeLeg.CALL,
+        order_action=OrderAction.BUY,
+        strike=25000,
+        quote_bid=99.5,
+        quote_ask=100.0,
+        ticks=[
+            TickObservation(base_ts + 60, 25020.0, 103.0, 103.5, 95.0, 95.5),
+            TickObservation(base_ts + 120, 25050.0, 109.5, 110.0, 90.0, 90.5),  # Gain +9.5 pts >= 8.0 target
+        ],
+    ))
+
+    # 2. Moderate Bearish Stalls: SELL CALL 1-step OTM (25050 CE), captures decay [User Tip Priority]
+    scenarios.append(SingleLegScalpScenario(
+        name="Day 02: Resistance Stalls (SELL CALL 1-step OTM Target Hit) [User Tip Priority]",
+        scenario_type="SELL_CALL_WIN",
+        initial_spot=25000.0,
+        pre_market=make_scalp_intel(-0.22),
+        trade_leg=TradeLeg.CALL,
+        order_action=OrderAction.SELL,
+        strike=25050,
+        quote_bid=90.0,
+        quote_ask=90.5,
+        ticks=[
+            TickObservation(base_ts + 60, 24980.0, 84.5, 85.0, 105.0, 105.5),
+            TickObservation(base_ts + 180, 24950.0, 77.5, 78.0, 112.0, 112.5),  # Ask decays to 78.0 (12 pts >= 8 target)
+        ],
+    ))
+
+    # 3. Moderate Bullish Support Bounce: SELL PUT 1-step OTM (24950 PE)
+    scenarios.append(SingleLegScalpScenario(
+        name="Day 03: Support Bounce (SELL PUT 1-step OTM Target Hit)",
+        scenario_type="SELL_PUT_WIN",
+        initial_spot=25000.0,
+        pre_market=make_scalp_intel(0.18),
+        trade_leg=TradeLeg.PUT,
+        order_action=OrderAction.SELL,
+        strike=24950,
+        quote_bid=85.0,
+        quote_ask=85.5,
+        ticks=[
+            TickObservation(base_ts + 60, 25020.0, 104.0, 104.5, 78.5, 79.0),
+            TickObservation(base_ts + 180, 25045.0, 108.0, 108.5, 73.5, 74.0),  # Ask decays to 74.0 (11 pts >= 8 target)
+        ],
+    ))
+
+    # 4. Trailing Ratchet Locks Profit: BUY CALL ATM peaks at +6.0 pts, locks in +3.5 pts on reversal
+    scenarios.append(SingleLegScalpScenario(
+        name="Day 04: Dynamic Trailing Ratchet (Profit Protected)",
+        scenario_type="TRAILING_LOCK",
+        initial_spot=25000.0,
+        pre_market=make_scalp_intel(0.35),
+        trade_leg=TradeLeg.CALL,
+        order_action=OrderAction.BUY,
+        strike=25000,
+        quote_bid=99.5,
+        quote_ask=100.0,
+        ticks=[
+            TickObservation(base_ts + 60, 25030.0, 105.0, 105.5, 95.0, 95.5),  # Armed! (+5.0 pts >= 4.0)
+            TickObservation(base_ts + 90, 25035.0, 106.0, 106.5, 94.0, 94.5),  # Peak (+6.0 pts)
+            TickObservation(base_ts + 120, 25010.0, 103.5, 104.0, 96.0, 96.5), # Drops 2.5 pts >= 2.0 trail -> EXIT!
+        ],
+    ))
+
+    # 5. Disciplined Stop Loss: BUY CALL ATM hits -8.0 pts SL limit
+    scenarios.append(SingleLegScalpScenario(
+        name="Day 05: Disciplined Stop Loss (-8.0 pts)",
+        scenario_type="STOP_LOSS",
+        initial_spot=25000.0,
+        pre_market=make_scalp_intel(0.35),
+        trade_leg=TradeLeg.CALL,
+        order_action=OrderAction.BUY,
+        strike=25000,
+        quote_bid=99.5,
+        quote_ask=100.0,
+        ticks=[
+            TickObservation(base_ts + 60, 24920.0, 90.0, 90.5, 120.0, 120.5),  # Bid drops to 90.0 (-10 pts loss <= -8 SL)
+        ],
+    ))
+
+    # 6. Rule 2 High VIX Gate: India VIX = 23.5 (> 20.0) -> Skipped Day
+    scenarios.append(SingleLegScalpScenario(
+        name="Day 06: Rule 2 High VIX Skip (VIX > 20.0)",
+        scenario_type="VIX_SKIP",
+        initial_spot=25000.0,
+        pre_market=make_scalp_intel(0.40, vix=23.5, vix_skip=True, vix_skip_reason="HIGH_VIX: 23.50 > 20.00 threshold"),
+        trade_leg=TradeLeg.CALL,
+        order_action=OrderAction.BUY,
+        strike=25000,
+        quote_bid=99.5,
+        quote_ask=100.0,
+        ticks=[],
+    ))
+
+    # 7. Neutral Chop: CMS = +0.02 -> Skipped Day
+    scenarios.append(SingleLegScalpScenario(
+        name="Day 07: Neutral Chop Skip (-0.10 < CMS < +0.10)",
+        scenario_type="CHOP_SKIP",
+        initial_spot=25000.0,
+        pre_market=make_scalp_intel(0.02),
+        trade_leg=TradeLeg.NONE,
+        order_action=OrderAction.BUY,
+        strike=25000,
+        quote_bid=99.5,
+        quote_ask=100.0,
+        ticks=[],
+    ))
+
+    # 8. Mandatory Hard Time Stop at 09:55:00 AM IST
+    scenarios.append(SingleLegScalpScenario(
+        name="Day 08: 09:55 AM Hard Time Stop Liquidation",
+        scenario_type="HARD_STOP",
+        initial_spot=25000.0,
+        pre_market=make_scalp_intel(0.35),
+        trade_leg=TradeLeg.CALL,
+        order_action=OrderAction.BUY,
+        strike=25000,
+        quote_bid=99.5,
+        quote_ask=100.0,
+        ticks=[
+            TickObservation(1793420700.0, 25005.0, 101.0, 101.5, 98.0, 98.5),  # Exact 09:55:00 AM IST
+        ],
+    ))
+
+    return scenarios
+
+
+def run_single_leg_simulation(scenario: SingleLegScalpScenario) -> Dict[str, Any]:
+    """Runs a single-leg directional scalp simulation through OpeningStraddleEngine."""
+    engine = OpeningStraddleEngine(
+        pre_market=scenario.pre_market,
+        execution_mode=StraddleExecutionMode.SINGLE_LEG_DIRECTIONAL,
+    )
+
+    # 1. Pre-Market Skips
+    if scenario.pre_market.vix_skip:
+        skip_reason = scenario.pre_market.vix_skip_reason or "VIX_SKIP"
+        exit_r = ExitReason.HIGH_VIX_SKIP if "HIGH_VIX" in skip_reason else ExitReason.MISSING_VIX_SKIP
+        engine.record_skipped_session(skip_reason, exit_r)
+        return {
+            "scenario": scenario.name,
+            "status": engine.status,
+            "exit_reason": engine.exit_reason.value,
+            "net_pnl_inr": 0.0,
+            "net_roi_pct": 0.0,
+            "premium_pnl_pct": 0.0,
+        }
+
+    if scenario.scenario_type == "CHOP_SKIP":
+        engine.record_skipped_session("NEUTRAL_CHOP: CMS in (-0.10, +0.10)", ExitReason.NEUTRAL_CHOP_SKIP)
+        return {
+            "scenario": scenario.name,
+            "status": engine.status,
+            "exit_reason": engine.exit_reason.value,
+            "net_pnl_inr": 0.0,
+            "net_roi_pct": 0.0,
+            "premium_pnl_pct": 0.0,
+        }
+
+    # 2. Arm Position
+    opt_suffix = "CE" if scenario.trade_leg == TradeLeg.CALL else "PE"
+    quote = StraddleLegQuote(
+        symbol=f"NIFTY{scenario.strike}{opt_suffix}",
+        token="101",
+        strike=scenario.strike,
+        option_type=opt_suffix,
+        bid=scenario.quote_bid,
+        ask=scenario.quote_ask,
+        ltp=scenario.quote_bid if scenario.order_action == OrderAction.SELL else scenario.quote_ask,
+    )
+
+    start_ts = 1793418365.0  # 09:16:05 AM IST
+    armed = engine.arm_single_leg_entry(
+        leg=scenario.trade_leg,
+        action=scenario.order_action,
+        strike=scenario.strike,
+        quote=quote,
+        spot_price=scenario.initial_spot,
+        entry_ts=start_ts,
+    )
+    if not armed:
+        return {
+            "scenario": scenario.name,
+            "status": engine.status,
+            "exit_reason": engine.exit_reason.value,
+            "net_pnl_inr": 0.0,
+            "net_roi_pct": 0.0,
+            "premium_pnl_pct": 0.0,
+        }
+
+    # 3. Replay Ticks
+    for tick in scenario.ticks:
+        engine.process_tick(tick)
+        if engine.state == StrategyState.CLOSED:
+            break
+
+    if engine.state not in (StrategyState.CLOSED, StrategyState.ABORTED):
+        engine.force_hard_time_exit()
+
+    return {
+        "scenario": scenario.name,
+        "status": engine.status,
+        "exit_reason": engine.exit_reason.value,
+        "net_pnl_inr": round(engine.net_pnl_inr, 2),
+        "net_roi_pct": round(engine.net_roi_pct, 2),
+        "premium_pnl_pct": round(engine.premium_pnl_pct, 2),
+    }
+
+
+def run_single_leg_backtest_suite() -> Dict[str, Any]:
+    """Runs all single-leg scenarios and aggregates performance."""
+    scenarios = build_single_leg_scenarios()
+    results = [run_single_leg_simulation(s) for s in scenarios]
+
+    executed = [r for r in results if r["status"] == "PAPER_TRADING"]
+    skipped = [r for r in results if r["status"] == "SKIPPED"]
+    wins = [r for r in executed if r["net_pnl_inr"] > 0]
+    losses = [r for r in executed if r["net_pnl_inr"] < 0]
+
+    total_net_pnl = sum(r["net_pnl_inr"] for r in results)
+    win_rate = (len(wins) / len(executed) * 100.0) if executed else 0.0
+
+    return {
+        "total_sessions": len(scenarios),
+        "executed_count": len(executed),
+        "skipped_count": len(skipped),
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate_pct": round(win_rate, 1),
+        "total_net_pnl_inr": round(total_net_pnl, 2),
+        "results": results,
     }
 
 

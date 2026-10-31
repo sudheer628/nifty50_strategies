@@ -15,6 +15,22 @@ class BiasClassification(str, Enum):
     STRONG_BEARISH = "STRONG_BEARISH"
 
 
+def derive_bias_from_cms(cms: Optional[float]) -> BiasClassification:
+    """Derives directional bias from the Composite Morning Score (CMS)."""
+    if cms is None:
+        return BiasClassification.NEUTRAL
+    if cms >= 0.30:
+        return BiasClassification.STRONG_BULLISH
+    elif cms >= 0.10:
+        return BiasClassification.MODERATE_BULLISH
+    elif cms <= -0.30:
+        return BiasClassification.STRONG_BEARISH
+    elif cms <= -0.10:
+        return BiasClassification.MODERATE_BEARISH
+    else:
+        return BiasClassification.NEUTRAL
+
+
 class ConfidenceLevel(str, Enum):
     """Confidence level of the pre-market Composite Directional Score (CDS)."""
     HIGH = "HIGH"          # Coverage >= 80%
@@ -33,6 +49,20 @@ class StraddleExecutionMode(str, Enum):
     """Execution mode for opening straddle strategy."""
     BUY_STRADDLE = "BUY_STRADDLE"    # Option A: Long Straddle + 09:20 losing leg cut + independent runner
     SELL_STRADDLE = "SELL_STRADDLE"  # Short Straddle: Sell CE + Sell PE with per-leg SL
+    SINGLE_LEG_DIRECTIONAL = "SINGLE_LEG_DIRECTIONAL"  # Directional single-leg scalp (BUY/SELL)
+
+
+class OrderAction(str, Enum):
+    """Execution side for the single-leg opening trade."""
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class TradeLeg(str, Enum):
+    """Selected contract option type for single-leg trading."""
+    CALL = "CALL"
+    PUT = "PUT"
+    NONE = "NONE"
 
 
 class StrategyState(str, Enum):
@@ -46,11 +76,16 @@ class StrategyState(str, Enum):
     EVALUATION_925 = "EVALUATION_925"
     CALL_RUNNER = "CALL_RUNNER"
     PUT_RUNNER = "PUT_RUNNER"
+    SINGLE_LEG_ACTIVE = "SINGLE_LEG_ACTIVE"
     PROFIT_TARGET_EXIT = "PROFIT_TARGET_EXIT"
     STOP_LOSS_EXIT = "STOP_LOSS_EXIT"
     TRAILING_STOP_EXIT = "TRAILING_STOP_EXIT"
     HARD_TIME_EXIT = "HARD_TIME_EXIT"
     SCRATCH_EXIT = "SCRATCH_EXIT"
+    SKIPPED_HIGH_VIX = "SKIPPED_HIGH_VIX"
+    SKIPPED_MISSING_VIX = "SKIPPED_MISSING_VIX"
+    SKIPPED_NEUTRAL_CHOP = "SKIPPED_NEUTRAL_CHOP"
+    SKIPPED_INSUFFICIENT_COVERAGE = "SKIPPED_INSUFFICIENT_COVERAGE"
     ABORTED = "ABORTED"
     CLOSED = "CLOSED"
 
@@ -72,6 +107,11 @@ class ExitReason(str, Enum):
     HARD_TIME_STOP = "HARD_TIME_STOP"      # 09:55:00 AM mandatory exit
     SCRATCH = "SCRATCH"                    # Inconclusive at 09:25:00 AM
     EXECUTION_ABORT = "EXECUTION_ABORT"    # Wide spread or partial fill fail-closed
+    HIGH_VIX_SKIP = "HIGH_VIX_SKIP"        # VIX > threshold skip
+    MISSING_VIX_SKIP = "MISSING_VIX_SKIP"  # VIX missing / stale fail-closed
+    NEUTRAL_CHOP_SKIP = "NEUTRAL_CHOP_SKIP" # Dead flat market skip
+    INSUFFICIENT_COVERAGE_SKIP = "INSUFFICIENT_COVERAGE_SKIP" # Premarket coverage < 50% skip
+    MIN_PROFIT_TARGET = "MIN_PROFIT_TARGET" # Single-leg scalp profit target
 
 
 @dataclass
@@ -110,12 +150,19 @@ class PreMarketIntelligence:
     confidence: ConfidenceLevel
     bias: BiasClassification
     components: Dict[str, SourceComponent]
-    vix: float
+    vix: Optional[float]                            # India VIX (None if completely unavailable)
     vix_regime: VolatilityRegime
     timestamp_utc: str
     nifty_prev_close: Optional[float] = None
     nifty_spot: Optional[float] = None
     upstox_pulse_levels: Optional[Dict[str, Any]] = None
+    vix_fresh: bool = True                          # True if live VIX quote age <= 300s
+    vix_skip: bool = False                          # True if VIX > threshold or missing
+    vix_skip_reason: Optional[str] = None           # Explanation for VIX skip if triggered
+    prior_day_ohlc: Optional[Dict[str, Any]] = None # Prior Day Open, High, Low, Close, Range
+    grok_social_sentiment: Optional[Dict[str, Any]] = None # Grok 4.3 intraday sentiment
+    composite_morning_score: Optional[float] = None # CMS score combining gap, 1m candle, etc.
+    final_bias: Optional[BiasClassification] = None # Directional bias derived from final synthesized CMS
 
     @property
     def is_contrarian_filter_eligible(self) -> bool:
@@ -139,8 +186,15 @@ class PreMarketIntelligence:
             "confidence": self.confidence.value,
             "bias": self.bias.value,
             "is_contrarian_filter_eligible": self.is_contrarian_filter_eligible,
-            "vix": round(self.vix, 2),
+            "vix": round(self.vix, 2) if self.vix is not None else None,
             "vix_regime": self.vix_regime.value,
+            "vix_fresh": self.vix_fresh,
+            "vix_skip": self.vix_skip,
+            "vix_skip_reason": self.vix_skip_reason,
+            "prior_day_ohlc": self.prior_day_ohlc,
+            "grok_social_sentiment": self.grok_social_sentiment,
+            "composite_morning_score": round(self.composite_morning_score, 4) if self.composite_morning_score is not None else None,
+            "final_bias": self.final_bias.value if self.final_bias is not None else None,
             "timestamp_utc": self.timestamp_utc,
             "nifty_prev_close": self.nifty_prev_close,
             "nifty_spot": self.nifty_spot,
@@ -150,10 +204,14 @@ class PreMarketIntelligence:
 
     def summary_str(self) -> str:
         eligible_tag = "ELIGIBLE" if self.is_contrarian_filter_eligible else "INELIGIBLE"
+        vix_str = f"{self.vix:.2f}" if self.vix is not None else "N/A"
+        fresh_tag = "FRESH" if self.vix_fresh else "STALE/FALLBACK"
+        skip_tag = f" [VIX_SKIP: {self.vix_skip_reason}]" if self.vix_skip else ""
+        cms_str = f" | CMS={self.composite_morning_score:+.3f}" if self.composite_morning_score is not None else ""
         return (
-            f"CDS={self.cds:+.3f} | Bias={self.bias.value} | Coverage={self.coverage*100:.1f}% "
+            f"CDS={self.cds:+.3f}{cms_str} | Bias={self.bias.value} | Coverage={self.coverage*100:.1f}% "
             f"({self.confidence.value}) | ContrarianFilter={eligible_tag} | "
-            f"VIX={self.vix:.2f} ({self.vix_regime.value})"
+            f"VIX={vix_str} ({self.vix_regime.value}, {fresh_tag}){skip_tag}"
         )
 
 
@@ -210,9 +268,9 @@ class StraddleSessionRecord:
     expiry_date: str         # YYYY-MM-DD
     atm_strike: int
     pre_market: PreMarketIntelligence
-    call_entry_price: float
-    put_entry_price: float
-    total_debit_inr: float
+    call_entry_price: float = 0.0
+    put_entry_price: float = 0.0
+    total_debit_inr: float = 0.0
     state: StrategyState = StrategyState.CLOSED
     selected_leg: SelectedLeg = SelectedLeg.NONE
     decision_time: Optional[str] = None
@@ -228,3 +286,14 @@ class StraddleSessionRecord:
     exit_reason: ExitReason = ExitReason.NONE
     execution_mode: str = "BUY_STRADDLE"
     status: str = "COMPLETED"
+    # Single-Leg Directional Scalp Fields:
+    order_action: OrderAction = OrderAction.BUY
+    trade_leg: TradeLeg = TradeLeg.NONE
+    executed_strike: Optional[int] = None
+    entry_price: Optional[float] = None
+    exit_price: Optional[float] = None
+    margin_inr: float = 0.0
+    premium_pnl_pct: float = 0.0
+    capital_deployed_inr: float = 0.0
+    vix_open: Optional[float] = None
+    final_bias: Optional[BiasClassification] = None

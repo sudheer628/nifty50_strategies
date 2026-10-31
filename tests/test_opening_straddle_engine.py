@@ -15,11 +15,13 @@ from strategies.opening_straddle_models import (
     BiasClassification,
     ConfidenceLevel,
     ExitReason,
+    OrderAction,
     PreMarketIntelligence,
     SelectedLeg,
     StrategyState,
     StraddleLegQuote,
     TickObservation,
+    TradeLeg,
     VolatilityRegime,
 )
 
@@ -573,6 +575,9 @@ def test_opening_straddle_selector_freshness_gating(mock_pre_market, temp_db):
     import time
     from strategies.opening_straddle_selector import run_opening_straddle
 
+    mock_pre_market.cds = 0.40
+    mock_pre_market.composite_morning_score = 0.40
+
     with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls:
         mock_loader = mock_loader_cls.return_value
         mock_loader.load_intelligence.return_value = mock_pre_market
@@ -634,6 +639,9 @@ def test_opening_straddle_entry_retry_success(mock_pre_market, temp_db):
         "put": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "102", "trading_symbol": "NIFTY25000PE", "feed_time": now_t - 1.0},
     }
 
+    mock_pre_market.cds = 0.40
+    mock_pre_market.composite_morning_score = 0.40
+
     with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls:
         mock_loader = mock_loader_cls.return_value
         mock_loader.load_intelligence.return_value = mock_pre_market
@@ -646,7 +654,7 @@ def test_opening_straddle_entry_retry_success(mock_pre_market, temp_db):
              patch("strategies.opening_straddle_selector.get_nifty_option_chain", mock_get_chain), \
              patch("strategies.opening_straddle_selector.OpeningStraddleEngine") as mock_engine_cls:
             mock_engine = mock_engine_cls.return_value
-            mock_engine.arm_entry.return_value = True
+            mock_engine.arm_single_leg_entry.return_value = True
             mock_engine.state = StrategyState.CLOSED
 
             code = run_opening_straddle(
@@ -656,10 +664,10 @@ def test_opening_straddle_entry_retry_success(mock_pre_market, temp_db):
                 entry_grace_timeout_sec=5.0,
             )
             assert code == 0
-            # Ensure arm_entry was called with the fresh quotes
-            assert mock_engine.arm_entry.called
-            call_arg = mock_engine.arm_entry.call_args[1]
-            assert call_arg["call_quote"].symbol == "NIFTY25000CE"
+            # Ensure arm_single_leg_entry was called with the fresh quotes
+            assert mock_engine.arm_single_leg_entry.called
+            call_arg = mock_engine.arm_single_leg_entry.call_args[1]
+            assert call_arg["quote"].symbol == "NIFTY25000CE"
             assert call_arg["spot_price"] == 25000.0
 
 
@@ -874,3 +882,756 @@ def test_runner_individual_trailing_stop(mock_pre_market, temp_db):
     assert engine.state == StrategyState.CLOSED
     assert engine.exit_reason == ExitReason.TRAILING_STOP
     assert engine.call_leg.exit_price == 111.0
+
+
+def test_single_leg_buy_call_quick_scalp_profit_target(mock_pre_market, temp_db):
+    """
+    Step 2: Verify Single Leg BUY CALL execution, accounting, and quick scalp target exit.
+      - Entry at Ask = 100.0, Capital Deployed = 65 * 100.0 = 6500.0 INR (Margin = 0.0).
+      - Price rises to Bid = 110.0 (+10.0% premium gain, gross = +650 INR, net = +575 INR > 8.0 pts).
+      - Exit at Bid = 110.0 with MIN_PROFIT_TARGET.
+    """
+    start_ts = 1793418365.0  # 2026-10-31 09:16:05 IST
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+
+    quote = StraddleLegQuote(
+        symbol="NIFTY25000CE", token="101", strike=25000, option_type="CE",
+        bid=99.5, ask=100.0, ltp=100.0,
+    )
+
+    armed = engine.arm_single_leg_entry(
+        leg=TradeLeg.CALL,
+        action=OrderAction.BUY,
+        strike=25000,
+        quote=quote,
+        spot_price=25010.0,
+        entry_ts=start_ts,
+    )
+    assert armed is True
+    assert engine.state == StrategyState.SINGLE_LEG_ACTIVE
+    assert engine.order_action == OrderAction.BUY
+    assert engine.trade_leg == TradeLeg.CALL
+    assert engine.entry_price == 100.0
+    assert engine.margin_inr == 0.0
+    assert engine.capital_deployed_inr == 6500.0
+
+    # Advance tick: Call Bid rises to 110.0 (Ask = 110.5) at 09:18:05 IST
+    tick = TickObservation(
+        ts=start_ts + 120.0,
+        nifty_spot=25060.0,
+        call_bid=110.0, call_ask=110.5,
+        put_bid=80.0, put_ask=80.5,
+    )
+    engine.process_tick(tick)
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.MIN_PROFIT_TARGET
+    assert engine.exit_price == 110.0
+    assert engine.net_pnl_inr == pytest.approx(575.0, abs=1e-2)  # 650 gross - 75 friction
+    assert engine.premium_pnl_pct == pytest.approx(10.0, abs=1e-2)
+    assert engine.net_roi_pct == pytest.approx((575.0 / 6500.0) * 100.0, abs=1e-2)
+
+    # Verify SQLite record
+    with sqlite3.connect(temp_db) as conn:
+        cursor = conn.execute(
+            "SELECT order_action, trade_leg, executed_strike, entry_price, exit_price, net_pnl_inr, exit_reason FROM opening_straddle_sessions"
+        )
+        row = cursor.fetchone()
+        assert row is not None
+        assert row[0] == "BUY"
+        assert row[1] == "CALL"
+        assert row[2] == 25000
+        assert row[3] == 100.0
+        assert row[4] == 110.0
+        assert row[5] == pytest.approx(575.0, abs=1e-2)
+        assert row[6] == "MIN_PROFIT_TARGET"
+
+
+def test_single_leg_sell_call_accounting_and_margin(mock_pre_market, temp_db):
+    """
+    Step 2: Verify Single Leg SELL CALL execution:
+      - Sells at Bid = 95.0. Capital Deployed = 120,000 INR Margin.
+      - Option decays to Ask = 80.0 (+15.0 pts decay = +975 gross - 75 friction = +900 net).
+      - Net ROI % is evaluated against Margin base (120,000).
+    """
+    start_ts = 1793418365.0  # 2026-10-31 09:16:05 IST
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+
+    quote = StraddleLegQuote(
+        symbol="NIFTY25050CE", token="103", strike=25050, option_type="CE",
+        bid=95.0, ask=95.5, ltp=95.0,
+    )
+
+    armed = engine.arm_single_leg_entry(
+        leg=TradeLeg.CALL,
+        action=OrderAction.SELL,
+        strike=25050,
+        quote=quote,
+        spot_price=25000.0,
+        entry_ts=start_ts,
+    )
+    assert armed is True
+    assert engine.state == StrategyState.SINGLE_LEG_ACTIVE
+    assert engine.order_action == OrderAction.SELL
+    assert engine.entry_price == 95.0
+    assert engine.margin_inr == 120000.0
+    assert engine.capital_deployed_inr == 120000.0
+
+    # Advance tick: Call decays to Ask = 80.0 (Bid = 79.5) at 09:19:05 IST
+    tick = TickObservation(
+        ts=start_ts + 180.0,
+        nifty_spot=24970.0,
+        call_bid=79.5, call_ask=80.0,
+        put_bid=110.0, put_ask=110.5,
+    )
+    engine.process_tick(tick)
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.MIN_PROFIT_TARGET
+    assert engine.exit_price == 80.0
+    assert engine.net_pnl_inr == pytest.approx(900.0, abs=1e-2)  # (95 - 80)*65 - 75 = 900
+    assert engine.premium_pnl_pct == pytest.approx((15.0 / 95.0) * 100.0, abs=1e-2)
+    assert engine.net_roi_pct == pytest.approx((900.0 / 120000.0) * 100.0, abs=1e-2)
+
+
+def test_single_leg_dynamic_trailing_ratchet(mock_pre_market, temp_db):
+    """
+    Step 2: Verify Single Leg Dynamic Trailing Ratchet:
+      - Arms when profit reaches >= +4.0 pts or +6.0%.
+      - Trails 2.0 pts behind peak.
+      - Locks in partial profit if momentum reverses.
+    """
+    start_ts = 1793418365.0  # 2026-10-31 09:16:05 IST
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+
+    quote = StraddleLegQuote(
+        symbol="NIFTY25000PE", token="104", strike=25000, option_type="PE",
+        bid=79.5, ask=80.0, ltp=80.0,
+    )
+    engine.arm_single_leg_entry(
+        leg=TradeLeg.PUT, action=OrderAction.BUY, strike=25000, quote=quote, spot_price=24990.0, entry_ts=start_ts
+    )
+
+    # Surge tick: Put Bid surges to 85.5 (+5.5 pts gain >= 4.0 pts arm threshold)
+    engine.process_tick(TickObservation(
+        ts=start_ts + 60.0,
+        nifty_spot=24960.0,
+        call_bid=70.0, call_ask=70.5,
+        put_bid=85.5, put_ask=86.0,
+    ))
+    assert engine.state == StrategyState.SINGLE_LEG_ACTIVE
+    assert engine.trailing_ratchet_armed is True
+
+    # Peak tick: Put Bid reaches 86.5 (Peak gross points = 6.5, net points ~ 5.35)
+    engine.process_tick(TickObservation(
+        ts=start_ts + 90.0,
+        nifty_spot=24950.0,
+        call_bid=68.0, call_ask=68.5,
+        put_bid=86.5, put_ask=87.0,
+    ))
+    assert engine.state == StrategyState.SINGLE_LEG_ACTIVE
+
+    # Drop tick: Put Bid drops to 84.0 (Drop of 2.5 pts >= 2.0 pts trailing drop threshold)
+    engine.process_tick(TickObservation(
+        ts=start_ts + 120.0,
+        nifty_spot=24970.0,
+        call_bid=72.0, call_ask=72.5,
+        put_bid=84.0, put_ask=84.5,
+    ))
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.TRAILING_STOP
+    assert engine.exit_price == 84.0
+    assert engine.net_pnl_inr > 0.0  # Successfully closed green!
+
+
+def test_single_leg_stop_loss_limit(mock_pre_market, temp_db):
+    """
+    Step 2: Verify Single Leg Stop Loss (-8.0 pts or -15.0% on premium).
+    """
+    start_ts = 1793418365.0  # 2026-10-31 09:16:05 IST
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+
+    quote = StraddleLegQuote(
+        symbol="NIFTY25000CE", token="105", strike=25000, option_type="CE",
+        bid=99.5, ask=100.0, ltp=100.0,
+    )
+    engine.arm_single_leg_entry(
+        leg=TradeLeg.CALL, action=OrderAction.BUY, strike=25000, quote=quote, spot_price=25000.0, entry_ts=start_ts
+    )
+
+    # Adverse move: Call Bid drops to 90.0 (-10.0 pts loss <= -8.0 pts SL threshold) at 09:17:05 IST
+    engine.process_tick(TickObservation(
+        ts=start_ts + 60.0,
+        nifty_spot=24930.0,
+        call_bid=90.0, call_ask=90.5,
+        put_bid=120.0, put_ask=120.5,
+    ))
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.STOP_LOSS
+    assert engine.exit_price == 90.0
+
+
+def test_single_leg_hard_time_stop(mock_pre_market, temp_db):
+    """
+    Step 2: Verify Hard Time Stop aligns to 09:55:00 AM IST (2,335s from 09:16:05 entry).
+    """
+    start_ts = 1793418365.0  # 2026-10-31 09:16:05 IST
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+
+    quote = StraddleLegQuote(
+        symbol="NIFTY25000CE", token="106", strike=25000, option_type="CE",
+        bid=99.5, ask=100.0, ltp=100.0,
+    )
+    engine.arm_single_leg_entry(
+        leg=TradeLeg.CALL, action=OrderAction.BUY, strike=25000, quote=quote, spot_price=25000.0, entry_ts=start_ts
+    )
+
+    # Tick at exactly 09:55:00 AM IST (1793420700.0, exactly 2335s from 09:16:05)
+    engine.process_tick(TickObservation(
+        ts=1793420700.0,  # 2026-10-31 09:55:00 IST
+        nifty_spot=25005.0,
+        call_bid=101.0, call_ask=101.5,
+        put_bid=98.0, put_ask=98.5,
+    ))
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.HARD_TIME_STOP
+    assert engine.exit_price == 101.0
+
+    # Also verify late-started session (e.g. entered at 09:35:00 IST) still unconditionally exits at 09:55:00 AM IST
+    engine_late = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+    engine_late.arm_single_leg_entry(
+        leg=TradeLeg.CALL, action=OrderAction.BUY, strike=25000, quote=quote, spot_price=25000.0, entry_ts=1793419500.0  # 09:35:00 IST
+    )
+    engine_late.process_tick(TickObservation(
+        ts=1793420700.0,  # 09:55:00 IST (only 1200s elapsed, but clock cutoff is 09:55:00 IST!)
+        nifty_spot=25005.0,
+        call_bid=100.5, call_ask=101.0,
+        put_bid=98.0, put_ask=98.5,
+    ))
+    assert engine_late.state == StrategyState.CLOSED
+    assert engine_late.exit_reason == ExitReason.HARD_TIME_STOP
+
+
+def test_short_margin_configurable(mock_pre_market, temp_db, monkeypatch):
+    """
+    Step 2: Verify short margin configuration via SHORT_MARGIN_PER_LOT env var and constructor.
+    """
+    monkeypatch.setenv("SHORT_MARGIN_PER_LOT", "135000.0")
+    engine_env = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+    assert engine_env.short_margin_per_lot == 135000.0
+
+    engine_param = OpeningStraddleEngine(pre_market=mock_pre_market, short_margin_per_lot=140000.0, db_path=temp_db)
+    assert engine_param.short_margin_per_lot == 140000.0
+
+    quote = StraddleLegQuote("NIFTY25000CE", "101", 25000, "CE", bid=90.0, ask=90.5, ltp=90.0)
+    engine_param.arm_single_leg_entry(
+        leg=TradeLeg.CALL, action=OrderAction.SELL, strike=25000, quote=quote, spot_price=25000.0
+    )
+    assert engine_param.margin_inr == 140000.0
+    assert engine_param.capital_deployed_inr == 140000.0
+
+
+def test_record_skipped_session_high_vix(mock_pre_market, temp_db):
+    """
+    Step 2: Verify record_skipped_session records SKIPPED_HIGH_VIX and zero P&L.
+    """
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+    engine.record_skipped_session("HIGH_VIX: 22.5 > 20.0", ExitReason.HIGH_VIX_SKIP)
+
+    assert engine.state == StrategyState.SKIPPED_HIGH_VIX
+    assert engine.exit_reason == ExitReason.HIGH_VIX_SKIP
+    assert engine.status == "SKIPPED"
+    assert engine.net_pnl_inr == 0.0
+
+    with sqlite3.connect(temp_db) as conn:
+        cursor = conn.execute(
+            "SELECT status, exit_reason, net_pnl_inr FROM opening_straddle_sessions"
+        )
+        row = cursor.fetchone()
+        assert row is not None
+        assert row[0] == "SKIPPED"
+        assert row[1] == "HIGH_VIX_SKIP"
+        assert row[2] == 0.0
+
+
+def test_single_leg_spread_quality_gate(mock_pre_market, temp_db):
+    """
+    Step 2: Verify single-leg spread quality gate rejects wide spreads (> 1.5%).
+    """
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+    wide_quote = StraddleLegQuote(
+        symbol="NIFTY25000CE", token="107", strike=25000, option_type="CE",
+        bid=100.0, ask=103.0, ltp=100.0,  # Spread 3.0% > 1.5%
+    )
+    armed = engine.arm_single_leg_entry(
+        leg=TradeLeg.CALL, action=OrderAction.BUY, strike=25000, quote=wide_quote, spot_price=25000.0
+    )
+    assert armed is False
+    assert engine.state == StrategyState.ABORTED
+    assert engine.exit_reason == ExitReason.EXECUTION_ABORT
+
+
+def test_one_minute_candle_score_calculation():
+    """
+    Step 3: Verify 1-minute candle momentum normalization:
+      - 0.15% return yields +/-1.0
+      - Clipped to [-1.0, +1.0]
+      - Zero/flat yields 0.0
+      - Missing/invalid yields 0.0
+    """
+    from strategies.opening_straddle_selector import compute_one_minute_candle_score
+
+    # Flat move -> 0.0
+    assert compute_one_minute_candle_score(25000.0, 25000.0) == 0.0
+
+    # Exactly +0.15% (37.5 pts on 25000) -> +1.0
+    assert compute_one_minute_candle_score(25000.0, 25037.5) == pytest.approx(1.0, abs=1e-4)
+
+    # Exactly -0.15% (-37.5 pts on 25000) -> -1.0
+    assert compute_one_minute_candle_score(25000.0, 24962.5) == pytest.approx(-1.0, abs=1e-4)
+
+    # +0.075% move -> +0.50
+    assert compute_one_minute_candle_score(25000.0, 25018.75) == pytest.approx(0.50, abs=1e-4)
+
+    # Huge breakout +0.50% -> clipped to +1.0
+    assert compute_one_minute_candle_score(25000.0, 25125.0) == 1.0
+
+    # Huge breakdown -0.50% -> clipped to -1.0
+    assert compute_one_minute_candle_score(25000.0, 24875.0) == -1.0
+
+    # Missing / None / zero
+    assert compute_one_minute_candle_score(None, 25000.0) == 0.0
+    assert compute_one_minute_candle_score(25000.0, None) == 0.0
+    assert compute_one_minute_candle_score(0.0, 25000.0) == 0.0
+
+
+def test_final_composite_morning_score_synthesis():
+    """
+    Step 3: Verify synthesis of Final CMS at 09:16:05:
+      - Coverage < 0.50 -> forced to 0.0 (fail-safe)
+      - Coverage >= 0.50 -> 0.80 * Premarket + 0.20 * 1m Candle
+    """
+    from strategies.opening_straddle_selector import compute_final_composite_morning_score
+
+    # Coverage < 0.50 -> forced to 0.0 even with strong signals
+    assert compute_final_composite_morning_score(pre_market_cms=0.80, pre_market_coverage=0.45, score_1m_candle=0.90) == 0.0
+
+    # Coverage >= 0.50 -> 0.80 * 0.40 + 0.20 * 0.50 = 0.32 + 0.10 = 0.42
+    res = compute_final_composite_morning_score(pre_market_cms=0.40, pre_market_coverage=0.75, score_1m_candle=0.50)
+    assert res == pytest.approx(0.42, abs=1e-4)
+
+    # Bearish alignment -> 0.80 * (-0.30) + 0.20 * (-0.40) = -0.24 - 0.08 = -0.32
+    res_bear = compute_final_composite_morning_score(pre_market_cms=-0.30, pre_market_coverage=0.80, score_1m_candle=-0.40)
+    assert res_bear == pytest.approx(-0.32, abs=1e-4)
+
+    # Clipping to [-1.0, +1.0]
+    res_clip = compute_final_composite_morning_score(pre_market_cms=1.0, pre_market_coverage=1.0, score_1m_candle=1.0)
+    assert res_clip == 1.0
+
+
+def test_select_single_leg_decision_matrix():
+    """
+    Step 3: Verify Leg Selection Decision Matrix (Plan Section 5.1):
+      - Strong Bullish (>= +0.30): BUY CALL ATM
+      - Moderate Bullish (+0.10 to +0.30): SELL PUT 1-step OTM
+      - Moderate Bearish (-0.30 to -0.10): SELL CALL 1-step OTM (User Tip Priority)
+      - Strong Bearish (<= -0.30): SELL CALL 1-step OTM (Primary) / BUY PUT ATM (Secondary)
+      - Neutral Chop (-0.10 to +0.10): SKIP
+    """
+    from strategies.opening_straddle_selector import select_single_leg_decision
+
+    # 1. Strong Bullish (+0.35) -> BUY CALL ATM 25000
+    leg, action, strike, reason = select_single_leg_decision(0.35, 25000)
+    assert leg == TradeLeg.CALL
+    assert action == OrderAction.BUY
+    assert strike == 25000
+
+    # 2. Moderate Bullish (+0.20) -> SELL PUT 1-step OTM 24950
+    leg, action, strike, reason = select_single_leg_decision(0.20, 25000)
+    assert leg == TradeLeg.PUT
+    assert action == OrderAction.SELL
+    assert strike == 24950
+
+    # 3. Moderate Bearish (-0.20) -> SELL CALL 1-step OTM 25050 (User Tip Priority)
+    leg, action, strike, reason = select_single_leg_decision(-0.20, 25000)
+    assert leg == TradeLeg.CALL
+    assert action == OrderAction.SELL
+    assert strike == 25050
+
+    # 4. Strong Bearish (-0.40, primary default) -> SELL CALL 1-step OTM 25050
+    leg, action, strike, reason = select_single_leg_decision(-0.40, 25000, prefer_sell_call_on_strong_bearish=True)
+    assert leg == TradeLeg.CALL
+    assert action == OrderAction.SELL
+    assert strike == 25050
+
+    # 5. Strong Bearish (-0.40, secondary flag) -> BUY PUT ATM 25000
+    leg, action, strike, reason = select_single_leg_decision(-0.40, 25000, prefer_sell_call_on_strong_bearish=False)
+    assert leg == TradeLeg.PUT
+    assert action == OrderAction.BUY
+    assert strike == 25000
+
+    # 6. Neutral Chop (+0.05) -> SKIP
+    leg, action, strike, reason = select_single_leg_decision(0.05, 25000)
+    assert leg == TradeLeg.NONE
+    assert action is None
+    assert strike is None
+    assert "SKIP" in reason
+
+    # 7. Neutral Chop (-0.05) -> SKIP
+    leg, action, strike, reason = select_single_leg_decision(-0.05, 25000)
+    assert leg == TradeLeg.NONE
+    assert action is None
+    assert strike is None
+
+
+def test_run_opening_straddle_neutral_chop_skip(temp_db):
+    """
+    Step 3: Verify run_opening_straddle terminates cleanly with SKIPPED_NEUTRAL_CHOP when CMS is flat.
+    """
+    from unittest.mock import patch
+    from strategies.opening_straddle_selector import run_opening_straddle
+
+    neutral_intel = PreMarketIntelligence(
+        cds=0.02,
+        coverage=0.80,
+        confidence=ConfidenceLevel.HIGH,
+        bias=BiasClassification.NEUTRAL,
+        components={},
+        vix=15.0,
+        vix_regime=VolatilityRegime.NORMAL,
+        timestamp_utc="2026-10-31T03:44:00Z",
+        nifty_prev_close=25000.0,
+        nifty_spot=25000.0,
+        composite_morning_score=0.02,
+    )
+
+    with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls, \
+         patch("strategies.opening_straddle_selector.get_nifty_spot", return_value={"ltp": 25000.0, "feed_time": time.time()}):
+        mock_loader = mock_loader_cls.return_value
+        mock_loader.load_intelligence.return_value = neutral_intel
+
+        code = run_opening_straddle(
+            db_path=temp_db,
+            enable_alerts=False,
+            wait_for_market_open=False,
+        )
+        assert code == 0
+
+    with sqlite3.connect(temp_db) as conn:
+        row = conn.execute(
+            "SELECT status, exit_reason, net_pnl_inr FROM opening_straddle_sessions"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "SKIPPED"
+        assert row[1] == "NEUTRAL_CHOP_SKIP"
+        assert row[2] == 0.0
+
+
+def test_force_hard_time_exit_single_leg(mock_pre_market, temp_db):
+    """
+    Verify engine.force_hard_time_exit() cleanly liquidates active single leg,
+    calculates P&L, sets HARD_TIME_STOP, and persists session to SQLite.
+    """
+    engine = OpeningStraddleEngine(pre_market=mock_pre_market, db_path=temp_db)
+    quote = StraddleLegQuote(
+        symbol="NIFTY25000CE", token="101", strike=25000, option_type="CE",
+        bid=102.0, ask=102.5, ltp=102.0,
+    )
+    engine.arm_single_leg_entry(
+        leg=TradeLeg.CALL, action=OrderAction.BUY, strike=25000, quote=quote, spot_price=25000.0,
+    )
+    assert engine.state == StrategyState.SINGLE_LEG_ACTIVE
+
+    engine.force_hard_time_exit()
+    assert engine.state == StrategyState.CLOSED
+    assert engine.exit_reason == ExitReason.HARD_TIME_STOP
+    assert engine.exit_price == 102.0
+    assert engine.status == "PAPER_TRADING"
+    assert engine.net_pnl_inr is not None
+
+    with sqlite3.connect(temp_db) as conn:
+        row = conn.execute(
+            "SELECT status, exit_reason, exit_price, net_pnl_inr FROM opening_straddle_sessions"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "PAPER_TRADING"
+        assert row[1] == "HARD_TIME_STOP"
+        assert row[2] == 102.0
+
+
+def test_run_opening_straddle_max_duration_forced_exit(mock_pre_market, temp_db):
+    """
+    Verify run_opening_straddle forces hard time liquidation when max_duration_sec is exceeded,
+    ensuring no session is left hanging in SINGLE_LEG_ACTIVE.
+    """
+    from unittest.mock import patch
+    import time
+    from strategies.opening_straddle_selector import run_opening_straddle
+
+    mock_pre_market.cds = 0.40
+    mock_pre_market.composite_morning_score = 0.40
+
+    now_t = time.time()
+    spot_quote = {"ltp": 25000.0, "source": "angelone", "feed_time": now_t - 1.0}
+    chain_quote = {
+        "call": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "101", "trading_symbol": "NIFTY25000CE", "feed_time": now_t - 1.0},
+        "put": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "102", "trading_symbol": "NIFTY25000PE", "feed_time": now_t - 1.0},
+    }
+
+    with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls, \
+         patch("strategies.opening_straddle_selector.get_nifty_spot", return_value=spot_quote), \
+         patch("strategies.opening_straddle_selector.get_nifty_option_chain", return_value=chain_quote):
+        mock_loader = mock_loader_cls.return_value
+        mock_loader.load_intelligence.return_value = mock_pre_market
+
+        # Setting max_duration_sec = 0 forces immediate timeout exit in observation loop
+        code = run_opening_straddle(
+            db_path=temp_db,
+            enable_alerts=False,
+            wait_for_market_open=False,
+            max_duration_sec=0,
+        )
+        assert code == 0
+
+    with sqlite3.connect(temp_db) as conn:
+        row = conn.execute(
+            "SELECT status, exit_reason, exit_price, net_pnl_inr FROM opening_straddle_sessions"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "PAPER_TRADING"
+        assert row[1] == "HARD_TIME_STOP"
+        assert row[2] is not None
+        assert row[3] is not None
+
+
+def test_insufficient_coverage_skip_persisted(temp_db):
+    """
+    Verify that when premarket coverage < 0.50, the selector records
+    ExitReason.INSUFFICIENT_COVERAGE_SKIP and StrategyState.SKIPPED_INSUFFICIENT_COVERAGE
+    in SQLite, cleanly distinguishing missing data from neutral chop.
+    """
+    from unittest.mock import patch
+    from strategies.opening_straddle_models import PreMarketIntelligence, ConfidenceLevel, VolatilityRegime, BiasClassification
+    from strategies.opening_straddle_selector import run_opening_straddle
+
+    low_cov_intel = PreMarketIntelligence(
+        cds=0.25,
+        coverage=0.30,  # Below 0.50 threshold
+        confidence=ConfidenceLevel.LOW,
+        bias=BiasClassification.NEUTRAL,
+        components={},
+        vix=14.5,
+        vix_regime=VolatilityRegime.NORMAL,
+        timestamp_utc="2026-10-31T03:44:00Z",
+        nifty_prev_close=25000.0,
+        nifty_spot=25000.0,
+        composite_morning_score=0.0,
+    )
+
+    with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls, \
+         patch("strategies.opening_straddle_selector.get_nifty_spot", return_value={"ltp": 25000.0, "feed_time": time.time()}):
+        mock_loader = mock_loader_cls.return_value
+        mock_loader.load_intelligence.return_value = low_cov_intel
+
+        code = run_opening_straddle(
+            db_path=temp_db,
+            enable_alerts=False,
+            wait_for_market_open=False,
+        )
+        assert code == 0
+
+    with sqlite3.connect(temp_db) as conn:
+        row = conn.execute(
+            "SELECT status, exit_reason, selected_leg FROM opening_straddle_sessions"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "SKIPPED"
+        assert row[1] == "INSUFFICIENT_COVERAGE_SKIP"
+
+
+def test_final_cms_persisted_in_db(mock_pre_market, temp_db):
+    """
+    Verify that the final blended CMS (incorporating 0.80 premarket + 0.20 candle)
+    is persisted into SQLite composite_directional_score column instead of raw premarket cds.
+    """
+    from unittest.mock import patch
+    from strategies.opening_straddle_selector import run_opening_straddle
+
+    mock_pre_market.cds = 0.50
+    mock_pre_market.composite_morning_score = 0.50
+    mock_pre_market.coverage = 0.90
+
+    now_t = time.time()
+    spot_quote = {"ltp": 25000.0, "source": "angelone", "feed_time": now_t - 1.0}
+    chain_quote = {
+        "call": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "101", "trading_symbol": "NIFTY25000CE", "feed_time": now_t - 1.0},
+        "put": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "102", "trading_symbol": "NIFTY25000PE", "feed_time": now_t - 1.0},
+    }
+
+    with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls, \
+         patch("strategies.opening_straddle_selector.get_nifty_spot", return_value=spot_quote), \
+         patch("strategies.opening_straddle_selector.get_nifty_option_chain", return_value=chain_quote):
+        mock_loader = mock_loader_cls.return_value
+        mock_loader.load_intelligence.return_value = mock_pre_market
+
+        code = run_opening_straddle(
+            db_path=temp_db,
+            enable_alerts=False,
+            wait_for_market_open=False,
+            max_duration_sec=0,
+        )
+        assert code == 0
+
+    with sqlite3.connect(temp_db) as conn:
+        row = conn.execute(
+            "SELECT composite_directional_score FROM opening_straddle_sessions"
+        ).fetchone()
+        assert row is not None
+        # With premarket CMS = 0.50 and flat candle score = 0.0:
+        # final_cms = 0.80 * 0.50 + 0.20 * 0.0 = 0.400
+        assert round(row[0], 3) == 0.400
+
+
+def test_sample_opening_candle_early_launch():
+    """
+    Verify sample_opening_candle sleeps until 09:15:00 if launched early (e.g. at 08:50 AM).
+    """
+    from unittest.mock import patch
+    from strategies.opening_straddle_selector import sample_opening_candle, IST_TZ
+    from datetime import datetime
+
+    early_dt = datetime(2026, 10, 27, 8, 50, 0, tzinfo=IST_TZ)
+    # Target 09:15:00 is 1500 seconds away
+    mock_now_times = [
+        early_dt,  # Initial check
+        datetime(2026, 10, 27, 9, 15, 0, tzinfo=IST_TZ),  # After sleeping
+        datetime(2026, 10, 27, 9, 16, 1, tzinfo=IST_TZ),  # Loop end
+        datetime(2026, 10, 27, 9, 16, 6, tzinfo=IST_TZ),  # Buffer check
+    ]
+
+    sleep_calls = []
+    with patch("strategies.opening_straddle_selector.datetime") as mock_dt, \
+         patch("strategies.opening_straddle_selector.time.sleep", side_effect=lambda s: sleep_calls.append(s)), \
+         patch("strategies.opening_straddle_selector.get_nifty_spot", return_value={"ltp": 25000.0}):
+        mock_dt.now.side_effect = mock_now_times
+        mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
+
+        candle = sample_opening_candle(wait_for_market_open=True)
+        # Should have slept for 1500s until 09:15:00
+        assert len(sleep_calls) >= 1
+        assert round(sleep_calls[0]) == 1500
+
+
+def test_sample_opening_candle_late_launch_returns_none_and_aborts(mock_pre_market, temp_db):
+    """
+    Verify sample_opening_candle returns None when launched past 09:16:00,
+    and run_opening_straddle aborts session cleanly with ExitReason.EXECUTION_ABORT.
+    """
+    from unittest.mock import patch
+    from strategies.opening_straddle_selector import run_opening_straddle, sample_opening_candle, IST_TZ
+    from datetime import datetime
+
+    late_dt = datetime(2026, 10, 27, 9, 20, 0, tzinfo=IST_TZ)
+
+    with patch("strategies.opening_straddle_selector.datetime") as mock_dt:
+        mock_dt.now.return_value = late_dt
+        mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
+        candle = sample_opening_candle(wait_for_market_open=True)
+        assert candle == {"open": None, "high": None, "low": None, "close": None}
+
+    # Verify run_opening_straddle aborts
+    with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls, \
+         patch("strategies.opening_straddle_selector.sample_opening_candle", return_value={"open": None, "high": None, "low": None, "close": None}):
+        mock_loader = mock_loader_cls.return_value
+        mock_loader.load_intelligence.return_value = mock_pre_market
+
+        code = run_opening_straddle(
+            db_path=temp_db,
+            enable_alerts=False,
+            wait_for_market_open=True,
+        )
+        assert code == 1
+
+    with sqlite3.connect(temp_db) as conn:
+        row = conn.execute(
+            "SELECT status, exit_reason FROM opening_straddle_sessions"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "SKIPPED"
+        assert row[1] == "EXECUTION_ABORT"
+
+
+def test_premarket_bias_preserved_and_alert_shift_annotation(mock_pre_market, temp_db, monkeypatch):
+    """
+    Integration test verifying:
+    1. Premarket bias (STRONG_BULLISH) is preserved and persisted to SQLite bias_classification.
+    2. Final execution bias (MODERATE_BULLISH) is derived from final CMS and persisted to final_bias.
+    3. The Discord entry alert receives both and displays:
+       `MODERATE_BULLISH` *(Premarket: STRONG_BULLISH)*.
+    """
+    from unittest.mock import MagicMock, patch
+    import time
+    from strategies.opening_straddle_models import BiasClassification
+    from strategies.opening_straddle_selector import run_opening_straddle
+
+    monkeypatch.setenv("DISCORD_OPENING_STRADDLE", "https://discord.com/api/webhooks/test")
+
+    # Premarket CDS = 0.40 -> STRONG_BULLISH
+    mock_pre_market.cds = 0.40
+    mock_pre_market.composite_morning_score = 0.40
+    mock_pre_market.bias = BiasClassification.STRONG_BULLISH
+
+    now_t = time.time()
+    spot_quote = {"ltp": 25000.0, "source": "angelone", "feed_time": now_t - 1.0}
+    # Target strike for MODERATE_BULLISH (SELL PUT 1-step OTM) is 25000 - 50 = 24950
+    chain_quote = {
+        "call": {"ltp": 100.0, "bid": 99.8, "ask": 100.2, "token": "101", "trading_symbol": "NIFTY25000CE", "feed_time": now_t - 1.0},
+        "put": {"ltp": 80.0, "bid": 79.8, "ask": 80.2, "token": "102", "trading_symbol": "NIFTY24950PE", "feed_time": now_t - 1.0},
+    }
+
+    # Opening candle score:
+    # r_ratio = (25000.0 - 25032.0) / (25032.0 * 0.0015) = -32.0 / 37.548 = -0.8522
+    # final_cms = 0.80 * 0.40 + 0.20 * (-0.8522) = 0.320 - 0.1704 = 0.150 (MODERATE_BULLISH)
+    candle_mock = {"open": 25032.0, "high": 25032.0, "low": 24995.0, "close": 25000.0}
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+
+    with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls, \
+         patch("strategies.opening_straddle_selector.sample_opening_candle", return_value=candle_mock), \
+         patch("strategies.opening_straddle_selector.get_nifty_spot", return_value=spot_quote), \
+         patch("strategies.opening_straddle_selector.get_nifty_option_chain", return_value=chain_quote), \
+         patch("requests.post", return_value=mock_resp) as mock_post:
+        mock_loader = mock_loader_cls.return_value
+        mock_loader.load_intelligence.return_value = mock_pre_market
+
+        code = run_opening_straddle(
+            db_path=temp_db,
+            enable_alerts=True,
+            wait_for_market_open=False,
+            max_duration_sec=0,
+        )
+        assert code == 0
+
+    # 1. Verify intel.bias was NOT mutated
+    assert mock_pre_market.bias == BiasClassification.STRONG_BULLISH
+
+    # 2. Verify SQLite columns
+    with sqlite3.connect(temp_db) as conn:
+        row = conn.execute(
+            "SELECT bias_classification, final_bias, composite_directional_score, order_action, trade_leg FROM opening_straddle_sessions"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "STRONG_BULLISH"   # bias_classification preserves premarket prior bias
+        assert row[1] == "MODERATE_BULLISH" # final_bias stores final execution bias
+        assert round(row[2], 3) == 0.150    # final_cms
+        assert row[3] == "SELL"
+        assert row[4] == "PUT"
+
+    # 3. Verify entry alert embed contained the shift annotation
+    assert mock_post.called
+    entry_embed = mock_post.call_args_list[0][1]["json"]["embeds"][0]
+    cms_field = next(f for f in entry_embed["fields"] if "Composite Score" in f["name"])
+    assert "+0.150" in cms_field["value"]
+    assert "MODERATE_BULLISH" in cms_field["value"]
+    assert "Premarket: STRONG_BULLISH" in cms_field["value"]
+
+

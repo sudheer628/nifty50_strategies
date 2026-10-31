@@ -400,3 +400,334 @@ def test_serialization_methods(test_env):
     assert "CDS=" in s
     assert "Coverage=" in s
     assert "ContrarianFilter=ELIGIBLE" in s
+
+
+def test_vix_freshness_and_skip_gate(tmp_path):
+    """
+    Verify VIX freshness checking, fail-safe skip on high VIX, and fail-safe on missing VIX.
+    """
+    now = 1791957300.0
+
+    # Case 1: High VIX (> 20.0) -> triggers vix_skip
+    feed_high = tmp_path / "feed_high_vix.json"
+    feed_high.write_text(json.dumps({
+        "quotes": {
+            "NSE_INDEX|India VIX": {"ltp": 22.5, "updated_at_epoch": now - 30.0},
+        }
+    }), encoding="utf-8")
+    loader_high = PreMarketIntelligenceLoader(feed_cache_path=str(feed_high))
+    intel_high = loader_high.load_intelligence(ref_time_epoch=now)
+    assert intel_high.vix == pytest.approx(22.5, abs=1e-2)
+    assert intel_high.vix_fresh is True
+    assert intel_high.vix_skip is True
+    assert "HIGH_VIX" in intel_high.vix_skip_reason
+
+    # Case 2: Normal Fresh VIX (15.0 <= 20.0) -> passes gate
+    feed_normal = tmp_path / "feed_normal_vix.json"
+    feed_normal.write_text(json.dumps({
+        "quotes": {
+            "NSE_INDEX|India VIX": {"ltp": 15.0, "updated_at_epoch": now - 30.0},
+        }
+    }), encoding="utf-8")
+    loader_normal = PreMarketIntelligenceLoader(feed_cache_path=str(feed_normal))
+    intel_normal = loader_normal.load_intelligence(ref_time_epoch=now)
+    assert intel_normal.vix == pytest.approx(15.0, abs=1e-2)
+    assert intel_normal.vix_fresh is True
+    assert intel_normal.vix_skip is False
+
+    # Case 3: Completely missing VIX -> fail closed
+    feed_empty = tmp_path / "feed_empty.json"
+    feed_empty.write_text(json.dumps({"quotes": {}}), encoding="utf-8")
+    loader_empty = PreMarketIntelligenceLoader(feed_cache_path=str(feed_empty), sqlite_base_dir=str(tmp_path))
+    intel_empty = loader_empty.load_intelligence(ref_time_epoch=now)
+    assert intel_empty.vix_fresh is False
+    assert intel_empty.vix_skip is True
+    assert "MISSING_VIX" in intel_empty.vix_skip_reason
+
+
+def test_prior_day_structure_ingestion(tmp_path):
+    """
+    Verify calculation of gap, range breakout vs high/low, and bar direction.
+    """
+    now = 1791957300.0
+    feed = tmp_path / "feed_structure.json"
+    # Spot is 25150, prev close 25000, high 25100 (spot > high -> breakout expansion)
+    feed.write_text(json.dumps({
+        "quotes": {
+            "NSE_INDEX|Nifty 50": {
+                "ltp": 25150.0,
+                "cp": 25000.0,
+                "open": 24900.0,
+                "high": 25100.0,
+                "low": 24850.0,
+                "updated_at_epoch": now - 10.0,
+            }
+        }
+    }), encoding="utf-8")
+
+    loader = PreMarketIntelligenceLoader(feed_cache_path=str(feed))
+    loader.apply_directional_scalp_weights(weight_prior_day=0.30)
+    intel = loader.load_intelligence(ref_time_epoch=now)
+
+    comp = intel.components["prior_day_structure"]
+    assert comp.is_available is True
+    assert comp.normalized_score > 0.0  # Bullish expansion
+    assert intel.prior_day_ohlc is not None
+    assert intel.prior_day_ohlc["is_above_prior_high"] is True
+    assert intel.prior_day_ohlc["gap_pct"] == pytest.approx(0.60, abs=1e-2)
+
+
+def test_grok_social_sentiment_ingestion(tmp_path):
+    """
+    Verify loading and confidence-weighting of X/AI Grok social sentiment from JSON files.
+    """
+    now = 1791957300.0
+    social_dir = tmp_path / "social"
+    social_dir.mkdir()
+    social_file = social_dir / "2026-10-31_0900.json"
+    social_file.write_text(json.dumps({
+        "source": "grok_social",
+        "net_bias_score": 0.60,
+        "confidence": 0.80,
+        "overall_sentiment": "bullish",
+        "key_factors": ["fii_buying", "global_tech_rally"],
+    }), encoding="utf-8")
+    # Set file mtime to 30 mins ago
+    os.utime(social_file, (now - 1800, now - 1800))
+
+    loader = PreMarketIntelligenceLoader(social_data_dir=str(social_dir))
+    loader.apply_directional_scalp_weights(weight_grok=0.20)
+    intel = loader.load_intelligence(ref_time_epoch=now)
+
+    comp = intel.components["grok_social"]
+    assert comp.is_available is True
+    assert not comp.is_stale
+    # 0.60 * 0.80 = 0.48
+    assert comp.normalized_score == pytest.approx(0.48, abs=1e-2)
+    assert intel.grok_social_sentiment["overall_sentiment"] == "bullish"
+
+
+def test_single_leg_enums_and_session_record():
+    """
+    Verify OrderAction, TradeLeg, StrategyState, ExitReason enums and StraddleSessionRecord single-leg fields.
+    """
+    from strategies.opening_straddle_models import (
+        OrderAction,
+        TradeLeg,
+        StrategyState,
+        ExitReason,
+        StraddleSessionRecord,
+        PreMarketIntelligence,
+        VolatilityRegime,
+        ConfidenceLevel,
+        BiasClassification,
+    )
+
+    assert OrderAction.BUY == "BUY"
+    assert OrderAction.SELL == "SELL"
+    assert TradeLeg.CALL == "CALL"
+    assert TradeLeg.PUT == "PUT"
+    assert StrategyState.SKIPPED_HIGH_VIX == "SKIPPED_HIGH_VIX"
+    assert ExitReason.HIGH_VIX_SKIP == "HIGH_VIX_SKIP"
+    assert ExitReason.MIN_PROFIT_TARGET == "MIN_PROFIT_TARGET"
+
+    mock_intel = PreMarketIntelligence(
+        cds=0.35,
+        coverage=0.90,
+        confidence=ConfidenceLevel.HIGH,
+        bias=BiasClassification.STRONG_BULLISH,
+        components={},
+        vix=14.5,
+        vix_regime=VolatilityRegime.NORMAL,
+        timestamp_utc="2026-10-31T03:44:00Z",
+    )
+
+    record = StraddleSessionRecord(
+        trade_date="2026-10-31",
+        expiry_date="2026-11-03",
+        atm_strike=25000,
+        pre_market=mock_intel,
+        order_action=OrderAction.SELL,
+        trade_leg=TradeLeg.CALL,
+        executed_strike=25050,
+        entry_price=85.0,
+        margin_inr=120000.0,
+        state=StrategyState.SINGLE_LEG_ACTIVE,
+    )
+    assert record.order_action == OrderAction.SELL
+    assert record.trade_leg == TradeLeg.CALL
+    assert record.executed_strike == 25050
+    assert record.entry_price == 85.0
+
+
+def test_cms_low_coverage_forces_zero_score(tmp_path):
+    """
+    Finding 1: Verify that if coverage < 0.50, composite_morning_score is forced to 0.0
+    even if an individual active source has a strong directional score (+1.0).
+    """
+    now = 1791957300.0
+    feed = tmp_path / "feed_low_coverage.json"
+    # Only DJI is present (nominal weight 0.25). All other feeds missing.
+    feed.write_text(json.dumps({
+        "quotes": {
+            "GLOBAL_INDEX|^DJI": {"change_pct": 2.0, "updated_at_epoch": now - 30.0},
+            "NSE_INDEX|India VIX": {"ltp": 14.0, "updated_at_epoch": now - 30.0},
+        }
+    }), encoding="utf-8")
+
+    loader = PreMarketIntelligenceLoader(
+        feed_cache_path=str(feed),
+        sqlite_base_dir=str(tmp_path / "empty_sqlite"),
+        pulse_data_dir=str(tmp_path / "empty_pulse"),
+        social_data_dir=str(tmp_path / "empty_social"),
+    )
+    intel = loader.load_intelligence(ref_time_epoch=now)
+    assert intel.coverage < 0.50
+    assert intel.composite_morning_score == 0.0
+    assert intel.bias == BiasClassification.NEUTRAL
+
+
+def test_directional_scalp_mode_initialization():
+    """
+    Finding 2: Verify that directional_scalp=True activates the full 5-factor scalp weights.
+    """
+    loader_default = PreMarketIntelligenceLoader()
+    assert loader_default.weights["prior_day_structure"] == 0.0
+    assert loader_default.weights["grok_social"] == 0.0
+
+    loader_scalp = PreMarketIntelligenceLoader(directional_scalp=True)
+    assert loader_scalp.weights["gift_nifty"] == 0.25
+    assert loader_scalp.weights["prior_day_structure"] == 0.25
+    assert loader_scalp.weights["upstox_pulse"] == 0.15
+    assert loader_scalp.weights["news_nlp"] == 0.15
+    assert loader_scalp.weights["grok_social"] == 0.10
+    assert loader_scalp.weights["fii_flow"] == 0.10
+    assert loader_scalp.weights["global_macro"] == 0.0
+
+
+def test_vix_missing_timestamp_treated_as_stale(tmp_path):
+    """
+    Finding 3a: Verify that a VIX quote with no updated_at_epoch is NOT assumed fresh.
+    """
+    now = 1791957300.0
+    feed = tmp_path / "feed_no_vix_ts.json"
+    feed.write_text(json.dumps({
+        "quotes": {
+            "NSE_INDEX|India VIX": {"ltp": 15.0},  # No updated_at_epoch
+        }
+    }), encoding="utf-8")
+
+    loader = PreMarketIntelligenceLoader(
+        feed_cache_path=str(feed),
+        sqlite_base_dir=str(tmp_path / "empty_sqlite"),
+    )
+    intel = loader.load_intelligence(ref_time_epoch=now)
+    # Stale/unverified feed quote with no fallback available -> fail closed
+    assert intel.vix_fresh is False
+    assert intel.vix_skip is True
+    assert "MISSING_VIX" in intel.vix_skip_reason
+
+
+def test_vix_fallback_threshold_and_ts_constraint(tmp_path):
+    """
+    Finding 3b & 3c:
+    - Fallback VIX > 18.0 must trigger HIGH_VIX_FALLBACK skip.
+    - SQLite readings older than 5 days must be rejected.
+    """
+    import sqlite3
+    now = 1791957300.0
+    db_dir = tmp_path / "sqlite"
+    db_dir.mkdir()
+    db_path = db_dir / "signals_data_2026_10.db"
+
+    # 1. Setup fallback VIX with 19.5 (> 18.0) recorded 1 hour ago
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE market_data (pk TEXT, symbol TEXT, data TEXT, ts REAL)")
+        conn.execute(
+            "INSERT INTO market_data VALUES (?, ?, ?, ?)",
+            ("INDEX#VIX#DAILY", "INDIAVIX", json.dumps({"ltp": 19.5}), now - 3600.0),
+        )
+
+    # Empty feed cache forces SQLite fallback
+    empty_feed = tmp_path / "empty_feed.json"
+    empty_feed.write_text(json.dumps({"quotes": {}}), encoding="utf-8")
+
+    loader = PreMarketIntelligenceLoader(
+        feed_cache_path=str(empty_feed),
+        sqlite_base_dir=str(db_dir),
+    )
+    intel = loader.load_intelligence(ref_time_epoch=now)
+    assert intel.vix == pytest.approx(19.5, abs=1e-2)
+    assert intel.vix_fresh is False
+    assert intel.vix_skip is True
+    assert "HIGH_VIX_FALLBACK" in intel.vix_skip_reason
+
+    # 2. Setup SQLite with VIX recorded 10 days ago (stale > 5 days)
+    stale_db_dir = tmp_path / "stale_sqlite"
+    stale_db_dir.mkdir()
+    stale_db_path = stale_db_dir / "signals_data_2026_10.db"
+    with sqlite3.connect(stale_db_path) as conn:
+        conn.execute("CREATE TABLE market_data (pk TEXT, symbol TEXT, data TEXT, ts REAL)")
+        conn.execute(
+            "INSERT INTO market_data VALUES (?, ?, ?, ?)",
+            ("INDEX#VIX#DAILY", "INDIAVIX", json.dumps({"ltp": 14.0}), now - (10.0 * 86400.0)),
+        )
+
+    loader_stale = PreMarketIntelligenceLoader(
+        feed_cache_path=str(empty_feed),
+        sqlite_base_dir=str(stale_db_dir),
+    )
+    intel_stale = loader_stale.load_intelligence(ref_time_epoch=now)
+    # 10 days old fallback rejected -> missing VIX
+    assert intel_stale.vix is None
+    assert intel_stale.vix_skip is True
+    assert "MISSING_VIX" in intel_stale.vix_skip_reason
+
+
+def test_missing_vix_reports_none(tmp_path):
+    """
+    Finding 4: Missing VIX must be reported as None, not substituted with 14.0.
+    """
+    now = 1791957300.0
+    empty_feed = tmp_path / "empty_feed.json"
+    empty_feed.write_text(json.dumps({"quotes": {}}), encoding="utf-8")
+
+    loader = PreMarketIntelligenceLoader(
+        feed_cache_path=str(empty_feed),
+        sqlite_base_dir=str(tmp_path / "empty_sqlite"),
+    )
+    intel = loader.load_intelligence(ref_time_epoch=now)
+    assert intel.vix is None
+    assert intel.vix_skip is True
+    assert "MISSING_VIX" in intel.vix_skip_reason
+
+
+def test_incomplete_prior_day_ohlc_not_fabricated(tmp_path):
+    """
+    Finding 5: Incomplete prior-day OHLC (missing high or low) must be marked unavailable
+    rather than fabricating synthetic +/-0.5% levels.
+    """
+    now = 1791957300.0
+    feed = tmp_path / "feed_incomplete_ohlc.json"
+    # Spot and close are provided, but high and low are missing
+    feed.write_text(json.dumps({
+        "quotes": {
+            "NSE_INDEX|Nifty 50": {
+                "ltp": 25150.0,
+                "cp": 25000.0,
+                "open": 25000.0,
+                "updated_at_epoch": now - 10.0,
+            }
+        }
+    }), encoding="utf-8")
+
+    loader = PreMarketIntelligenceLoader(
+        feed_cache_path=str(feed),
+        sqlite_base_dir=str(tmp_path / "empty_sqlite"),
+        directional_scalp=True,
+    )
+    intel = loader.load_intelligence(ref_time_epoch=now)
+    comp = intel.components["prior_day_structure"]
+    assert comp.is_available is False
+    assert "incomplete_prior_ohlc" in comp.metadata.get("reason", "")
+    assert intel.prior_day_ohlc is None

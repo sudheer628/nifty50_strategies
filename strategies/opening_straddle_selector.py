@@ -27,12 +27,18 @@ from common.expiry import format_expiry_angelone
 from strategies.opening_straddle_engine import (
     OpeningStraddleEngine,
     resolve_opening_straddle_expiry,
+    DEFAULT_MAX_SPREAD_PCT,
 )
 from strategies.opening_straddle_models import (
+    ExitReason,
+    OrderAction,
     PreMarketIntelligence,
+    StraddleExecutionMode,
     StrategyState,
     StraddleLegQuote,
     TickObservation,
+    TradeLeg,
+    derive_bias_from_cms,
 )
 from strategies.premarket_intelligence import PreMarketIntelligenceLoader
 
@@ -43,20 +49,180 @@ MAX_QUOTE_AGE_SEC = 15.0   # Live tick quote must not be older than 15 seconds
 MAX_CLOCK_SKEW_SEC = 2.0   # Max acceptable future timestamp clock skew in seconds
 
 
-def compute_market_open_wait_sec(now_dt: Optional[datetime] = None) -> float:
+def _is_valid_price(p: Any) -> bool:
+    """Validates that a numeric price is finite, positive, and non-zero."""
+    import math
+    if p is None:
+        return False
+    try:
+        val = float(p)
+        return math.isfinite(val) and val > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def compute_market_open_wait_sec(now_dt: Optional[datetime] = None, target_second: int = 5) -> float:
     """
-    Computes seconds to wait until 09:15:05 AM IST for market open.
+    Computes seconds to wait until 09:15:{target_second:02d} AM IST for market open.
 
     Returns:
-        - float seconds (> 0.0) if currently between 09:00:00 and 09:15:05 IST.
-        - 0.0 if already at or past 09:15:05 IST, or outside the pre-market window.
+        - float seconds (> 0.0) if currently between 09:00:00 and target IST time.
+        - 0.0 if already at or past target IST time, or outside the pre-market window.
     """
     now_dt = now_dt or datetime.now(tz=IST_TZ)
-    target_entry = now_dt.replace(hour=9, minute=15, second=5, microsecond=0)
+    target_entry = now_dt.replace(hour=9, minute=15, second=target_second, microsecond=0)
     wait_sec = (target_entry - now_dt).total_seconds()
-    if 0 < wait_sec <= 900:  # Within 15 minutes before 09:15:05 AM (09:00 - 09:15:05)
+    if 0 < wait_sec <= 900:  # Within 15 minutes before target (09:00 - 09:15:XX)
         return wait_sec
     return 0.0
+
+
+def compute_one_minute_candle_score(open_spot: Optional[float], close_spot: Optional[float]) -> float:
+    """
+    Computes 1-minute opening candle momentum score in [-1.0, +1.0] (Plan Section 4.1):
+      r_1m = ((close - open) / open) * 100
+      score_1m = clip((close - open) / (open * 0.0015), -1.0, 1.0)
+    A 0.15% return moves score to full +/- 1.0.
+    Returns 0.0 if open or close is missing/invalid.
+    """
+    if not _is_valid_price(open_spot) or not _is_valid_price(close_spot):
+        return 0.0
+    r_ratio = (float(close_spot) - float(open_spot)) / (float(open_spot) * 0.0015)
+    return max(-1.0, min(1.0, r_ratio))
+
+
+def compute_final_composite_morning_score(
+    pre_market_cms: float,
+    pre_market_coverage: float,
+    score_1m_candle: float,
+    pre_market_weight: float = 0.80,
+    candle_weight: float = 0.20,
+) -> float:
+    """
+    Synthesizes final 09:16:05 AM Composite Morning Score (CMS) (Plan Section 4.2):
+      - Coverage gate: If premarket coverage < 0.50, CMS is forced to 0.0 (SKIP).
+      - Otherwise: CMS = clip(0.80 * pre_market_cms + 0.20 * score_1m_candle, -1.0, 1.0).
+    """
+    if pre_market_coverage < 0.50:
+        return 0.0
+    raw_cms = (pre_market_weight * pre_market_cms) + (candle_weight * score_1m_candle)
+    return max(-1.0, min(1.0, raw_cms))
+
+
+def select_single_leg_decision(
+    cms: float,
+    atm_strike: int,
+    prefer_sell_call_on_strong_bearish: bool = True,
+) -> Tuple[TradeLeg, Optional[OrderAction], Optional[int], str]:
+    """
+    Evaluates Composite Morning Score (CMS) against Decision Matrix (Plan Section 5.1):
+      - Strong Bullish (CMS >= +0.30):
+          BUY CALL ATM (K_atm)
+      - Moderate Bullish / Support (+0.10 <= CMS < +0.30):
+          SELL PUT 1-step OTM (K_atm - 50)
+      - Moderate Bearish / Resistance (-0.30 < CMS <= -0.10):
+          SELL CALL 1-step OTM (K_atm + 50) [User Priority Tip]
+      - Strong Bearish (CMS <= -0.30):
+          SELL CALL 1-step OTM (Primary) or BUY PUT ATM (Secondary)
+      - Neutral / Chop (-0.10 < CMS < +0.10):
+          SKIP TRADE (NEUTRAL_CHOP)
+    """
+    if cms >= 0.30:
+        return (TradeLeg.CALL, OrderAction.BUY, atm_strike, f"STRONG_BULLISH (CMS={cms:+.3f}): BUY CALL ATM {atm_strike}")
+    elif 0.10 <= cms < 0.30:
+        target_strike = atm_strike - 50
+        return (TradeLeg.PUT, OrderAction.SELL, target_strike, f"MODERATE_BULLISH (CMS={cms:+.3f}): SELL PUT 1-step OTM {target_strike}")
+    elif -0.30 < cms <= -0.10:
+        target_strike = atm_strike + 50
+        return (TradeLeg.CALL, OrderAction.SELL, target_strike, f"MODERATE_BEARISH (CMS={cms:+.3f}): SELL CALL 1-step OTM {target_strike} (User Tip Priority)")
+    elif cms <= -0.30:
+        if prefer_sell_call_on_strong_bearish:
+            target_strike = atm_strike + 50
+            return (TradeLeg.CALL, OrderAction.SELL, target_strike, f"STRONG_BEARISH (CMS={cms:+.3f}): SELL CALL 1-step OTM {target_strike} (Primary)")
+        else:
+            return (TradeLeg.PUT, OrderAction.BUY, atm_strike, f"STRONG_BEARISH (CMS={cms:+.3f}): BUY PUT ATM {atm_strike} (Secondary)")
+    else:
+        return (TradeLeg.NONE, None, None, f"NEUTRAL_CHOP (CMS={cms:+.3f} in (-0.10, +0.10)): SKIP TRADE")
+
+
+def sample_opening_candle(
+    wait_for_market_open: bool = True,
+    poll_interval_sec: float = 1.0,
+) -> Dict[str, Optional[float]]:
+    """
+    Samples the 1-minute opening candle between 09:15:00 and 09:16:00 AM IST.
+    Captures: open, high, low, close.
+    If wait_for_market_open is False, takes a single snapshot of the current spot.
+    """
+    now_dt = datetime.now(tz=IST_TZ)
+
+    if not wait_for_market_open:
+        spot_res = get_nifty_spot()
+        spot_val = None
+        if isinstance(spot_res, dict):
+            val = spot_res.get("ltp")
+            spot_val = float(val) if _is_valid_price(val) else None
+        elif _is_valid_price(spot_res):
+            spot_val = float(spot_res)
+        return {"open": spot_val, "high": spot_val, "low": spot_val, "close": spot_val}
+
+    # Observe 09:15:00 to 09:16:00
+    market_open_dt = now_dt.replace(hour=9, minute=15, second=0, microsecond=0)
+    candle_end_dt = now_dt.replace(hour=9, minute=16, second=0, microsecond=0)
+    target_entry_dt = now_dt.replace(hour=9, minute=16, second=5, microsecond=0)
+
+    # 1. Early launch: If before 09:15:00 IST, wait for opening bell
+    if now_dt < market_open_dt:
+        wait_sec = (market_open_dt - now_dt).total_seconds()
+        logger.info(
+            "Current time is %s IST (%.1fs before market open). Waiting until 09:15:00 AM IST for opening candle observation...",
+            now_dt.strftime("%H:%M:%S"),
+            wait_sec,
+        )
+        time.sleep(wait_sec)
+
+    # 2. Late launch: If past 09:16:00 IST, observation window has already elapsed
+    now_dt = datetime.now(tz=IST_TZ)
+    if now_dt >= candle_end_dt:
+        logger.warning(
+            "Current time %s IST is at or past 09:16:00 AM IST. Opening candle observation window (09:15-09:16) has already closed.",
+            now_dt.strftime("%H:%M:%S"),
+        )
+        return {"open": None, "high": None, "low": None, "close": None}
+
+    open_p: Optional[float] = None
+    high_p: Optional[float] = None
+    low_p: Optional[float] = None
+    close_p: Optional[float] = None
+
+    while datetime.now(tz=IST_TZ) < candle_end_dt:
+        spot_res = get_nifty_spot()
+        s_val = None
+        if isinstance(spot_res, dict):
+            val = spot_res.get("ltp")
+            if _is_valid_price(val):
+                s_val = float(val)
+        elif _is_valid_price(spot_res):
+            s_val = float(spot_res)
+
+        if s_val is not None and s_val > 0:
+            if open_p is None:
+                open_p = s_val
+            high_p = max(high_p, s_val) if high_p is not None else s_val
+            low_p = min(low_p, s_val) if low_p is not None else s_val
+            close_p = s_val
+
+        time.sleep(poll_interval_sec)
+
+    # Wait until 09:16:05 AM IST for entry gate
+    now_dt = datetime.now(tz=IST_TZ)
+    if now_dt < target_entry_dt:
+        entry_wait = (target_entry_dt - now_dt).total_seconds()
+        if 0 < entry_wait <= 10.0:
+            logger.info("Awaiting 09:16:05 entry timestamp (%.1fs buffer)...", entry_wait)
+            time.sleep(entry_wait)
+
+    return {"open": open_p, "high": high_p, "low": low_p, "close": close_p}
 
 
 def parse_quote_age_sec(
@@ -136,96 +302,194 @@ def run_opening_straddle(
     runner_stop_loss_pct: float = -10.0,
     runner_trailing_trigger_pct: float = 15.0,
     runner_trailing_drop_pct: float = 8.0,
+    prefer_sell_call_on_strong_bearish: bool = True,
+    short_margin_per_lot: Optional[float] = None,
 ) -> int:
     """
-    Main orchestrator running the daily opening straddle cycle from 09:14 to 10:00 AM.
+    Main orchestrator running the daily directional single-leg scalp cycle (09:14 to 10:00 AM).
     Operates strictly as an analytical signal, paper-execution, and risk-tracking engine.
     Order placement is completely out of scope.
     """
-    logger.info("=" * 65)
-    logger.info("Starting NIFTY 50 Opening Straddle Strategy (Tracking Mode)")
-    logger.info("=" * 65)
+    logger.info("=" * 70)
+    logger.info("Starting NIFTY 50 Directional Single-Leg Scalper (Tracking Mode)")
+    logger.info("=" * 70)
 
-    # 1. Step 1: Pre-Market Multi-Source Ingestion (09:14:00 AM)
-    logger.info("Step 1: Running Pre-Market Multi-Source Ingestion Engine...")
-    intel_loader = PreMarketIntelligenceLoader()
+    # 1. Step 1: Pre-Market Multi-Source Ingestion & VIX Gate (09:14:00 AM)
+    logger.info("Step 1: Running Pre-Market Multi-Source Ingestion Engine (Directional Scalp Mode)...")
+    intel_loader = PreMarketIntelligenceLoader(directional_scalp=True)
     intel = intel_loader.load_intelligence()
     logger.info("Pre-Market Summary: %s", intel.summary_str())
+
+    # VIX Fail-Safe Gate: Terminate immediately if VIX is elevated or missing (Rule 2)
+    if intel.vix_skip:
+        logger.warning(
+            "VIX Gate triggered: %s. Skipping morning strategy execution for the day.",
+            intel.vix_skip_reason,
+        )
+        engine = OpeningStraddleEngine(
+            pre_market=intel,
+            db_path=db_path,
+            enable_alerts=enable_alerts,
+            execution_mode=StraddleExecutionMode.SINGLE_LEG_DIRECTIONAL,
+        )
+        skip_exit_reason = (
+            ExitReason.HIGH_VIX_SKIP
+            if "HIGH_VIX" in (intel.vix_skip_reason or "")
+            else ExitReason.MISSING_VIX_SKIP
+        )
+        engine.record_skipped_session(intel.vix_skip_reason or "VIX_SKIP", skip_exit_reason)
+        return 0
 
     # 2. Step 2: Resolve Target Expiry & Contracts
     target_expiry = resolve_opening_straddle_expiry()
     expiry_angel = format_expiry_angelone(target_expiry)
     logger.info("Target Expiry: %s (Angel Format: %s)", target_expiry.strftime("%Y-%m-%d"), expiry_angel)
 
-    # Wait until 09:15:05 AM IST for market open
-    if wait_for_market_open:
-        wait_sec = compute_market_open_wait_sec()
-        if wait_sec > 0:
-            now_ist = datetime.now(tz=IST_TZ)
-            logger.info(
-                "Pre-market preparation complete at %s IST. Waiting %.1fs until 09:15:05 AM IST for market open...",
-                now_ist.strftime("%H:%M:%S"),
-                wait_sec,
-            )
-            time.sleep(wait_sec)
+    # 3. Step 3: Wait for Market Open & Sample 1-Minute Candle (09:15:00 - 09:16:00 AM IST)
+    logger.info("Step 3: Awaiting market open and sampling 1-minute candle momentum (09:15 - 09:16 AM IST)...")
+    candle_data = sample_opening_candle(
+        wait_for_market_open=wait_for_market_open,
+        poll_interval_sec=poll_interval_sec,
+    )
+    spot_open = candle_data.get("open")
+    spot_close = candle_data.get("close")
 
-    # 3. Step 3 & 4: Live Spot Discovery, ATM Strike Anchor & Quality Gate (with grace window)
-    logger.info("Step 3: Sampling 09:15:05 AM spot price anchor and option quotes...")
+    # In production live mode (wait_for_market_open=True), missing opening candle means late launch or feed failure
+    if wait_for_market_open and (spot_open is None or spot_close is None):
+        logger.error(
+            "Opening candle (09:15-09:16 IST) data is missing (late launch past 09:16:00 or feed offline). "
+            "Cannot synthesize 09:16:05 CMS or execute directional trade. Aborting morning scalp session."
+        )
+        engine = OpeningStraddleEngine(
+            pre_market=intel,
+            trade_date=datetime.now().strftime("%Y-%m-%d"),
+            expiry_date=target_expiry.strftime("%Y-%m-%d"),
+            db_path=db_path,
+            enable_alerts=enable_alerts,
+            execution_mode=StraddleExecutionMode.SINGLE_LEG_DIRECTIONAL,
+        )
+        engine.record_skipped_session("OPENING_CANDLE_MISSING (late launch past 09:16:00 or feed offline)", ExitReason.EXECUTION_ABORT)
+        return 1
 
-    def _is_valid_price(p: Any) -> bool:
-        import math
-        try:
-            val = float(p)
-            return math.isfinite(val) and val > 0.0
-        except (TypeError, ValueError):
-            return False
+    score_1m = compute_one_minute_candle_score(spot_open, spot_close)
+    logger.info(
+        "1-Minute Opening Candle (09:15-09:16): Open=%s, High=%s, Low=%s, Close=%s | Score=%.3f",
+        f"{spot_open:.2f}" if spot_open else "N/A",
+        f"{candle_data.get('high'):.2f}" if candle_data.get('high') else "N/A",
+        f"{candle_data.get('low'):.2f}" if candle_data.get('low') else "N/A",
+        f"{spot_close:.2f}" if spot_close else "N/A",
+        score_1m,
+    )
+
+    # Blend Premarket CMS (0.80) and 1m Candle Score (0.20)
+    pre_market_cms = (
+        intel.composite_morning_score
+        if intel.composite_morning_score is not None
+        else (intel.cds if intel.coverage >= 0.50 else 0.0)
+    )
+    final_cms = compute_final_composite_morning_score(
+        pre_market_cms=pre_market_cms,
+        pre_market_coverage=intel.coverage,
+        score_1m_candle=score_1m,
+    )
+    intel.composite_morning_score = final_cms
+    intel.final_bias = derive_bias_from_cms(final_cms)
+    logger.info(
+        "Final CMS Synthesis at 09:16:05: Premarket CMS=%.3f (cov=%.2f) * 0.80 + 1m Candle=%.3f * 0.20 -> Final CMS=%.3f",
+        pre_market_cms,
+        intel.coverage,
+        score_1m,
+        final_cms,
+    )
+
+    # 4. Step 4: Decision Matrix & Single Leg Strike Selection (09:16:05 AM IST)
+    # Determine reference spot: prefer 09:16 close, then intel.nifty_spot
+    ref_spot = spot_close or intel.nifty_spot or 0.0
+    if ref_spot <= 0.0:
+        spot_res = get_nifty_spot()
+        if isinstance(spot_res, dict):
+            ref_spot = float(spot_res.get("ltp") or 0.0)
+        elif spot_res is not None:
+            ref_spot = float(spot_res)
+
+    atm_strike = int(round(ref_spot / 50.0) * 50) if ref_spot > 0 else 0
+
+    trade_leg, order_action, target_strike, decision_reason = select_single_leg_decision(
+        cms=final_cms,
+        atm_strike=atm_strike,
+        prefer_sell_call_on_strong_bearish=prefer_sell_call_on_strong_bearish,
+    )
+    logger.info("Leg Selection Matrix Result: %s", decision_reason)
+
+    # Skip Gate: Insufficient Coverage or Neutral Chop
+    if trade_leg == TradeLeg.NONE or order_action is None or target_strike is None:
+        is_insufficient_cov = (intel.coverage < 0.50)
+        skip_reason_label = (
+            f"INSUFFICIENT_COVERAGE (coverage={intel.coverage:.2f} < 0.50): SKIP TRADE"
+            if is_insufficient_cov
+            else decision_reason
+        )
+        skip_exit_reason = (
+            ExitReason.INSUFFICIENT_COVERAGE_SKIP
+            if is_insufficient_cov
+            else ExitReason.NEUTRAL_CHOP_SKIP
+        )
+        logger.warning(
+            "Skip Gate triggered: %s. Skipping morning trade.",
+            skip_reason_label,
+        )
+        engine = OpeningStraddleEngine(
+            pre_market=intel,
+            trade_date=datetime.now().strftime("%Y-%m-%d"),
+            expiry_date=target_expiry.strftime("%Y-%m-%d"),
+            db_path=db_path,
+            enable_alerts=enable_alerts,
+            execution_mode=StraddleExecutionMode.SINGLE_LEG_DIRECTIONAL,
+        )
+        engine.record_skipped_session(skip_reason_label, skip_exit_reason, final_cms=final_cms)
+        return 0
+
+    # 5. Step 5: Acquire Fresh Executable Option Quote for Target Strike
+    logger.info(
+        "Step 5: Sampling 09:16:05 AM executable quote for %s %s Strike=%d...",
+        order_action.value,
+        trade_leg.value,
+        target_strike,
+    )
 
     entry_start_time = time.time()
-    spot_val = 0.0
-    atm_strike = 0
-    call_leg: Optional[StraddleLegQuote] = None
-    put_leg: Optional[StraddleLegQuote] = None
+    spot_val = ref_spot
+    leg_quote: Optional[StraddleLegQuote] = None
     last_rejection_reasons: List[str] = []
 
     while (time.time() - entry_start_time) <= entry_grace_timeout_sec:
         spot_res = get_nifty_spot()
         if isinstance(spot_res, dict):
-            spot_val = float(spot_res.get("ltp") or 0.0)
-        elif spot_res is not None:
+            s_candidate = spot_res.get("ltp")
+            if _is_valid_price(s_candidate):
+                spot_val = float(s_candidate)
+        elif _is_valid_price(spot_res):
             spot_val = float(spot_res)
-        else:
-            spot_val = 0.0
 
-        if spot_val <= 0:
-            if intel.nifty_spot and intel.nifty_spot > 0:
-                spot_val = float(intel.nifty_spot)
-            else:
-                last_rejection_reasons = ["Invalid/missing NIFTY spot price"]
-                time.sleep(1.0)
-                continue
-
-        atm_strike = int(round(spot_val / 50.0) * 50)
-        chain = get_nifty_option_chain(expiry_angel, atm_strike, atm_strike, mode="FULL")
+        chain = get_nifty_option_chain(expiry_angel, target_strike, target_strike, mode="FULL")
         t_entry_recv = time.time()
         call_info = chain.get("call") or {}
         put_info = chain.get("put") or {}
+        leg_info = call_info if trade_leg == TradeLeg.CALL else put_info
 
-        ce_ltp = float(call_info.get("ltp") or 0.0)
-        pe_ltp = float(put_info.get("ltp") or 0.0)
-
-        if ce_ltp <= 0.0 or pe_ltp <= 0.0:
-            last_rejection_reasons = [f"Missing option LTPs (CE={ce_ltp:.2f}, PE={pe_ltp:.2f})"]
+        leg_ltp = float(leg_info.get("ltp") or 0.0)
+        if leg_ltp <= 0.0:
+            last_rejection_reasons = [f"Missing option LTP ({trade_leg.value}={leg_ltp:.2f})"]
             time.sleep(1.0)
             continue
 
-        # Validate opening quote freshness
+        # Validate quote freshness
         spot_entry_age = parse_quote_age_sec(
             spot_res.get("feed_time") if isinstance(spot_res, dict) else None,
             now_ts=t_entry_recv,
             max_skew_sec=MAX_CLOCK_SKEW_SEC,
         )
-        ce_entry_age = parse_quote_age_sec(call_info.get("feed_time"), now_ts=t_entry_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
-        pe_entry_age = parse_quote_age_sec(put_info.get("feed_time"), now_ts=t_entry_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
+        leg_entry_age = parse_quote_age_sec(leg_info.get("feed_time"), now_ts=t_entry_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
 
         entry_stale_reasons = []
         if spot_entry_age is None:
@@ -234,22 +498,16 @@ def run_opening_straddle(
         elif spot_entry_age > MAX_QUOTE_AGE_SEC:
             entry_stale_reasons.append(f"Spot={spot_entry_age:.1f}s")
 
-        if ce_entry_age is None:
+        if leg_entry_age is None:
             if not allow_synthetic_spread:
-                entry_stale_reasons.append("Call=missing_or_unverifiable_timestamp")
-        elif ce_entry_age > MAX_QUOTE_AGE_SEC:
-            entry_stale_reasons.append(f"Call={ce_entry_age:.1f}s")
-
-        if pe_entry_age is None:
-            if not allow_synthetic_spread:
-                entry_stale_reasons.append("Put=missing_or_unverifiable_timestamp")
-        elif pe_entry_age > MAX_QUOTE_AGE_SEC:
-            entry_stale_reasons.append(f"Put={pe_entry_age:.1f}s")
+                entry_stale_reasons.append(f"{trade_leg.value}=missing_or_unverifiable_timestamp")
+        elif leg_entry_age > MAX_QUOTE_AGE_SEC:
+            entry_stale_reasons.append(f"{trade_leg.value}={leg_entry_age:.1f}s")
 
         if entry_stale_reasons:
             last_rejection_reasons = entry_stale_reasons
             elapsed = time.time() - entry_start_time
-            if (time.time() - entry_start_time) < entry_grace_timeout_sec:
+            if elapsed < entry_grace_timeout_sec:
                 logger.info(
                     "Opening quotes not yet fresh (%s). Awaiting live ticks (elapsed %.1fs/%.0fs)...",
                     ", ".join(entry_stale_reasons),
@@ -259,35 +517,27 @@ def run_opening_straddle(
                 time.sleep(1.5)
             continue
 
-        raw_ce_bid = call_info.get("bid")
-        raw_ce_ask = call_info.get("ask")
-        raw_pe_bid = put_info.get("bid")
-        raw_pe_ask = put_info.get("ask")
+        raw_bid = leg_info.get("bid")
+        raw_ask = leg_info.get("ask")
 
         has_depth = (
-            _is_valid_price(raw_ce_bid)
-            and _is_valid_price(raw_ce_ask)
-            and float(raw_ce_ask) >= float(raw_ce_bid)
-            and _is_valid_price(raw_pe_bid)
-            and _is_valid_price(raw_pe_ask)
-            and float(raw_pe_ask) >= float(raw_pe_bid)
+            _is_valid_price(raw_bid)
+            and _is_valid_price(raw_ask)
+            and float(raw_ask) >= float(raw_bid)
         )
 
         if not has_depth:
             if allow_synthetic_spread:
                 logger.warning(
-                    "Opening market depth quotes unavailable from broker (CE bid=%s, ask=%s; PE bid=%s, ask=%s). "
-                    "Synthesizing 0.4%% spread around LTP because --allow-synthetic-spread is enabled.",
-                    raw_ce_bid, raw_ce_ask, raw_pe_bid, raw_pe_ask
+                    "Market depth unavailable for %s (bid=%s, ask=%s). Synthesizing 0.4%% spread around LTP.",
+                    trade_leg.value, raw_bid, raw_ask,
                 )
-                ce_bid = ce_ltp * 0.998
-                ce_ask = ce_ltp * 1.002
-                pe_bid = pe_ltp * 0.998
-                pe_ask = pe_ltp * 1.002
+                leg_bid = leg_ltp * 0.998
+                leg_ask = leg_ltp * 1.002
             else:
-                last_rejection_reasons = [f"Awaiting depth (CE bid={raw_ce_bid}, ask={raw_ce_ask}; PE bid={raw_pe_bid}, ask={raw_pe_ask})"]
+                last_rejection_reasons = [f"Awaiting depth ({trade_leg.value} bid={raw_bid}, ask={raw_ask})"]
                 elapsed = time.time() - entry_start_time
-                if (time.time() - entry_start_time) < entry_grace_timeout_sec:
+                if elapsed < entry_grace_timeout_sec:
                     logger.info(
                         "Opening depth not yet formed (%s). Retrying (elapsed %.1fs/%.0fs)...",
                         last_rejection_reasons[0],
@@ -297,45 +547,35 @@ def run_opening_straddle(
                     time.sleep(1.5)
                 continue
         else:
-            ce_bid = float(raw_ce_bid)
-            ce_ask = float(raw_ce_ask)
-            pe_bid = float(raw_pe_bid)
-            pe_ask = float(raw_pe_ask)
+            leg_bid = float(raw_bid)
+            leg_ask = float(raw_ask)
 
-        ce_token = str(call_info.get("token") or "")
-        pe_token = str(put_info.get("token") or "")
-        ce_symbol = str(call_info.get("trading_symbol") or f"NIFTY{atm_strike}CE")
-        pe_symbol = str(put_info.get("trading_symbol") or f"NIFTY{atm_strike}PE")
+        leg_token = str(leg_info.get("token") or "")
+        opt_suffix = "CE" if trade_leg == TradeLeg.CALL else "PE"
+        leg_symbol = str(leg_info.get("trading_symbol") or f"NIFTY{target_strike}{opt_suffix}")
 
-        call_leg = StraddleLegQuote(
-            symbol=ce_symbol,
-            token=ce_token,
-            strike=atm_strike,
-            option_type="CE",
-            bid=ce_bid,
-            ask=ce_ask,
-            ltp=ce_ltp,
-        )
-        put_leg = StraddleLegQuote(
-            symbol=pe_symbol,
-            token=pe_token,
-            strike=atm_strike,
-            option_type="PE",
-            bid=pe_bid,
-            ask=pe_ask,
-            ltp=pe_ltp,
+        leg_quote = StraddleLegQuote(
+            symbol=leg_symbol,
+            token=leg_token,
+            strike=target_strike,
+            option_type=opt_suffix,
+            bid=leg_bid,
+            ask=leg_ask,
+            ltp=leg_ltp,
         )
         logger.info(
-            "Acquired fresh opening quotes and valid depth for ATM strike %d at +%.2fs (Spot=%.2f, CE ltp=%.2f, PE ltp=%.2f).",
-            atm_strike,
+            "Acquired fresh quote and valid depth for %s Strike %d at +%.2fs (Spot=%.2f, LTP=%.2f, Bid=%.2f, Ask=%.2f).",
+            trade_leg.value,
+            target_strike,
             time.time() - entry_start_time,
             spot_val,
-            ce_ltp,
-            pe_ltp,
+            leg_ltp,
+            leg_bid,
+            leg_ask,
         )
         break
 
-    if call_leg is None or put_leg is None:
+    if leg_quote is None:
         logger.error(
             "Failed to acquire fresh opening quotes within %.0fs grace window (%s). Aborting entry.",
             entry_grace_timeout_sec,
@@ -343,6 +583,7 @@ def run_opening_straddle(
         )
         return 1
 
+    # 6. Step 6: Arm Single-Leg Directional Entry
     engine = OpeningStraddleEngine(
         pre_market=intel,
         trade_date=datetime.now().strftime("%Y-%m-%d"),
@@ -352,24 +593,38 @@ def run_opening_straddle(
         runner_stop_loss_pct=runner_stop_loss_pct,
         runner_trailing_trigger_pct=runner_trailing_trigger_pct,
         runner_trailing_drop_pct=runner_trailing_drop_pct,
+        short_margin_per_lot=short_margin_per_lot,
         enable_alerts=enable_alerts,
+        execution_mode=StraddleExecutionMode.SINGLE_LEG_DIRECTIONAL,
     )
 
-    if not engine.arm_entry(spot_price=spot_val, call_quote=call_leg, put_quote=put_leg):
-        logger.warning("Opening Straddle Entry Gate rejected or aborted (Status=%s).", engine.status)
+    armed = engine.arm_single_leg_entry(
+        leg=trade_leg,
+        action=order_action,
+        strike=target_strike,
+        quote=leg_quote,
+        spot_price=spot_val,
+        final_cms=final_cms,
+    )
+    if not armed:
+        logger.warning("Single-leg entry gate rejected or aborted (Status=%s).", engine.status)
         return 1
 
-    # 5. Step 5: Live Observation & Decoupling Loop (1 Hz polling)
-    logger.info("Step 5: Entering high-frequency observation loop...")
+    # 7. Step 7: Live Observation Loop (1 Hz polling until exit or 09:55:00 AM IST)
+    logger.info("Step 7: Entering high-frequency single-leg observation loop...")
     start_time = time.time()
     try:
         while engine.state not in (StrategyState.CLOSED, StrategyState.ABORTED):
             loop_now = time.time()
             if (loop_now - start_time) > max_duration_sec:
-                logger.info("Session max duration exceeded. Forcing hard time exit.")
+                logger.info(
+                    "Session max duration exceeded (%.1fs > %ds). Forcing hard time exit.",
+                    loop_now - start_time,
+                    max_duration_sec,
+                )
+                engine.force_hard_time_exit()
                 break
 
-            # Fetch fresh quotes with freshness & latency tracking
             t_req_start = time.time()
             fresh_spot_res = get_nifty_spot()
             raw_spot = None
@@ -379,40 +634,34 @@ def run_opening_straddle(
                 raw_spot = fresh_spot_res
 
             if not _is_valid_price(raw_spot):
-                logger.warning("Invalid or non-finite NIFTY spot quote received (%s). Skipping tick.", raw_spot)
                 time.sleep(poll_interval_sec)
                 continue
             curr_spot = float(raw_spot)
 
-            chain_tick = get_nifty_option_chain(expiry_angel, atm_strike, atm_strike, mode="FULL")
+            chain_tick = get_nifty_option_chain(expiry_angel, target_strike, target_strike, mode="FULL")
             t_recv = time.time()
             latency_sec = t_recv - t_req_start
             if latency_sec > 5.0:
-                logger.warning("Quote API round-trip latency exceeded threshold (%.2fs > 5.0s). Skipping stale tick.", latency_sec)
+                logger.warning("Quote API round-trip latency exceeded (%.2fs > 5.0s). Skipping stale tick.", latency_sec)
                 time.sleep(poll_interval_sec)
                 continue
 
             c_info = chain_tick.get("call") or {}
             p_info = chain_tick.get("put") or {}
+            leg_info = c_info if trade_leg == TradeLeg.CALL else p_info
 
-            raw_c_ltp = c_info.get("ltp")
-            raw_p_ltp = p_info.get("ltp")
-            if not _is_valid_price(raw_c_ltp) or not _is_valid_price(raw_p_ltp):
-                logger.warning("Option LTP missing/invalid on live tick (CE=%s, PE=%s). Skipping tick.", raw_c_ltp, raw_p_ltp)
+            raw_leg_ltp = leg_info.get("ltp")
+            if not _is_valid_price(raw_leg_ltp):
                 time.sleep(poll_interval_sec)
                 continue
 
-            c_ltp = float(raw_c_ltp)
-            p_ltp = float(raw_p_ltp)
-
-            # Validate underlying market data freshness via broker feed timestamps
+            # Check quote freshness
             spot_age = parse_quote_age_sec(
                 fresh_spot_res.get("feed_time") if isinstance(fresh_spot_res, dict) else None,
                 now_ts=t_recv,
                 max_skew_sec=MAX_CLOCK_SKEW_SEC,
             )
-            c_age = parse_quote_age_sec(c_info.get("feed_time"), now_ts=t_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
-            p_age = parse_quote_age_sec(p_info.get("feed_time"), now_ts=t_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
+            leg_age = parse_quote_age_sec(leg_info.get("feed_time"), now_ts=t_recv, max_skew_sec=MAX_CLOCK_SKEW_SEC)
 
             stale_reasons = []
             if spot_age is None:
@@ -421,75 +670,53 @@ def run_opening_straddle(
             elif spot_age > MAX_QUOTE_AGE_SEC:
                 stale_reasons.append(f"Spot={spot_age:.1f}s")
 
-            if c_age is None:
+            if leg_age is None:
                 if not allow_synthetic_spread:
-                    stale_reasons.append("Call=missing_or_unverifiable_timestamp")
-            elif c_age > MAX_QUOTE_AGE_SEC:
-                stale_reasons.append(f"Call={c_age:.1f}s")
-
-            if p_age is None:
-                if not allow_synthetic_spread:
-                    stale_reasons.append("Put=missing_or_unverifiable_timestamp")
-            elif p_age > MAX_QUOTE_AGE_SEC:
-                stale_reasons.append(f"Put={p_age:.1f}s")
+                    stale_reasons.append(f"{trade_leg.value}=missing_or_unverifiable_timestamp")
+            elif leg_age > MAX_QUOTE_AGE_SEC:
+                stale_reasons.append(f"{trade_leg.value}={leg_age:.1f}s")
 
             if stale_reasons:
-                logger.warning(
-                    "Stale or unverified market data detected (%s). Skipping tick.",
-                    ", ".join(stale_reasons),
-                )
+                logger.warning("Stale market data detected (%s). Skipping tick.", ", ".join(stale_reasons))
                 time.sleep(poll_interval_sec)
                 continue
 
-            max_observed_age = max(
-                (a for a in (spot_age, c_age, p_age) if a is not None),
-                default=None,
+            raw_bid = leg_info.get("bid")
+            raw_ask = leg_info.get("ask")
+            has_depth = (
+                _is_valid_price(raw_bid)
+                and _is_valid_price(raw_ask)
+                and float(raw_ask) >= float(raw_bid)
             )
 
-            # Strict Bid/Ask market depth validation
-            raw_c_bid = c_info.get("bid")
-            raw_c_ask = c_info.get("ask")
-            raw_p_bid = p_info.get("bid")
-            raw_p_ask = p_info.get("ask")
-
-            has_live_depth = (
-                _is_valid_price(raw_c_bid)
-                and _is_valid_price(raw_c_ask)
-                and float(raw_c_ask) >= float(raw_c_bid)
-                and _is_valid_price(raw_p_bid)
-                and _is_valid_price(raw_p_ask)
-                and float(raw_p_ask) >= float(raw_p_bid)
-            )
-
-            if not has_live_depth:
+            if not has_depth:
                 if allow_synthetic_spread:
-                    c_bid = c_ltp * 0.998
-                    c_ask = c_ltp * 1.002
-                    p_bid = p_ltp * 0.998
-                    p_ask = p_ltp * 1.002
+                    curr_leg_ltp = float(raw_leg_ltp)
+                    tick_bid = curr_leg_ltp * 0.998
+                    tick_ask = curr_leg_ltp * 1.002
                 else:
-                    logger.warning(
-                        "Live tick missing or invalid bid/ask depth (CE bid=%s, ask=%s; PE bid=%s, ask=%s). Skipping tick.",
-                        raw_c_bid, raw_c_ask, raw_p_bid, raw_p_ask,
-                    )
+                    logger.warning("Live tick missing depth for active leg %s. Skipping tick.", trade_leg.value)
                     time.sleep(poll_interval_sec)
                     continue
             else:
-                c_bid = float(raw_c_bid)
-                c_ask = float(raw_c_ask)
-                p_bid = float(raw_p_bid)
-                p_ask = float(raw_p_ask)
+                tick_bid = float(raw_bid)
+                tick_ask = float(raw_ask)
+
+            tick_call_bid = tick_bid if trade_leg == TradeLeg.CALL else 0.0
+            tick_call_ask = tick_ask if trade_leg == TradeLeg.CALL else 0.0
+            tick_put_bid = tick_bid if trade_leg == TradeLeg.PUT else 0.0
+            tick_put_ask = tick_ask if trade_leg == TradeLeg.PUT else 0.0
 
             tick = TickObservation(
                 ts=t_recv,
                 nifty_spot=curr_spot,
-                call_bid=c_bid,
-                call_ask=c_ask,
-                put_bid=p_bid,
-                put_ask=p_ask,
-                call_ltp=c_ltp,
-                put_ltp=p_ltp,
-                quote_age_sec=max_observed_age,
+                call_bid=tick_call_bid,
+                call_ask=tick_call_ask,
+                put_bid=tick_put_bid,
+                put_ask=tick_put_ask,
+                call_ltp=float(raw_leg_ltp) if trade_leg == TradeLeg.CALL else 0.0,
+                put_ltp=float(raw_leg_ltp) if trade_leg == TradeLeg.PUT else 0.0,
+                quote_age_sec=max((a for a in (spot_age, leg_age) if a is not None), default=None),
             )
 
             engine.process_tick(tick)
@@ -499,6 +726,14 @@ def run_opening_straddle(
         logger.info("Execution interrupted by user. Flushing buffered ticks and session...")
         engine.flush_interrupted_session()
         return 0
+
+    # Fail-safe liquidation guard: ensure any unclosed position is cleanly liquidated with HARD_TIME_STOP
+    if engine.state not in (StrategyState.CLOSED, StrategyState.ABORTED):
+        logger.warning(
+            "Observation loop ended while strategy was in state %s. Forcing hard time exit.",
+            engine.state.value,
+        )
+        engine.force_hard_time_exit()
 
     logger.info("Session complete: State=%s, Status=%s", engine.state.value, engine.status)
     return 0
@@ -520,6 +755,7 @@ def print_session_report(db_path: Optional[str] = None) -> int:
         rows = conn.execute(
             """
             SELECT trade_date, atm_strike, bias_classification, selected_leg,
+                   order_action, trade_leg, executed_strike, entry_price, exit_price,
                    net_pnl_inr, net_roi_pct, peak_roi_pct, exit_reason, status
             FROM opening_straddle_sessions
             ORDER BY trade_date DESC LIMIT 30
@@ -530,21 +766,30 @@ def print_session_report(db_path: Optional[str] = None) -> int:
         print(f"No sessions found in {target_db}")
         return 0
 
-    print("=" * 88)
-    print(" NIFTY 50 OPENING STRADDLE - HISTORICAL SESSIONS")
-    print("=" * 88)
-    header = f"{'Date':<11} | {'ATM':<6} | {'Prior Bias':<14} | {'Leg':<8} | {'Net P&L':>11} | {'ROI %':>8} | {'Peak %':>8} | {'Exit Reason':<14}"
+    print("=" * 96)
+    print(" NIFTY 50 DIRECTIONAL SINGLE-LEG / OPENING SCALPER - HISTORICAL SESSIONS")
+    print("=" * 96)
+    header = f"{'Date':<11} | {'ATM':<6} | {'Prior Bias':<14} | {'Action / Leg':<16} | {'Net P&L':>11} | {'ROI %':>8} | {'Peak %':>8} | {'Exit Reason':<16}"
     print(header)
-    print("-" * 88)
+    print("-" * 96)
     for r in rows:
         pnl_str = f"INR {r['net_pnl_inr']:+,.2f}" if r["net_pnl_inr"] is not None else "N/A"
         roi_str = f"{r['net_roi_pct']:+.2f}%" if r["net_roi_pct"] is not None else "N/A"
         peak_str = f"{r['peak_roi_pct']:+.2f}%" if r["peak_roi_pct"] is not None else "N/A"
         bias = (r["bias_classification"] or "N/A")[:14]
-        leg = (r["selected_leg"] or "N/A")[:8]
-        exit_r = (r["exit_reason"] or "N/A")[:14]
-        print(f"{r['trade_date']:<11} | {r['atm_strike']:<6} | {bias:<14} | {leg:<8} | {pnl_str:>11} | {roi_str:>8} | {peak_str:>8} | {exit_r:<14}")
-    print("=" * 88)
+
+        # Single-leg or legacy display
+        if r["order_action"] and r["trade_leg"] and r["trade_leg"] != "NONE":
+            act = r["order_action"]
+            t_leg = r["trade_leg"]
+            stk = r["executed_strike"] or r["atm_strike"] or ""
+            leg_display = f"{act} {t_leg} {stk}"[:16]
+        else:
+            leg_display = (r["selected_leg"] or r["status"] or "N/A")[:16]
+
+        exit_r = (r["exit_reason"] or "N/A")[:16]
+        print(f"{r['trade_date']:<11} | {r['atm_strike']:<6} | {bias:<14} | {leg_display:<16} | {pnl_str:>11} | {roi_str:>8} | {peak_str:>8} | {exit_r:<16}")
+    print("=" * 96)
     return 0
 
 
@@ -561,6 +806,8 @@ def main():
     parser.add_argument("--runner-profit-target", type=float, default=35.0, help="Individual runner profit target percent (default: +35.0%%)")
     parser.add_argument("--runner-trailing-trigger", type=float, default=15.0, help="Runner trailing stop activation trigger percent (default: +15.0%%)")
     parser.add_argument("--runner-trailing-drop", type=float, default=8.0, help="Runner trailing stop drop distance from peak (default: 8.0%%)")
+    parser.add_argument("--prefer-buy-put-on-strong-bearish", action="store_true", help="BUY PUT ATM instead of SELL CALL 1-step OTM on strong bearish (default: False, prioritizes SELL CALL)")
+    parser.add_argument("--short-margin", type=float, default=None, help="Custom short margin INR per lot (default: 120,000 INR)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -588,6 +835,8 @@ def main():
         runner_stop_loss_pct=args.runner_stop_loss,
         runner_trailing_trigger_pct=args.runner_trailing_trigger,
         runner_trailing_drop_pct=args.runner_trailing_drop,
+        prefer_sell_call_on_strong_bearish=not args.prefer_buy_put_on_strong_bearish,
+        short_margin_per_lot=args.short_margin,
     )
 
 
