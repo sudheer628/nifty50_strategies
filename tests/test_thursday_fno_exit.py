@@ -44,10 +44,10 @@ def test_round_to_tick():
 
 
 def test_thursday_redis_keys_isolation():
-    keys = thu_module.build_trail_redis_keys("upstox", "NIFTY03NOV2622650CE", "NSE_FO|53750")
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY03NOV2622650CE", "NSE_FO|53750")
     assert ":thu:" in keys["enabled"]
-    assert "fno:upstox:enabled:thu:NIFTY:03NOV26:22650:CE" in keys["enabled"]
-    assert "fno:upstox:trail:thu:NIFTY:03NOV26:22650:CE" in keys["max"]
+    assert "fno:angelone:enabled:thu:NIFTY:03NOV26:22650:CE" in keys["enabled"]
+    assert "fno:angelone:trail:thu:NIFTY:03NOV26:22650:CE" in keys["max"]
 
 
 def test_multi_lot_quantity_slicing():
@@ -321,6 +321,62 @@ def test_parse_positions_separates_long_and_short():
     assert shorts[0]["quantity"] == -65
 
 
+def test_parse_positions_raw_angelone_payload():
+    """Verify parse_positions normalizes a raw AngelOne getPosition response with netqty and cfbuyavgprice."""
+    raw_payload = {
+        "status": True,
+        "message": "SUCCESS",
+        "errorcode": "",
+        "data": [
+            {
+                "exchange": "NFO",
+                "symboltoken": "53750",
+                "symbolname": "NIFTY",
+                "instrumenttype": "OPTIDX",
+                "strikeprice": "22650.00",
+                "optiontype": "CE",
+                "expirydate": "03NOV2026",
+                "netqty": "65",
+                "cfbuyqty": "65",
+                "cfsellqty": "0",
+                "cfbuyavgprice": "105.50",
+                "buyavgprice": "105.50",
+                "tradingsymbol": "NIFTY03NOV2622650CE",
+                "producttype": "CARRYFORWARD",
+            },
+            {
+                "exchange": "NFO",
+                "symboltoken": "53795",
+                "symbolname": "NIFTY",
+                "instrumenttype": "OPTIDX",
+                "strikeprice": "22800.00",
+                "optiontype": "PE",
+                "expirydate": "03NOV2026",
+                "netqty": "-65",
+                "cfbuyqty": "0",
+                "cfsellqty": "65",
+                "cfbuyavgprice": "0.00",
+                "cfsellavgprice": "140.00",
+                "tradingsymbol": "NIFTY03NOV2622800PE",
+                "producttype": "CARRYFORWARD",
+            },
+        ],
+    }
+    longs, shorts = thu_module.parse_positions(raw_payload)
+    assert len(longs) == 1
+    assert longs[0]["tradingsymbol"] == "NIFTY03NOV2622650CE"
+    assert longs[0]["symboltoken"] == "53750"
+    assert longs[0]["instrument_token"] == "53750"
+    assert longs[0]["quantity"] == 65.0
+    assert longs[0]["average_price"] == 105.50
+    assert longs[0]["product"] == "CARRYFORWARD"
+
+    assert len(shorts) == 1
+    assert shorts[0]["tradingsymbol"] == "NIFTY03NOV2622800PE"
+    assert shorts[0]["symboltoken"] == "53795"
+    assert shorts[0]["quantity"] == -65.0
+
+
 def test_strict_whitelist_authorization_values():
     """Verify that typos like 'treu' or 'maybe' are rejected fail-closed in Thursday script."""
     mock_redis = MagicMock()
@@ -342,8 +398,8 @@ def test_reconcile_cycle_legs_cleans_terminal_leg_keeps_active_leg():
     """Verify that PUT leg with no position and no open order is retired while CALL leg is preserved in Thursday script."""
     mock_redis = MagicMock()
     # Two keys in Redis: CALL and PUT
-    call_key = "fno:upstox:enabled:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750"
-    put_key = "fno:upstox:enabled:thu:NIFTY:03NOV26:22800:PE:NIFTY03NOV2622800PE:NSE_FO_53795"
+    call_key = "fno:angelone:enabled:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750"
+    put_key = "fno:angelone:enabled:thu:NIFTY:03NOV26:22800:PE:NIFTY03NOV2622800PE:NSE_FO_53795"
 
     mock_redis.scan_iter.return_value = [call_key, put_key]
     mock_redis.get.return_value = "1"
@@ -371,7 +427,7 @@ def test_reconcile_cycle_legs_cleans_terminal_leg_keeps_active_leg():
     }]
 
     with patch.object(thu_module, "_cleanup_thursday_leg_state") as mock_cleanup:
-        cleaned = thu_module.reconcile_cycle_legs(mock_redis, positions, orders, broker="upstox", cycle="thu", tag="THU-SL")
+        cleaned = thu_module.reconcile_cycle_legs(mock_redis, positions, orders, broker="angelone", cycle="thu", tag="THU-SL")
 
         # PUT key was cleaned up because position is 0 and no open order exists
         assert len(cleaned) == 1
@@ -385,7 +441,7 @@ def test_reconcile_cycle_legs_cleans_terminal_leg_keeps_active_leg():
 def test_get_access_token_checks_redis_and_env():
     """Verify Thursday get_access_token checks Redis keys before falling back to env."""
     mock_redis = MagicMock()
-    mock_redis.get.side_effect = lambda k: "token_from_redis" if k == "upstox_access_token" else None
+    mock_redis.get.side_effect = lambda k: json.dumps({"jwtToken": "token_from_redis"}) if k == "angelone_jwt_feed" else None
 
     with patch.object(thu_module, "get_redis_client", return_value=mock_redis), \
          patch.dict("os.environ", {}, clear=True):
@@ -394,9 +450,9 @@ def test_get_access_token_checks_redis_and_env():
 
 
 def test_canonical_key_authorizes_thursday_position():
-    """Verify that canonical key fno:upstox:enabled:thu:2026-11-03:22650:CE authorizes the position without token."""
+    """Verify that canonical key fno:angelone:enabled:thu:2026-11-03:22650:CE authorizes the position without token."""
     mock_redis = MagicMock()
-    canonical_key = "fno:upstox:enabled:thu:2026-11-03:22650:CE"
+    canonical_key = "fno:angelone:enabled:thu:2026-11-03:22650:CE"
     mock_redis.get.side_effect = lambda k: json.dumps({"enabled": True, "qty": 65}) if k == canonical_key else None
 
     positions = [{
@@ -426,7 +482,7 @@ def test_canonical_key_authorizes_thursday_position():
 def test_reconcile_cycle_legs_blocks_retiring_leg_with_short_position_thu():
     """Verify reconcile_cycle_legs NEVER deletes Redis state if a short position exists for that leg in Thursday."""
     mock_redis = MagicMock()
-    call_key = "fno:upstox:enabled:thu:2026-11-03:22650:CE"
+    call_key = "fno:angelone:enabled:thu:2026-11-03:22650:CE"
     mock_redis.scan_iter.return_value = [call_key]
     mock_redis.get.return_value = "1"
 
@@ -444,7 +500,7 @@ def test_reconcile_cycle_legs_blocks_retiring_leg_with_short_position_thu():
             mock_redis,
             long_positions,
             orders,
-            broker="upstox",
+            broker="angelone",
             cycle="thu",
             tag="THU-SL",
             short_positions=short_positions,
@@ -457,7 +513,7 @@ def test_reconcile_cycle_legs_blocks_retiring_leg_with_short_position_thu():
 def test_two_expiries_at_same_strike_only_authorizes_target_expiry_thu():
     """Verify that having two expiries at the same strike only authorizes the target expiry in Thursday."""
     mock_redis = MagicMock()
-    target_key = "fno:upstox:enabled:thu:2026-11-03:22650:CE"
+    target_key = "fno:angelone:enabled:thu:2026-11-03:22650:CE"
     mock_redis.get.side_effect = lambda k: json.dumps({"enabled": True, "qty": 65}) if k == target_key else None
 
     positions = [
@@ -504,8 +560,8 @@ def test_two_expiries_at_same_strike_only_authorizes_target_expiry_thu():
 def test_disabled_canonical_key_does_not_fall_through_to_detailed_key_thu():
     """Verify canonical authority in Thursday: disabled canonical key must NOT fall through to enabled detailed key."""
     mock_redis = MagicMock()
-    canonical_key = "fno:upstox:enabled:thu:2026-11-03:22650:CE"
-    detailed_key = "fno:upstox:enabled:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750"
+    canonical_key = "fno:angelone:enabled:thu:2026-11-03:22650:CE"
+    detailed_key = "fno:angelone:enabled:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750"
 
     def redis_get(k):
         if k == canonical_key:
@@ -542,9 +598,9 @@ def test_disabled_canonical_key_does_not_fall_through_to_detailed_key_thu():
 def test_reconcile_cycle_legs_purges_matching_trailing_keys_thu():
     """Verify reconcile_cycle_legs purges all detailed trailing keys when retiring a closed canonical leg in Thursday."""
     mock_redis = MagicMock()
-    call_key = "fno:upstox:enabled:thu:2026-11-03:22650:CE"
-    trail_max = "fno:upstox:trail:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750:max"
-    trail_sl = "fno:upstox:trail:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750:sl"
+    call_key = "fno:angelone:enabled:thu:2026-11-03:22650:CE"
+    trail_max = "fno:angelone:trail:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750:max"
+    trail_sl = "fno:angelone:trail:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750:sl"
 
     def scan_mock(pattern, count=30):
         if "enabled" in pattern:
@@ -562,7 +618,7 @@ def test_reconcile_cycle_legs_purges_matching_trailing_keys_thu():
         mock_redis,
         positions=[],
         orders=[],
-        broker="upstox",
+        broker="angelone",
         cycle="thu",
         tag="THU-SL",
     )
@@ -578,13 +634,13 @@ def test_reconcile_cycle_legs_purges_only_target_expiry_trailing_keys():
     """Verify that retiring an older expiry strictly preserves the trailing state of another active expiry at the same strike for Thursday."""
     mock_redis = MagicMock()
     # Expiring / closed contract: 03-Nov-2026
-    target_key = "fno:upstox:enabled:thu:2026-11-03:22650:CE"
-    target_trail_max = "fno:upstox:trail:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750:max"
-    target_trail_sl = "fno:upstox:trail:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750:sl"
+    target_key = "fno:angelone:enabled:thu:2026-11-03:22650:CE"
+    target_trail_max = "fno:angelone:trail:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750:max"
+    target_trail_sl = "fno:angelone:trail:thu:NIFTY:03NOV26:22650:CE:NIFTY03NOV2622650CE:NSE_FO_53750:sl"
 
     # Separate future active contract: 10-Nov-2026
-    future_trail_max = "fno:upstox:trail:thu:NIFTY:10NOV26:22650:CE:NIFTY10NOV2622650CE:NSE_FO_53800:max"
-    future_trail_sl = "fno:upstox:trail:thu:NIFTY:10NOV26:22650:CE:NIFTY10NOV2622650CE:NSE_FO_53800:sl"
+    future_trail_max = "fno:angelone:trail:thu:NIFTY:10NOV26:22650:CE:NIFTY10NOV2622650CE:NSE_FO_53800:max"
+    future_trail_sl = "fno:angelone:trail:thu:NIFTY:10NOV26:22650:CE:NIFTY10NOV2622650CE:NSE_FO_53800:sl"
 
     def scan_mock(pattern, count=30):
         if "enabled" in pattern:
@@ -603,7 +659,7 @@ def test_reconcile_cycle_legs_purges_only_target_expiry_trailing_keys():
         mock_redis,
         positions=[],
         orders=[],
-        broker="upstox",
+        broker="angelone",
         cycle="thu",
         tag="THU-SL",
     )
@@ -625,10 +681,10 @@ def test_legacy_symbol_4aug_matches_publisher_key():
     """Verify legacy symbol NIFTY4AUG24000CE resolves to publisher key with active strategy expiry for Thursday."""
     mock_redis = MagicMock()
     # Publisher wrote canonical key using active strategy's ISO date
-    publisher_key = "fno:upstox:enabled:thu:2026-08-04:24000:CE"
+    publisher_key = "fno:angelone:enabled:thu:2026-08-04:24000:CE"
     mock_redis.get.side_effect = lambda k: json.dumps({"enabled": True, "qty": 130}) if k == publisher_key else None
 
-    # Upstox broker returned legacy tradingsymbol without year
+    # Broker returned legacy tradingsymbol without year
     positions = [{
         "tradingsymbol": "NIFTY4AUG24000CE",
         "exchange": "NFO",
@@ -659,7 +715,7 @@ def test_legacy_symbol_4aug_matches_publisher_key():
 def test_reconcile_cycle_legs_year_boundary_legacy_symbol():
     """Verify reconcile_cycle_legs does NOT retire a yearless broker position across year boundary (e.g. 4JAN in 2027) for Thursday."""
     mock_redis = MagicMock()
-    canonical_key = "fno:upstox:enabled:thu:2027-01-04:24000:CE"
+    canonical_key = "fno:angelone:enabled:thu:2027-01-04:24000:CE"
     mock_redis.scan_iter.return_value = [canonical_key]
     mock_redis.get.return_value = "1"
 
@@ -677,7 +733,7 @@ def test_reconcile_cycle_legs_year_boundary_legacy_symbol():
         mock_redis,
         positions=positions,
         orders=orders,
-        broker="upstox",
+        broker="angelone",
         cycle="thu",
         tag="THU-SL",
         active_expiry="2027-01-04",
@@ -907,6 +963,230 @@ def test_market_close_blocks_broker_order_mutations():
         mock_place.assert_not_called()
         mock_modify.assert_not_called()
         assert res.get("fatal_error") == "market_closed"
+
+
+def test_unsupported_broker_rejection():
+    """Verify Thursday manager rejects non-AngelOne brokers fail-closed."""
+    with pytest.raises(RuntimeError, match="strictly support 'angelone'"):
+        thu_module.get_access_token(broker="upstox")
+
+    with patch("sys.argv", ["Thursday-Fno-Exit-Orders-V1.py", "--broker", "upstox", "--mock"]):
+        code = thu_module.main()
+        assert code == 1
+
+
+def test_angelone_place_order_slm_payload():
+    """Verify AngelOne place_exit_order_slm constructs valid SmartAPI STOPLOSS payload."""
+    pos = {
+        "tradingsymbol": "NIFTY03NOV2622650CE",
+        "symboltoken": "53750",
+        "exchange": "NFO",
+        "producttype": "CARRYFORWARD",
+    }
+    with patch("requests.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": True, "data": {"orderid": "ANGEL_12345"}}
+        mock_post.return_value = mock_resp
+
+        res = thu_module.place_exit_order_slm(
+            token="JWT_TOKEN",
+            position=pos,
+            target_qty=65,
+            trigger_price=95.50,
+            product="CARRYFORWARD",
+            tag="THU-SL",
+            broker="angelone",
+        )
+        assert res["success"] is True
+        assert res["order_id"] == "ANGEL_12345"
+        mock_post.assert_called_once()
+        _, kwargs = mock_post.call_args
+        payload = kwargs["json"]
+        assert payload["variety"] == "STOPLOSS"
+        assert payload["ordertype"] == "STOPLOSS_MARKET"
+        assert payload["producttype"] == "CARRYFORWARD"
+        assert payload["transactiontype"] == "SELL"
+        assert payload["symboltoken"] == "53750"
+        assert payload["triggerprice"] == "95.50"
+        assert payload["price"] == "0"
+
+
+def test_angelone_order_recognized_via_redis_stored_id_without_tag():
+    """Verify an open order without custom tag THU-SL is recognized as managed via Redis stored order_id."""
+    mock_redis = MagicMock()
+    call_key = "fno:angelone:enabled:thu:2026-11-03:22650:CE"
+
+    def redis_get(k):
+        if k == call_key:
+            return json.dumps({"enabled": True, "qty": 65})
+        if "order_id" in k:
+            return "ANGEL_SL_999"
+        if "sl" in k:
+            return "90.0"
+        if "max" in k:
+            return "110.0"
+        return None
+
+    mock_redis.get.side_effect = redis_get
+    mock_redis.scan_iter.return_value = []
+
+    positions = [{
+        "tradingsymbol": "NIFTY03NOV2622650CE",
+        "exchange": "NFO",
+        "instrument_token": "NSE_FO|53750",
+        "symboltoken": "53750",
+        "quantity": 65,
+        "last_price": 120.0,
+        "average_price": 100.0,
+    }]
+    orders = [{
+        "orderid": "ANGEL_SL_999",
+        "tradingsymbol": "NIFTY03NOV2622650CE",
+        "symboltoken": "53750",
+        "orderstatus": "trigger pending",
+        "transactiontype": "SELL",
+        "ordertype": "STOPLOSS_MARKET",
+        "producttype": "CARRYFORWARD",
+        "quantity": 65,
+        "unfilledshares": 65,
+        "triggerprice": 90.0,
+        "tag": "",
+    }]
+
+    with patch.object(thu_module, "fetch_ltp", return_value=120.0):
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=False,
+            redis_client=mock_redis,
+        )
+
+    assert res["authorized_positions"] == 1
+    assert len(res["actions"]) == 1
+    action = res["actions"][0]
+    assert action["status"] != "manual_sell_conflict"
+    assert action["existing_order_id"] == "ANGEL_SL_999"
+
+
+def test_cycle_isolated_execution_lock_defaults():
+    """Verify Thursday uses isolated lock key fno:lock:exit_order_manager:thursday (Option A)."""
+    assert thu_module.DEFAULT_LOCK_KEY == "fno:lock:exit_order_manager:thursday"
+
+
+def test_parse_order_book_raw_angelone_payload():
+    """Verify parse_order_book normalizes a raw AngelOne SmartAPI orderbook response."""
+    raw_payload = {
+        "status": True,
+        "message": "SUCCESS",
+        "errorcode": "",
+        "data": [
+            {
+                "orderid": "241103000123",
+                "tradingsymbol": "NIFTY03NOV2622650CE",
+                "symboltoken": "53750",
+                "transactiontype": "SELL",
+                "exchange": "NFO",
+                "ordertype": "STOPLOSS_MARKET",
+                "producttype": "CARRYFORWARD",
+                "duration": "DAY",
+                "price": 0.0,
+                "triggerprice": 105.50,
+                "quantity": 65,
+                "filledshares": 0,
+                "unfilledshares": 65,
+                "orderstatus": "trigger pending",
+            }
+        ]
+    }
+    parsed = thu_module.parse_order_book(raw_payload)
+    assert len(parsed) == 1
+    o = parsed[0]
+    assert o["order_id"] == "241103000123"
+    assert o["symboltoken"] == "53750"
+    assert o["instrument_token"] == "53750"
+    assert o["trading_symbol"] == "NIFTY03NOV2622650CE"
+    assert o["transaction_type"] == "SELL"
+    assert o["order_type"] == "STOPLOSS_MARKET"
+    assert o["product"] == "CARRYFORWARD"
+    assert o["quantity"] == 65
+    assert o["pending_quantity"] == 65
+    assert o["trigger_price"] == 105.50
+    assert o["status"] == "trigger pending"
+
+
+def test_parse_order_book_unexpected_shape_raises():
+    """Verify parse_order_book fails closed (raises ValueError) on unexpected response shapes."""
+    # Data is an unexpected object instead of a list
+    with pytest.raises(ValueError, match="Unexpected order book response shape"):
+        thu_module.parse_order_book({"status": False, "data": {"error": "Corrupted structure"}})
+
+    # Non-dict and non-list payload
+    with pytest.raises(ValueError, match="Unexpected order book response shape"):
+        thu_module.parse_order_book("raw_string_error")
+
+
+def test_angelone_modify_order_slm_payload():
+    """Verify AngelOne modify_exit_order_slm constructs valid SmartAPI modifyOrder payload."""
+    order = {
+        "order_id": "ANGEL_12345",
+        "trading_symbol": "NIFTY03NOV2622650CE",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "product": "CARRYFORWARD",
+        "filled_quantity": 0,
+    }
+    with patch("requests.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": True, "data": {"orderid": "ANGEL_12345"}}
+        mock_post.return_value = mock_resp
+
+        res = thu_module.modify_exit_order_slm(
+            token="JWT_TOKEN",
+            order=order,
+            target_qty=65,
+            trigger_price=105.50,
+            tag="THU-SL",
+            broker="angelone",
+        )
+        assert res["success"] is True
+        assert res["order_id"] == "ANGEL_12345"
+        mock_post.assert_called_once()
+        _, kwargs = mock_post.call_args
+        payload = kwargs["json"]
+        assert payload["variety"] == "STOPLOSS"
+        assert payload["orderid"] == "ANGEL_12345"
+        assert payload["ordertype"] == "STOPLOSS_MARKET"
+        assert payload["producttype"] == "CARRYFORWARD"
+        assert payload["triggerprice"] == "105.50"
+        assert payload["quantity"] == "65"
+        assert payload["symboltoken"] == "53750"
+
+
+def test_angelone_cancel_order_payload():
+    """Verify AngelOne cancel_order constructs valid SmartAPI cancelOrder payload."""
+    with patch("requests.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": True, "message": "SUCCESS"}
+        mock_post.return_value = mock_resp
+
+        res = thu_module.cancel_order(
+            token="JWT_TOKEN",
+            order_id="ANGEL_ORPHAN_999",
+            broker="angelone",
+        )
+        assert res["success"] is True
+        assert res["order_id"] == "ANGEL_ORPHAN_999"
+        mock_post.assert_called_once()
+        url = mock_post.call_args[0][0]
+        assert "cancelOrder" in url
+        payload = mock_post.call_args[1]["json"]
+        assert payload["variety"] == "STOPLOSS"
+        assert payload["orderid"] == "ANGEL_ORPHAN_999"
+
 
 
 

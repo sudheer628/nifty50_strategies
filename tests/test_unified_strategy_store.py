@@ -370,7 +370,7 @@ class UnifiedStrategyStoreTests(unittest.TestCase):
         )
         self.assertTrue(res)
 
-        thu_call_key = "fno:upstox:enabled:thu:2026-11-03:23000:CE"
+        thu_call_key = "fno:angelone:enabled:thu:2026-11-03:23000:CE"
         mock_redis.set.assert_any_call(thu_call_key, json.dumps({"enabled": True, "qty": 65}), ex=604800)
         mock_redis.set.assert_any_call("ORDERS_LIVE_THU", "1")
         mock_redis.set.assert_any_call("fno:orders_live:thursday", "1")

@@ -665,7 +665,7 @@ def publish_exit_authorization_to_redis(
     put_exit: bool,
     strategy_data: Dict[str, Any],
     redis_client: Optional[Any] = None,
-    broker: str = "upstox",
+    broker: Optional[str] = None,
 ) -> List[str]:
     """
     Publish canonical Redis authorization keys and activate the fast Redis gate
@@ -691,6 +691,8 @@ def publish_exit_authorization_to_redis(
         return []
 
     cycle = "tue" if normalize_track(track) == "5day_strategy" else "thu"
+    if not broker:
+        broker = "upstox" if cycle == "tue" else "angelone"
     lot_size = int(os.getenv("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
     lots_env = "LOTS_TUESDAY" if cycle == "tue" else "LOTS_THURSDAY"
     default_lots = 2 if cycle == "tue" else 1

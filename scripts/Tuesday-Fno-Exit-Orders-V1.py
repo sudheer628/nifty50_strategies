@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -168,7 +169,7 @@ def is_market_hours_ist(ref_dt: Optional[datetime] = None) -> Tuple[bool, str]:
 @contextmanager
 def fno_execution_lock(
     r,
-    lock_key: str = "fno:lock:exit_order_manager",
+    lock_key: str = "fno:lock:exit_order_manager:tuesday",
     timeout: int = 60,
     retry_delay: float = 0.2,
     max_wait: float = 10.0,
@@ -1510,6 +1511,7 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--execute", action="store_true", help="Place/modify real orders (default: dry-run)")
+    parser.add_argument("--dry-run", action="store_true", help="Explicit dry-run mode (default behavior when --execute is omitted)")
     parser.add_argument("--mock", action="store_true", help="Use built-in offline mock data")
     parser.add_argument("--force", action="store_true", help="Bypass Redis authorization / ORDERS_LIVE checks (testing only)")
     parser.add_argument("--broker", default="upstox", help="Broker adapter (default: upstox)")
@@ -1540,7 +1542,7 @@ def main() -> int:
 
     # 1. Master Environment Gate: Check LIVE_EXIT_TRIGGER_TUESDAY in .env
     live_env_enabled = os.getenv("LIVE_EXIT_TRIGGER_TUESDAY", "false").strip().lower() in ("true", "1", "yes")
-    actual_execute = args.execute and live_env_enabled
+    actual_execute = args.execute and live_env_enabled and not args.dry_run
 
     if args.execute and not live_env_enabled:
         logger.warning(
@@ -1577,29 +1579,27 @@ def main() -> int:
             }, indent=2))
             return 0
 
-    # 3. Dynamic Broker Selection (Only Upstox supported)
-    active_broker = (args.broker or "upstox").lower().strip()
-    if not args.mock and r:
-        active_broker = (r.get("fno:active_broker") or os.getenv("ACTIVE_BROKER", active_broker)).lower().strip()
-
-    if active_broker != "upstox":
-        logger.critical("Broker '%s' is not supported. Tuesday F&O exit orders strictly support 'upstox'.", active_broker)
+    # 3. Dynamic Broker Selection (Strictly Upstox for Tuesday)
+    requested_broker = (args.broker or "upstox").lower().strip()
+    if requested_broker != "upstox":
+        logger.critical("Broker '%s' is not supported. Tuesday F&O exit orders strictly support 'upstox'.", requested_broker)
         print(json.dumps({
             "error": "unsupported_broker",
-            "broker": active_broker,
+            "broker": requested_broker,
             "message": "Only Upstox is supported for Tuesday F&O Exit Orders"
         }, indent=2))
         return 1
+    active_broker = "upstox"
 
-    # 4. Fetch Positions and Orders under Shared Execution Lock
+    # 4. Fetch Positions and Orders under Tuesday Execution Lock
     abort_event = threading.Event()
     with fno_execution_lock(
-        r, lock_key="fno:lock:exit_order_manager", timeout=60, max_wait=10.0, abort_event=abort_event
+        r, lock_key="fno:lock:exit_order_manager:tuesday", timeout=60, max_wait=10.0, abort_event=abort_event
     ) as acquired:
         if not acquired:
             logger.warning(
                 "Could not acquire distributed execution lock '%s' within 10s. Another manager is running. Exiting to avoid concurrent order conflict.",
-                "fno:lock:exit_order_manager"
+                "fno:lock:exit_order_manager:tuesday"
             )
             print(json.dumps({
                 "status": "lock_busy",
