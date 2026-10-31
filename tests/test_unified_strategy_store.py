@@ -25,8 +25,11 @@ class UnifiedStrategyStoreTests(unittest.TestCase):
         self.test_json = os.path.join(os.path.dirname(__file__), "test_active_strategies.json")
         if os.path.exists(self.test_json):
             os.remove(self.test_json)
+        self.env_patcher = patch.dict(os.environ, {"LOTS_TUESDAY": "2", "LOTS_THURSDAY": "1", "NIFTY_LOT_SIZE": "65"})
+        self.env_patcher.start()
 
     def tearDown(self):
+        self.env_patcher.stop()
         if os.path.exists(self.test_json):
             os.remove(self.test_json)
         lock_file = f"{self.test_json}.lock"
@@ -374,6 +377,38 @@ class UnifiedStrategyStoreTests(unittest.TestCase):
         mock_redis.set.assert_any_call(thu_call_key, json.dumps({"enabled": True, "qty": 65}), ex=604800)
         mock_redis.set.assert_any_call("ORDERS_LIVE_THU", "1")
         mock_redis.set.assert_any_call("fno:orders_live:thursday", "1")
+
+    @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
+    def test_record_exit_signal_custom_lots_tuesday(self, mock_mongo):
+        """Verify Tuesday track respects LOTS_TUESDAY=1 override (65 qty)."""
+        mock_redis = MagicMock()
+        init_or_rotate_cycle(
+            "5day_strategy",
+            {
+                "cycle_id": "CYCLE-TUE-20261027",
+                "call_strike": 22900,
+                "put_strike": 23100,
+                "expiry_date": "2026-11-03",
+            },
+            filepath=self.test_json,
+        )
+
+        with patch.dict(os.environ, {"LOTS_TUESDAY": "1", "NIFTY_LOT_SIZE": "65"}):
+            res = record_exit_signal_and_sync_mongo(
+                "5day_strategy",
+                "alpha_fsm",
+                {
+                    "action": "TAKE_PROFIT_CALL",
+                    "leg": "CALL",
+                    "timestamp": 1700001000,
+                },
+                filepath=self.test_json,
+                redis_client=mock_redis,
+            )
+            self.assertTrue(res)
+
+            call_key = "fno:upstox:enabled:tue:2026-11-03:22900:CE"
+            mock_redis.set.assert_any_call(call_key, json.dumps({"enabled": True, "qty": 65}), ex=604800)
 
     @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
     def test_peak_exit_does_not_publish_redis_authorization(self, mock_mongo):
