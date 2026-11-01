@@ -495,6 +495,12 @@ def update_locked_prices(
     spot: Optional[float] = None,
     timestamp: Optional[int] = None,
     filepath: Optional[str] = None,
+    call_order_id: Optional[str] = None,
+    put_order_id: Optional[str] = None,
+    call_ref_ltp: Optional[float] = None,
+    put_ref_ltp: Optional[float] = None,
+    broker: Optional[str] = None,
+    entry_status: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Record Day 1 locked BUY order prices (baseline anchor) under the active track.
@@ -509,6 +515,57 @@ def update_locked_prices(
     comb_buy = round(c_buy + p_buy, 2)
     s_val = round(float(spot), 2) if spot is not None else None
 
+    is_filled_or_paper = (entry_status in ("FILLED", "PAPER_ENTRY")) if entry_status else (c_buy > 0 and p_buy > 0)
+
+    if not is_filled_or_paper:
+        status_norm = "skipped" if (entry_status and "SKIPPED" in entry_status) else "aborted"
+        with strategy_lock(target):
+            active = load_active_strategies(filepath=target)
+            strat = active.get(norm, {})
+            strat["day1_locked_price"] = None
+            strat["status"] = status_norm
+            if call_order_id:
+                strat["call_order_id"] = str(call_order_id)
+            if put_order_id:
+                strat["put_order_id"] = str(put_order_id)
+            if broker:
+                strat["broker"] = str(broker)
+            if entry_status:
+                strat["entry_status"] = str(entry_status)
+            strat["updated_at_ist"] = _now_ist_str()
+            strat["updated_ts"] = _now_utc_ts()
+            save_active_strategies(active, filepath=target)
+
+        sync_active_cycles_to_mongodb(active)
+
+        event_type = f"ENTRY_{entry_status}" if entry_status else "ENTRY_ABORTED"
+        append_telemetry_log_to_mongodb({
+            "strategy_track": norm,
+            "cycle_id": strat.get("cycle_id"),
+            "timestamp": ts,
+            "time_ist": time_ist,
+            "event_type": event_type,
+            "nifty_spot": s_val,
+            "call_strike": strat.get("call_strike"),
+            "call_ltp": None,
+            "call_buy_price": None,
+            "call_diff_pts": 0.0,
+            "put_strike": strat.get("put_strike"),
+            "put_ltp": None,
+            "put_buy_price": None,
+            "put_diff_pts": 0.0,
+            "combined_ltp": None,
+            "combined_buy_price": None,
+            "combined_pnl_pts": 0.0,
+            "combined_pnl_pct": 0.0,
+            "combined_pnl_inr": 0.0,
+            "exit_signal": None,
+            "exit_details": f"Day 1 BUY Order Not Filled: Status={entry_status or 'ABORTED'} ({broker or 'broker'})",
+            "source": "unified_strategy_store:update_locked_prices",
+        })
+        logger.info("Updated %s unified store with non-entry status '%s'", norm, entry_status)
+        return active
+
     locked_obj = {
         "call_buy_price": c_buy,
         "put_buy_price": p_buy,
@@ -517,11 +574,31 @@ def update_locked_prices(
         "locked_at_ist": time_ist,
         "locked_ts": ts,
     }
+    if call_order_id:
+        locked_obj["call_order_id"] = str(call_order_id)
+    if put_order_id:
+        locked_obj["put_order_id"] = str(put_order_id)
+    if call_ref_ltp is not None:
+        locked_obj["call_ref_ltp"] = round(float(call_ref_ltp), 2)
+    if put_ref_ltp is not None:
+        locked_obj["put_ref_ltp"] = round(float(put_ref_ltp), 2)
+    if broker:
+        locked_obj["broker"] = str(broker)
+    if entry_status:
+        locked_obj["entry_status"] = str(entry_status)
 
     with strategy_lock(target):
         active = load_active_strategies(filepath=target)
         strat = active.get(norm, {})
         strat["day1_locked_price"] = locked_obj
+        if call_order_id:
+            strat["call_order_id"] = str(call_order_id)
+        if put_order_id:
+            strat["put_order_id"] = str(put_order_id)
+        if broker:
+            strat["broker"] = str(broker)
+        if entry_status:
+            strat["entry_status"] = str(entry_status)
         strat["updated_at_ist"] = _now_ist_str()
         strat["updated_ts"] = _now_utc_ts()
         save_active_strategies(active, filepath=target)

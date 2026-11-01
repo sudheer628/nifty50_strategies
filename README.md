@@ -30,12 +30,13 @@ This strategy:
 - Automated post-market weekly close orchestration and HTML/chart reporting
 
 - **Broker-Segregated Live F&O Trailing Stop-Loss Order Execution**: Dedicated exit managers (`Tuesday-Fno-Exit-Orders-V1.py` on Upstox and `Thursday-Fno-Exit-Orders-V1.py` on AngelOne SmartAPI) managing Stop-Loss Market (SL-M) orders, triggered strictly when Alpha FSM exit signals trigger in `sentinel-hermes`
+- **Automated Paired MARKET BUY Strategy Entry**: Collectors (`weekly_option_collector.py` for Tuesday via Upstox, `thursday_option_collector.py` for Thursday via AngelOne) execute paired MARKET BUY orders at strategy start. Includes broker preflight margin checks, back-to-back MARKET submissions, atomic cancel-and-SELL rollback on partial or failed fills, fill price vs reference LTP tracking, and cycle idempotency without Redis dependency.
 
 ### Out of scope
 
-- Real-money entry/BUY order placement (the system strictly manages trailing stop-loss exit orders; all entries are placed manually or via external tools)
-- Live broker margin / funds auto-allocation
 - General equity or cash market order execution
+- Cross-broker fallback (Tuesday is strictly Upstox; Thursday is strictly AngelOne)
+- Stale retry attempts (cycles with insufficient funds are safely skipped rather than retried late)
 
 ---
 
@@ -50,6 +51,7 @@ nifty50_strategies/
 ├── common/
 │   ├── __init__.py
 │   ├── angelone_client.py               # SmartAPI auth + market data fetchers
+│   ├── entry_order_manager.py           # Paired MARKET BUY executor, funds preflight & cancel-and-SELL rollback
 │   ├── expiry.py                        # Expiry resolution + static strike selector
 │   ├── ai_strike_selector.py            # Dynamic AI strike selector (VIX, ATR, Greeks)
 │   ├── calendar_utils.py                # Holiday detection via Upstox API & cycle calendar
@@ -1109,3 +1111,74 @@ This project interacts with external brokerage, AI, database, and email services
 
 
 
+
+---
+
+## 17. Automated Paired MARKET BUY Strategy Entry
+
+Automated paired MARKET BUY execution runs at the fresh strategy entry point managed by the collector scripts:
+- **Tuesday 5-Day Strategy**: Strictly routed to **Upstox** (`weekly_option_collector.py`).
+- **Thursday 3-Day Strategy**: Strictly routed to **AngelOne SmartAPI** (`thursday_option_collector.py`).
+- **Separation of Concerns**: Entry BUY order placement belongs strictly to collector scripts, while exit managers (`Tuesday-Fno-Exit-Orders-V1.py` and `Thursday-Fno-Exit-Orders-V1.py`) manage trailing / immediate exits only after Alpha FSM signals trigger.
+
+### 17.1. Activation Flags & Broker Routing
+
+Live BUY execution requires explicit activation via environment variable or CLI flag:
+- **Tuesday**: `LIVE_BUY_TRIGGER_TUESDAY=true` in `.env` OR `--execute-buy` CLI flag. Pinned strictly to **Upstox**.
+- **Thursday**: `LIVE_BUY_TRIGGER_THURSDAY=true` in `.env` OR `--execute-buy` CLI flag. Pinned strictly to **AngelOne**.
+- **CLI Precedence**:
+  - `--execute-buy`: Explicitly forces live broker BUY placement regardless of `.env`.
+  - `--no-execute-buy`: Explicitly forces paper mode regardless of `.env`.
+  - Flag omitted: Automatically defers to `LIVE_BUY_TRIGGER_TUESDAY` / `LIVE_BUY_TRIGGER_THURSDAY` in `.env`.
+- **Alert Decoupling**: Passing `--no-alert` (Tuesday) or `--dry-run` (Thursday) suppresses external Discord milestone notifications only; it does **not** suppress live broker order placement.
+
+```bash
+# Tuesday Live Paired Entry
+python strategies/weekly_option_collector.py --execute-buy
+
+# Thursday Live Paired Entry
+python strategies/thursday_option_collector.py --execute-buy
+```
+
+### 17.2. Preflight Margin Verification
+
+Before submitting either order, preflight_entry verifies:
+1. Both option contracts, quantities, and reference LTPs (> 0).
+2. Order quantity must be a positive integer multiple of NIFTY lot size (quantity % NIFTY_LOT_SIZE == 0). Non-lot multiples (e.g. 50 or 100) are rejected upfront.
+3. Upstox instrument keys must genuinely resolve to active broker keys starting with NSE_FO|; placeholder keys (NIFTY_...) are rejected upfront.
+4. Available broker funds via live RMS / funds API (/v2/user/get-funds-and-margin on Upstox; /rest/secure/angelbroking/user/v1/getRMS on AngelOne).
+5. Required funds scaled with lot quantity:
+   - Configurable premium buffer: 5% default (BUY_BUFFER_PCT=0.05).
+   - Default estimated charges: ₹40.0 per lot (BUY_ESTIMATED_CHARGES=40.0).
+6. **Insufficient Funds Rule**: If available funds are below required funds, **neither order is placed**, and the cycle is marked SKIPPED_INSUFFICIENT_FUNDS in local JSON, SQLite, unified active_strategies.json, and MongoDB Atlas.
+
+### 17.3. Back-to-Back Submission & Atomic Rollback Safeguard
+
+- **Back-to-Back Submission**: CALL and PUT are submitted as separate MARKET BUY requests without waiting for the first leg to fill.
+- **Strict Average Fill Price Verification**: Confirmed fills must report actual average_price > 0. If average_price is missing or <= 0, the executor strictly refuses to fabricate an execution price via LTP fallback, initiating immediate rollback.
+- **Atomic Rollback Guarantee**: The pair is successful only when **both legs are fully filled**. If either leg is rejected, incomplete, or partially filled after timeout:
+  1. The collector immediately requests cancellation of open BUY orders and **polls until BUY orders reach terminal broker status** (cancelled, 
+ejected, or complete), ensuring in-flight fills are never missed.
+  2. For any quantity already filled on either leg, the collector submits an immediate **MARKET SELL** for the exact filled quantity to unwind the incomplete pair.
+  3. **Fill Confirmation via Order Book Polling**: The collector polls the order book to confirm that all recovery MARKET SELL orders reach terminal status complete with 100% of the unwound quantity filled.
+  4. **Broker Position Flatness Verification**: Queries the broker position API (/v2/portfolio/short-term-positions on Upstox; /rest/secure/angelbroking/order/v1/getPosition on AngelOne) to verify that net positions for both CALL and PUT are strictly zero (zero net exposure: no residual long > 0 and no accidental short < 0).
+  5. **Emergency Unwind Failure Alerting**: If BUY cancellation times out, recovery SELLs fail or do not fill completely, or residual broker positions remain non-zero (long or short), the cycle is marked **UNWIND_FAILED**, and a critical high-priority Discord alert is immediately dispatched notifying that manual square-off is required.
+  6. If unwinding completes cleanly and positions are verified flat, the cycle is marked **FAILED_ROLLED_BACK**.
+  7. Alpha FSM is **not** initialized for trading on an unwound or aborted cycle.
+  8. The failed attempt is synced to SQLite, active_strategies.json, and MongoDB Atlas.
+
+### 17.4. Fill Price vs Reference LTP Persistence
+
+- Market LTPs at entry are preserved as reference anchors: call_ref_ltp and put_ref_ltp.
+- Actual broker fill prices are saved as call_buy_price and put_buy_price.
+- On aborted or skipped entries, day1_locked_price is set to None (preventing misleading ₹0.0 baseline locks), strategy status is set to skipped or aborted, and discrete telemetry is emitted as ENTRY_<entry_status> (e.g. ENTRY_SKIPPED_INSUFFICIENT_FUNDS, ENTRY_FAILED_ROLLED_BACK, ENTRY_UNWIND_FAILED).
+- Recorded to:
+  - Local JSON snapshot (current_week_buy.json / current_thursday_buy.json).
+  - SQLite strategy_buy_snapshots table with dynamic columns call_order_id, put_order_id, call_ref_ltp, put_ref_ltp, entry_status, broker.
+  - Unified state active_strategies.json and MongoDB Atlas.
+
+### 17.5. Collector Idempotency (Zero Redis Dependency)
+
+Entry state and idempotency guards reside strictly in cycle stores (current_week_buy.json / current_thursday_buy.json, SQLite, and active_strategies.json) without any Redis dependency:
+- Subsequent collector runs on the same start day check week_start_date == today and entry_status.
+- If already in any terminal state (FILLED, SKIPPED_INSUFFICIENT_FUNDS, FAILED_ROLLED_BACK, UNWIND_FAILED, PREFLIGHT_FAILED, AUTH_FAILED, or ABORTED), the collector skips collection cleanly and guarantees **zero duplicate broker order attempts** throughout the day.

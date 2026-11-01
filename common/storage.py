@@ -231,9 +231,31 @@ def init_db(db_path: str) -> None:
             put_extrinsic   REAL    DEFAULT 0.0,
             total_intrinsic REAL    DEFAULT 0.0,
             total_extrinsic REAL    DEFAULT 0.0,
+            call_order_id   TEXT,
+            put_order_id    TEXT,
+            call_ref_ltp    REAL,
+            put_ref_ltp     REAL,
+            entry_status    TEXT    DEFAULT 'COMPLETED',
+            broker          TEXT,
             PRIMARY KEY (strategy_name, cycle_id)
         )
     """)
+
+    # Migrate strategy_buy_snapshots for automated paired buy tracking
+    cur.execute("PRAGMA table_info(strategy_buy_snapshots)")
+    buy_snapshot_columns = {row[1] for row in cur.fetchall()}
+    new_snap_cols = [
+        ("call_order_id", "TEXT"),
+        ("put_order_id", "TEXT"),
+        ("call_ref_ltp", "REAL"),
+        ("put_ref_ltp", "REAL"),
+        ("entry_status", "TEXT DEFAULT 'COMPLETED'"),
+        ("broker", "TEXT"),
+    ]
+    for col_name, col_def in new_snap_cols:
+        if col_name not in buy_snapshot_columns:
+            cur.execute(f"ALTER TABLE strategy_buy_snapshots ADD COLUMN {col_name} {col_def}")
+            logger.info("Added %s column to strategy_buy_snapshots in %s", col_name, db_path)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS gamma_sniper_trades (

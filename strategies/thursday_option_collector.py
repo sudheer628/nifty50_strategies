@@ -54,6 +54,7 @@ from common.calendar_utils import (
 from common.ai_strike_selector import select_strikes
 
 from common.entry_gate import evaluate_entry_gate
+from common.entry_order_manager import TERMINAL_ENTRY_ABORT_STATUSES
 
 from common.angelone_client import (
     get_nifty_spot,
@@ -221,7 +222,7 @@ def _build_record(
     return record
 
 
-def collect_once(force_static: bool = False, force_entry: bool = False, dry_run: bool = False) -> bool:
+def collect_once(force_static: bool = False, force_entry: bool = False, dry_run: bool = False, execute_buy: Optional[bool] = None) -> bool:
     """
     Perform one data collection cycle for the 3-day Thursday track.
 
@@ -245,6 +246,14 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
     today_str = format_expiry_file(today)
 
     active = load_active_snapshot(filepath=THURSDAY_SNAPSHOT_FILE)
+    if active and active.get("week_start_date") == today_str:
+        entry_st = active.get("entry_status")
+        if entry_st in TERMINAL_ENTRY_ABORT_STATUSES or (entry_st and entry_st not in ("FILLED", "PAPER_ENTRY")):
+            logger.info(
+                "[Thursday Track] Cycle for today (%s) has entry_status='%s'. Skipping collection and preventing duplicate entry.",
+                today_str, entry_st
+            )
+            return True
     active_cycle = _active_cycle(active, today)
 
     # ------------------------------------------------------------------
@@ -450,9 +459,108 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         put_buy_price = active_cycle.get("put_buy_price")
         insert_buy_snapshot(db_path, active_cycle)
     else:
+        if active and active.get("week_start_date") == today_str:
+            entry_st = active.get("entry_status")
+            if entry_st in TERMINAL_ENTRY_ABORT_STATUSES or (entry_st and entry_st not in ("FILLED", "PAPER_ENTRY")):
+                logger.info(
+                    "[Thursday Track] Cycle already aborted/skipped for today (%s) with entry_status='%s'. Aborting duplicate entry.",
+                    today_str, entry_st
+                )
+                return True
+
         cycle_id = f"CYCLE-THU-{start_str}"
-        call_buy_price = call_ltp
-        put_buy_price = put_ltp
+
+        # Check if live MARKET BUY entry is enabled (Thursday is strictly AngelOne)
+        env_live_buy = os.getenv("LIVE_BUY_TRIGGER_THURSDAY", "false").strip().lower() in ("true", "1", "yes")
+        is_live_buy = env_live_buy if execute_buy is None else bool(execute_buy)
+
+        call_ref_ltp = call_ltp
+        put_ref_ltp = put_ltp
+        call_order_id = None
+        put_order_id = None
+        entry_status = "PAPER_ENTRY"
+        broker_name = "paper"
+
+        if is_live_buy:
+            from common.entry_order_manager import execute_paired_market_buy, NIFTY_LOT_SIZE
+            from common.angelone_client import resolve_option_token
+            qty = int(os.getenv("STRATEGY_BUY_QTY") or os.getenv("NIFTY_LOT_SIZE") or NIFTY_LOT_SIZE)
+            call_contract = resolve_option_token(expiry_angelone, call_strike, "CE")
+            put_contract = resolve_option_token(expiry_angelone, put_strike, "PE")
+
+            buy_res = execute_paired_market_buy(
+                broker="angelone",
+                call_contract=call_contract,
+                put_contract=put_contract,
+                quantity=qty,
+                call_ltp=call_ltp,
+                put_ltp=put_ltp,
+                tag="THU-BUY",
+            )
+
+            if not buy_res.get("success"):
+                entry_status = buy_res.get("status", "FAILED")
+                logger.critical("[Thursday Track] Paired market entry unsuccessful: %s. State: %s",
+                                buy_res.get("error"), entry_status)
+                abort_snapshot = {
+                    "strategy_name": STRATEGY_NAME_THURSDAY,
+                    "cycle_id": cycle_id,
+                    "week_start_date": start_str,
+                    "expiry_date": expiry_file,
+                    "entry_spot": nifty_ltp,
+                    "call_strike": call_strike,
+                    "put_strike": put_strike,
+                    "call_buy_price": None,
+                    "put_buy_price": None,
+                    "call_ref_ltp": call_ref_ltp,
+                    "put_ref_ltp": put_ref_ltp,
+                    "call_order_id": buy_res.get("call_order_id"),
+                    "put_order_id": buy_res.get("put_order_id"),
+                    "entry_status": entry_status,
+                    "broker": "angelone",
+                    "captured_at": _now_utc_ts(),
+                    "alpha_fsm": None,
+                }
+                save_active_snapshot(abort_snapshot, filepath=THURSDAY_SNAPSHOT_FILE)
+                insert_buy_snapshot(db_path, abort_snapshot)
+                try:
+                    from common.unified_strategy_store import init_or_rotate_cycle, update_locked_prices
+                    init_or_rotate_cycle("3day_strategy", {
+                        "cycle_id": cycle_id,
+                        "start_date": week_start.strftime("%Y-%m-%d"),
+                        "expiry_date": expiry_date.strftime("%Y-%m-%d"),
+                        "call_strike": call_strike,
+                        "put_strike": put_strike,
+                        "moneyness": STRIKE_MONEYNESS_MODE_THURSDAY,
+                        "entry_spot": nifty_ltp,
+                    })
+                    update_locked_prices(
+                        "3day_strategy",
+                        call_buy=0.0,
+                        put_buy=0.0,
+                        spot=nifty_ltp,
+                        timestamp=_now_utc_ts(),
+                        call_order_id=buy_res.get("call_order_id"),
+                        put_order_id=buy_res.get("put_order_id"),
+                        call_ref_ltp=call_ref_ltp,
+                        put_ref_ltp=put_ref_ltp,
+                        broker="angelone",
+                        entry_status=entry_status,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to sync unified 3day_strategy store on entry failure: %s", exc)
+                return entry_status == "SKIPPED_INSUFFICIENT_FUNDS"
+
+            call_buy_price = buy_res["call_buy_price"]
+            put_buy_price = buy_res["put_buy_price"]
+            call_order_id = buy_res.get("call_order_id")
+            put_order_id = buy_res.get("put_order_id")
+            entry_status = "FILLED"
+            broker_name = "angelone"
+        else:
+            call_buy_price = call_ltp
+            put_buy_price = put_ltp
+
         ie = compute_intrinsic_extrinsic(nifty_ltp, call_strike, put_strike, call_buy_price, put_buy_price)
 
         snapshot = {
@@ -465,6 +573,12 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             "put_strike": put_strike,
             "call_buy_price": call_buy_price,
             "put_buy_price": put_buy_price,
+            "call_ref_ltp": call_ref_ltp,
+            "put_ref_ltp": put_ref_ltp,
+            "call_order_id": call_order_id,
+            "put_order_id": put_order_id,
+            "entry_status": entry_status,
+            "broker": broker_name,
             "captured_at": _now_utc_ts(),
             "static_call_strike": static_call_strike,
             "static_put_strike": static_put_strike,
@@ -525,6 +639,12 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 put_buy=put_buy_price,
                 spot=nifty_ltp,
                 timestamp=_now_utc_ts(),
+                call_order_id=call_order_id,
+                put_order_id=put_order_id,
+                call_ref_ltp=call_ref_ltp,
+                put_ref_ltp=put_ref_ltp,
+                broker=broker_name,
+                entry_status=entry_status,
             )
         except Exception as exc:
             logger.warning("Failed to sync unified 3day_strategy store: %s", exc)
@@ -552,7 +672,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
     # ------------------------------------------------------------------
     # Evaluate Decoupled FSM Strategy (Alpha) — mirrors master flow
     # ------------------------------------------------------------------
-    curr_active = load_active_snapshot(filepath=THURSDAY_SNAPSHOT_FILE)
+    curr_active = load_active_snapshot(filepath=THURSDAY_SNAPSHOT_FILE) or {}
     fsm_state = curr_active.get("alpha_fsm")
     if not fsm_state:
         entry_spot_fb = curr_active.get("entry_spot") or curr_active.get("nifty_open") or nifty_ltp
@@ -695,9 +815,23 @@ def main() -> int:
     parser.add_argument("--force-static", action="store_true", help="Bypass AI strike selection; use static rule")
     parser.add_argument("--force-entry", action="store_true", help="Bypass Smart Entry Gate deferral")
     parser.add_argument("--dry-run", action="store_true", help="Do not dispatch external alerts")
+    parser.add_argument(
+        "--execute-buy",
+        "--live-buy",
+        dest="execute_buy",
+        action="store_true",
+        default=None,
+        help="Execute live paired MARKET BUY orders for fresh Thursday cycle",
+    )
+    parser.add_argument(
+        "--no-execute-buy",
+        dest="execute_buy",
+        action="store_false",
+        help="Disable live paired MARKET BUY orders even if LIVE_BUY_TRIGGER_THURSDAY=true",
+    )
     args = parser.parse_args()
 
-    ok = collect_once(force_static=args.force_static, force_entry=args.force_entry, dry_run=args.dry_run)
+    ok = collect_once(force_static=args.force_static, force_entry=args.force_entry, dry_run=args.dry_run, execute_buy=args.execute_buy)
     return 0 if ok else 1
 
 
