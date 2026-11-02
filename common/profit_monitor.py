@@ -12,6 +12,7 @@ order integration (Angel One / Upstox).
 import json
 import logging
 import os
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,11 +29,154 @@ from config import (
     DISCORD_URL,
     DISCORD_EXIT_3DAY,
     DISCORD_EXIT_5DAY,
+    SQLITE_DIR,
 )
 from common.storage import update_active_peak_state
 
 logger = logging.getLogger("nifty50_strategies.profit_monitor")
 tz_ist = pytz.timezone("Asia/Kolkata")
+
+
+def _get_peak_dedup_db_path() -> str:
+    """Return persistent SQLite database path for peak alert deduplication."""
+    custom_path = os.getenv("PEAK_DEDUP_DB_PATH")
+    if custom_path:
+        return custom_path
+    db_dir = SQLITE_DIR or os.getenv("SQLITE_DIR", "/home/ubuntu/sqlite/strategies/")
+    os.makedirs(db_dir, exist_ok=True)
+    return os.path.join(db_dir, "dispatched_peak_alerts.db")
+
+
+def has_peak_alert_dispatched(cycle_id: str, track: str) -> bool:
+    """Check if a peak profit alert has already been dispatched for this cycle and track in SQLite."""
+    if not cycle_id:
+        return False
+    try:
+        db_path = _get_peak_dedup_db_path()
+        conn = sqlite3.connect(db_path, timeout=10.0)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dispatched_peak_alerts (
+                    cycle_id TEXT NOT NULL,
+                    track TEXT NOT NULL,
+                    dispatched_ts INTEGER NOT NULL,
+                    pnl_pct REAL,
+                    pnl_pts REAL,
+                    PRIMARY KEY (cycle_id, track)
+                )
+                """
+            )
+            cur = conn.execute(
+                "SELECT 1 FROM dispatched_peak_alerts WHERE cycle_id = ? AND track = ?",
+                (cycle_id, track),
+            )
+            return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("Error checking SQLite peak alert deduplication: %s", e)
+        # Fail-closed: assume already dispatched to avoid duplicate alert storms on DB errors
+        return True
+
+
+def claim_peak_alert_dispatch(cycle_id: str, track: str, ts: int, pnl_pct: float, pnl_pts: float) -> bool:
+    """
+    Atomically claim the peak alert dispatch in SQLite using INSERT.
+    Returns True if successfully claimed (first caller).
+    Returns False if already claimed or on database error (fail-closed).
+    """
+    if not cycle_id:
+        return False
+    try:
+        db_path = _get_peak_dedup_db_path()
+        conn = sqlite3.connect(db_path, timeout=10.0)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dispatched_peak_alerts (
+                    cycle_id TEXT NOT NULL,
+                    track TEXT NOT NULL,
+                    dispatched_ts INTEGER NOT NULL,
+                    pnl_pct REAL,
+                    pnl_pts REAL,
+                    PRIMARY KEY (cycle_id, track)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO dispatched_peak_alerts (cycle_id, track, dispatched_ts, pnl_pct, pnl_pts)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (cycle_id, track, ts, pnl_pct, pnl_pts),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # Already dispatched / claimed
+            return False
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("Error in atomic claim for SQLite peak alert deduplication: %s", e)
+        # Fail-closed
+        return False
+
+
+def release_peak_alert_claim(cycle_id: str, track: str) -> None:
+    """Release atomic peak alert claim if Discord delivery fails."""
+    if not cycle_id:
+        return
+    try:
+        db_path = _get_peak_dedup_db_path()
+        conn = sqlite3.connect(db_path, timeout=10.0)
+        try:
+            conn.execute(
+                "DELETE FROM dispatched_peak_alerts WHERE cycle_id = ? AND track = ?",
+                (cycle_id, track),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Error releasing SQLite peak alert claim: %s", e)
+
+
+def record_peak_alert_dispatched(cycle_id: str, track: str, ts: int, pnl_pct: float, pnl_pts: float) -> bool:
+    """Record that a peak profit alert has been dispatched for this cycle and track in SQLite."""
+    if not cycle_id:
+        return False
+    try:
+        db_path = _get_peak_dedup_db_path()
+        conn = sqlite3.connect(db_path, timeout=10.0)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dispatched_peak_alerts (
+                    cycle_id TEXT NOT NULL,
+                    track TEXT NOT NULL,
+                    dispatched_ts INTEGER NOT NULL,
+                    pnl_pct REAL,
+                    pnl_pts REAL,
+                    PRIMARY KEY (cycle_id, track)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO dispatched_peak_alerts (cycle_id, track, dispatched_ts, pnl_pct, pnl_pts)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (cycle_id, track, ts, pnl_pct, pnl_pts),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Error recording SQLite peak alert deduplication: %s", e)
+        return False
 
 
 def _get_ist_date_str(ts: Optional[int] = None) -> str:
@@ -123,16 +267,36 @@ def evaluate_peak_profit(
         current_ts = int(datetime.now(timezone.utc).timestamp())
 
     today_ist = _get_ist_date_str(current_ts)
-    pnl = calculate_strangle_pnl(call_buy, call_ltp, put_buy, put_ltp)
+
+    alpha_fsm = snapshot.get("alpha_fsm") or {}
+    call_leg_data = alpha_fsm.get("call_leg") or {}
+    put_leg_data = alpha_fsm.get("put_leg") or {}
+
+    call_raw_status = f"{call_leg_data.get('status', '')} {call_leg_data.get('state', '')}".upper()
+    put_raw_status = f"{put_leg_data.get('status', '')} {put_leg_data.get('state', '')}".upper()
+
+    call_is_closed = bool(call_leg_data.get("exit_price") is not None or "CLOSED" in call_raw_status)
+    put_is_closed = bool(put_leg_data.get("exit_price") is not None or "CLOSED" in put_raw_status)
+
+    effective_call_ltp = float(call_leg_data["exit_price"]) if call_is_closed and call_leg_data.get("exit_price") is not None else call_ltp
+    effective_put_ltp = float(put_leg_data["exit_price"]) if put_is_closed and put_leg_data.get("exit_price") is not None else put_ltp
+
+    pnl = calculate_strangle_pnl(call_buy, effective_call_ltp, put_buy, effective_put_ltp)
     combined_pnl_pts = pnl["combined_pnl_pts"]
     combined_pnl_pct = pnl["combined_pnl_pct"]
     combined_pnl_inr = pnl["combined_pnl_inr"]
 
     peak_state = snapshot.get("peak_profit")
     cycle_id = snapshot.get("cycle_id")
+    track_slug = track or ("thursday" if ("3" in str(track_label).lower() or "thu" in str(track_label).lower()) else "weekly")
+    if not cycle_id:
+        ws = snapshot.get("week_start_date") or today_ist.replace("-", "")
+        cycle_id = f"CYCLE-{'THU' if track_slug == 'thursday' else 'TUE'}-{ws}"
 
     def _persist_peak(state_to_save: dict) -> None:
         update_active_peak_state(state_to_save, filepath=snapshot_filepath)
+
+    already_dispatched = has_peak_alert_dispatched(cycle_id, track_slug)
 
     # Baseline initialization on first run or when peak_profit not yet recorded
     if not peak_state:
@@ -142,17 +306,19 @@ def evaluate_peak_profit(
             "peak_pnl_pct": combined_pnl_pct,
             "peak_pnl_inr": combined_pnl_inr,
             "peak_timestamp": current_ts,
-            "last_notified_pts": None,
-            "last_notified_pct": None,
-            "last_notified_timestamp": None,
-            "alerts_sent_today": 0,
+            "last_notified_pts": combined_pnl_pts if already_dispatched else None,
+            "last_notified_pct": combined_pnl_pct if already_dispatched else None,
+            "last_notified_timestamp": current_ts if already_dispatched else None,
+            "alerts_sent_today": 1 if already_dispatched else 0,
             "last_alert_date": today_ist,
-            "alert_dispatched": False,
+            "alert_dispatched": already_dispatched,
         }
         _persist_peak(peak_state)
+        if already_dispatched:
+            return peak_state, False, f"Peak profit alert already dispatched for cycle '{cycle_id}'. Suppressed on baseline init."
         return peak_state, False, "Baseline established at cycle order lock"
 
-    if cycle_id and "cycle_id" not in peak_state:
+    if "cycle_id" not in peak_state or not peak_state.get("cycle_id"):
         peak_state["cycle_id"] = cycle_id
 
     # Reset daily alert counter if day rolled over in IST
@@ -160,6 +326,44 @@ def evaluate_peak_profit(
         peak_state["alerts_sent_today"] = 0
         peak_state["last_alert_date"] = today_ist
         _persist_peak(peak_state)
+
+    # Single-alert policy: only one peak profit alert (>=20%) is sent per cycle.
+    # Check BOTH in-memory/JSON snapshot AND persistent SQLite deduplication database.
+    # Self-healing migration: Seed SQLite from JSON snapshot immediately BEFORE any early returns
+    # so that cycles where profit pulls back from peak (e.g. 248 pts < 257 peak) are seeded reliably!
+    last_notified_pts = peak_state.get("last_notified_pts")
+    last_notified_pct = peak_state.get("last_notified_pct")
+    json_already_dispatched = (
+        last_notified_pts is not None
+        or bool(peak_state.get("alert_dispatched"))
+    )
+    db_already_dispatched = has_peak_alert_dispatched(cycle_id, track_slug)
+
+    if json_already_dispatched and not db_already_dispatched and not dry_run:
+        record_peak_alert_dispatched(
+            cycle_id=cycle_id,
+            track=track_slug,
+            ts=peak_state.get("last_notified_timestamp") or current_ts,
+            pnl_pct=peak_state.get("last_notified_pct") or combined_pnl_pct,
+            pnl_pts=peak_state.get("last_notified_pts") or combined_pnl_pts,
+        )
+        db_already_dispatched = True
+
+    if json_already_dispatched or db_already_dispatched:
+        previous_peak_pts = peak_state.get("peak_pnl_pts", -999999.0)
+        if combined_pnl_pts > previous_peak_pts:
+            peak_state["peak_pnl_pts"] = combined_pnl_pts
+            peak_state["peak_pnl_pct"] = combined_pnl_pct
+            peak_state["peak_pnl_inr"] = combined_pnl_inr
+            peak_state["peak_timestamp"] = current_ts
+        peak_state["alert_dispatched"] = True
+        peak_state["cycle_id"] = cycle_id
+        _persist_peak(peak_state)
+        return (
+            peak_state,
+            False,
+            f"Peak profit alert already dispatched for cycle '{cycle_id}' (+{last_notified_pct or 0.0:.1f}% / +{last_notified_pts or 0.0:.1f} pts). Single-alert policy suppresses expansion alerts.",
+        )
 
     if is_first_tick:
         # First tick of cycle lock establishes initial baseline
@@ -218,18 +422,18 @@ def evaluate_peak_profit(
 
     alerts_today = peak_state.get("alerts_sent_today", 0)
 
-    # Single-alert policy: only one peak profit alert (>=20%) is sent per cycle.
-    # Subsequent expansion (+5% or +10 pts) alerts are completely suppressed to eliminate notification spam.
-    last_notified_pts = peak_state.get("last_notified_pts")
-    last_notified_pct = peak_state.get("last_notified_pct")
-
-    if last_notified_pts is not None or peak_state.get("alert_dispatched"):
-        _persist_peak(peak_state)
-        return (
-            peak_state,
-            False,
-            f"Peak profit alert already dispatched for cycle '{cycle_id}' (+{last_notified_pct or 0.0:.1f}% / +{last_notified_pts or 0.0:.1f} pts). Single-alert policy suppresses expansion alerts.",
-        )
+    # Atomic claim in SQLite to eliminate concurrency race condition between parallel runs
+    if not dry_run:
+        claimed = claim_peak_alert_dispatch(cycle_id, track_slug, current_ts, combined_pnl_pct, combined_pnl_pts)
+        if not claimed:
+            peak_state["alert_dispatched"] = True
+            peak_state["cycle_id"] = cycle_id
+            _persist_peak(peak_state)
+            return (
+                peak_state,
+                False,
+                f"Peak profit alert already claimed or dispatched for cycle '{cycle_id}'. Atomic claim prevented duplicate dispatch.",
+            )
 
     # All criteria satisfied: Qualifies for alert!
     prev_notified_pts = peak_state.get("last_notified_pts")
@@ -242,23 +446,26 @@ def evaluate_peak_profit(
     peak_state["last_notified_timestamp"] = current_ts
     peak_state["alerts_sent_today"] = alerts_today + 1
     peak_state["last_alert_date"] = today_ist
+    peak_state["cycle_id"] = cycle_id
 
     _persist_peak(peak_state)
 
     event = {
-        "cycle_id": snapshot.get("cycle_id", "UNKNOWN"),
+        "cycle_id": cycle_id,
         "week_start_date": snapshot.get("week_start_date", ""),
         "expiry_date": snapshot.get("expiry_date", ""),
         "timestamp": current_ts,
         "nifty_ltp": nifty_ltp,
         "call_strike": call_strike,
         "call_buy": call_buy,
-        "call_ltp": call_ltp,
+        "call_ltp": effective_call_ltp,
         "call_pnl_pts": pnl["call_pnl_pts"],
+        "call_is_closed": call_is_closed,
         "put_strike": put_strike,
         "put_buy": put_buy,
-        "put_ltp": put_ltp,
+        "put_ltp": effective_put_ltp,
         "put_pnl_pts": pnl["put_pnl_pts"],
+        "put_is_closed": put_is_closed,
         "combined_pnl_pts": combined_pnl_pts,
         "combined_pnl_pct": combined_pnl_pct,
         "combined_pnl_inr": combined_pnl_inr,
@@ -270,13 +477,14 @@ def evaluate_peak_profit(
         "fsm_total_gainloss": fsm_total_gainloss,
         "dry_run": dry_run,
         "track_label": track_label,
-        "track": track or ("thursday" if ("3" in str(track_label).lower() or "thu" in str(track_label).lower()) else "weekly"),
+        "track": track_slug,
     }
 
     dispatch_ok = on_new_peak(event)
 
     if not dispatch_ok and not dry_run:
-        # Roll back notification state so this peak or next higher peak will be retried on next tick
+        # Release atomic claim so this peak or next higher peak can be retried on next tick
+        release_peak_alert_claim(cycle_id, track_slug)
         peak_state["last_notified_pts"] = prev_notified_pts
         peak_state["last_notified_pct"] = prev_notified_pct
         peak_state["last_notified_timestamp"] = prev_notified_ts
@@ -290,6 +498,7 @@ def evaluate_peak_profit(
         )
 
     peak_state["alert_dispatched"] = True
+    peak_state["cycle_id"] = cycle_id
     _persist_peak(peak_state)
     return peak_state, True, f"Qualifying peak alert triggered (+{combined_pnl_pct:.1f}% / +{combined_pnl_pts:.1f} pts)"
 
@@ -428,20 +637,8 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     call_pnl_sign = "+" if event.get("call_pnl_pts", 0.0) >= 0 else ""
     put_pnl_sign = "+" if event.get("put_pnl_pts", 0.0) >= 0 else ""
     comb_pnl_sign = "+" if event.get("combined_pnl_pts", 0.0) >= 0 else ""
-    track_label = event.get("track_label", "5-Day Tuesday Strategy")
-    if not track_label or track_label == "Weekly Strangle":
-        track_label = "5-Day Tuesday Strategy"
 
-    headline_label = f" [{track_label}]"
-    title_label = f" [{track_label}]"
-
-    headline = (
-        f"🎯 **[PORTFOLIO MILESTONE +20% — NO EXIT]{headline_label} {comb_pnl_sign}{event['combined_pnl_pct']:.1f}% "
-        f"({comb_pnl_sign}{event['combined_pnl_pts']:.1f} pts / ₹{event['combined_pnl_inr']:,.0f})** | NIFTY: {event['nifty_ltp']:.2f}"
-    )
-
-    fsm_str = f" • FSM: `{event['fsm_state']}`" if event.get("fsm_state") else ""
-
+    lot_size = event.get("lot_size", NIFTY_LOT_SIZE)
     call_strike = event.get("call_strike", "N/A")
     call_buy = event.get("call_buy")
     call_ltp = event.get("call_ltp")
@@ -454,59 +651,82 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
     put_buy_str = f"₹{put_buy:.2f}" if put_buy is not None else "N/A"
     put_ltp_str = f"₹{put_ltp:.2f}" if put_ltp is not None else "N/A"
 
+    total_invested_inr = round(((call_buy or 0.0) + (put_buy or 0.0)) * lot_size, 2)
+    call_gain_inr = round(float(event.get("call_pnl_pts", 0.0)) * lot_size, 2)
+    put_gain_inr = round(float(event.get("put_pnl_pts", 0.0)) * lot_size, 2)
+    call_gain_sign = "+" if call_gain_inr >= 0 else ""
+    put_gain_sign = "+" if put_gain_inr >= 0 else ""
+
+    track_label = event.get("track_label", "5-Day Tuesday Strategy")
+    is_thursday = "3" in str(track_label).lower() or "thu" in str(track_label).lower() or event.get("track") == "thursday"
+    track_name = "Thursday Strategy" if is_thursday else "Tuesday Strategy"
+
+    headline = (
+        f"🎯 **20% PEAK {track_name}** | Invested: ₹{total_invested_inr:,.0f} ({lot_size} Qty) | "
+        f"Return: **{comb_pnl_sign}₹{event['combined_pnl_inr']:,.0f} ({comb_pnl_sign}{event['combined_pnl_pct']:.1f}% | {comb_pnl_sign}{event['combined_pnl_pts']:.2f} pts)**"
+    )
+
+    call_is_closed = event.get("call_is_closed", False)
+    put_is_closed = event.get("put_is_closed", False)
+    fsm_state_str = str(event.get("fsm_state") or "").upper()
+    if call_is_closed and put_is_closed:
+        leg_status = "🏁 Both Legs Closed — Cycle Complete"
+    elif fsm_state_str in ("SOLO_CALL", "CALL_ONLY") or "PUT_CLOSED" in fsm_state_str or put_is_closed:
+        leg_status = "⚠️ Closed: PUT | Pending to close: CALL (Monitoring)"
+    elif fsm_state_str in ("SOLO_PUT", "PUT_ONLY") or "CALL_CLOSED" in fsm_state_str or call_is_closed:
+        leg_status = "⚠️ Closed: CALL | Pending to close: PUT (Monitoring)"
+    else:
+        leg_status = "Both legs open (Monitoring)"
+
     embed = {
-        "title": f"🎯 [PORTFOLIO MILESTONE — NO EXIT] NIFTY{title_label} +20% Target Achieved",
-        "description": f"Portfolio high-water mark reached for active cycle `{event.get('cycle_id', 'UNKNOWN')}`{fsm_str}",
+        "title": f"🎯 20% PEAK {track_name} ({comb_pnl_sign}{event['combined_pnl_pct']:.2f}%)",
+        "description": f"Portfolio 20% profit milestone reached for cycle `{event.get('cycle_id', 'UNKNOWN')}`",
         "color": 0x10B981,  # Emerald green
         "fields": [
             {
-                "name": "📊 Combined Peak Profit",
+                "name": "💰 Investment & Return",
                 "value": (
-                    f"**{comb_pnl_sign}{event['combined_pnl_pct']:.2f}%**\n"
-                    f"{comb_pnl_sign}{event['combined_pnl_pts']:.2f} pts  |  **+₹{event['combined_pnl_inr']:,.2f}** ({event.get('lot_size', NIFTY_LOT_SIZE)} Qty)"
+                    f"• Total Invested: **₹{total_invested_inr:,.2f}** ({lot_size} Qty)\n"
+                    f"• Total Return:   **{comb_pnl_sign}₹{event['combined_pnl_inr']:,.2f}** "
+                    f"({comb_pnl_sign}{event['combined_pnl_pct']:.2f}% | {comb_pnl_sign}{event['combined_pnl_pts']:.2f} pts)"
                 ),
                 "inline": False,
             },
             {
                 "name": f"🟢 CALL {call_strike}",
                 "value": (
-                    f"Buy: {call_buy_str}\n"
-                    f"LTP: {call_ltp_str}\n"
-                    f"Gain: `{call_pnl_sign}{event.get('call_pnl_pts', 0.0):.2f} pts`"
+                    f"Buy: {call_buy_str} | {'Exit' if call_is_closed else 'LTP'}: {call_ltp_str}\n"
+                    f"Return: **{call_pnl_sign}{event.get('call_pnl_pts', 0.0):.2f} pts** ({call_gain_sign}₹{call_gain_inr:,.2f})\n"
+                    f"Status: `{'Closed' if call_is_closed else 'Monitoring'}`"
                 ),
                 "inline": True,
             },
             {
                 "name": f"🔴 PUT {put_strike}",
                 "value": (
-                    f"Buy: {put_buy_str}\n"
-                    f"LTP: {put_ltp_str}\n"
-                    f"Gain: `{put_pnl_sign}{event.get('put_pnl_pts', 0.0):.2f} pts`"
+                    f"Buy: {put_buy_str} | {'Exit' if put_is_closed else 'LTP'}: {put_ltp_str}\n"
+                    f"Return: **{put_pnl_sign}{event.get('put_pnl_pts', 0.0):.2f} pts** ({put_gain_sign}₹{put_gain_inr:,.2f})\n"
+                    f"Status: `{'Closed' if put_is_closed else 'Monitoring'}`"
                 ),
                 "inline": True,
             },
             {
-                "name": "📍 Market Context",
-                "value": (
-                    f"NIFTY Spot: **{event['nifty_ltp']:.2f}**\n"
-                    f"Expiry: `{event.get('expiry_date', 'N/A')}`\n"
-                    f"Cycle Start: `{event.get('week_start_date', 'N/A')}`"
-                ),
+                "name": "📌 Leg Status",
+                "value": leg_status,
                 "inline": False,
             },
             {
-                "name": "🏁 Milestone Status & Next Steps",
+                "name": "📍 Market Context",
                 "value": (
-                    "• **Milestone Notification Only**: This alert tracks portfolio high-water mark; **positions remain open** (no broker action required).\n"
-                    "• **Single-Alert Policy**: This is the **only** portfolio peak profit alert for this cycle (expansion alerts are suppressed).\n"
-                    "• **Continuous Price Logging**: Hourly price logging continues automatically until expiry for counterfactual and EoD analysis.\n"
-                    "• **Alpha FSM (Actionable Exits)**: Dynamic leg harvest/stop-loss exit signals operate independently and will alert when actionable exit criteria are met."
+                    f"NIFTY Spot: **{event['nifty_ltp']:.2f}** | "
+                    f"Expiry: `{event.get('expiry_date', 'N/A')}` | "
+                    f"Cycle: `{event.get('cycle_id', 'UNKNOWN')}`"
                 ),
                 "inline": False,
             },
         ],
         "footer": {
-            "text": f"NIFTY 50 Strategy Automated Monitor • {track_label} • Time: {time_ist}"
+            "text": f"NIFTY 50 • {track_name} • Time: {time_ist}"
         },
         "timestamp": datetime.fromtimestamp(event["timestamp"], tz=timezone.utc).isoformat(),
     }

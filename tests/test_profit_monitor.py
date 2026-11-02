@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,10 @@ TS_WED_0930 = int(datetime(2026, 9, 23, 9, 30, tzinfo=IST).timestamp())
 
 class ProfitMonitorTests(unittest.TestCase):
     def setUp(self):
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._temp_db = os.path.join(self._temp_dir.name, 'test_dedup.db')
+        self._env_patch = patch.dict(os.environ, {'PEAK_DEDUP_DB_PATH': self._temp_db})
+        self._env_patch.start()
         self.mock_snapshot = {
             "strategy_name": "nifty50_weekly_option_collector",
             "cycle_id": "20260922-test1234",
@@ -40,6 +45,10 @@ class ProfitMonitorTests(unittest.TestCase):
             "call_buy_price": 100.0,
             "put_buy_price": 100.0,
         }
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self._temp_dir.cleanup()
 
     def test_calculate_strangle_pnl(self):
         pnl = calculate_strangle_pnl(
@@ -392,7 +401,7 @@ class ProfitMonitorTests(unittest.TestCase):
             self.assertEqual(embed["color"], 0x10B981)
             self.assertIn("20260922-test", embed["description"])
             field_names = [f["name"] for f in embed["fields"]]
-            self.assertTrue(any("Combined Peak Profit" in name for name in field_names))
+            self.assertTrue(any("Investment & Return" in name or "Combined Peak Profit" in name for name in field_names))
             self.assertTrue(any("CALL 25000" in name for name in field_names))
             self.assertTrue(any("PUT 24800" in name for name in field_names))
 
@@ -521,14 +530,17 @@ class ProfitMonitorTests(unittest.TestCase):
             self.assertEqual(len(posted), 1)
             payload = posted[0]
 
-            self.assertIn("[PORTFOLIO MILESTONE +20% — NO EXIT]", payload["content"])
+            self.assertIn("20% PEAK Tuesday Strategy", payload["content"])
             embed = payload["embeds"][0]
-            self.assertIn("[PORTFOLIO MILESTONE — NO EXIT]", embed["title"])
-            self.assertIn("+20% Target Achieved", embed["title"])
+            self.assertIn("20% PEAK Tuesday Strategy", embed["title"])
+            self.assertIn("+22.50%", embed["title"])
 
-            status_field = [f for f in embed["fields"] if f["name"] == "🏁 Milestone Status & Next Steps"][0]
-            self.assertIn("Single-Alert Policy", status_field["value"])
-            self.assertIn("Alpha FSM", status_field["value"])
+            invest_field = [f for f in embed["fields"] if f["name"] == "💰 Investment & Return"][0]
+            self.assertIn("Total Invested", invest_field["value"])
+            self.assertIn("Total Return", invest_field["value"])
+
+            status_field = [f for f in embed["fields"] if f["name"] == "📌 Leg Status"][0]
+            self.assertIn("Both legs open", status_field["value"])
 
     @patch("common.profit_monitor.send_peak_alert_discord")
     def test_dry_run_skips_discord_dispatch(self, mock_discord):
@@ -728,6 +740,277 @@ class ProfitMonitorTests(unittest.TestCase):
                         with patch("common.profit_monitor.Path.open", side_effect=lambda *args, **kwargs: open(fake_env, *args, **kwargs)):
                             resolved = resolve_discord_peak_url(track="thursday")
                             self.assertEqual(resolved, "https://discord.com/from-candidate-3day")
+
+
+    def test_reset_snapshot_suppressed_by_sqlite_db(self):
+        """Verify that when a snapshot peak_profit is wiped/reset, existing SQLite DB suppresses repeat alerts."""
+        from common.profit_monitor import record_peak_alert_dispatched, evaluate_peak_profit
+        cycle_id = "CYCLE-THU-20261029"
+        track = "thursday"
+        # Pre-record in SQLite
+        record_peak_alert_dispatched(cycle_id, track, 1793248353, 47.33, 230.79)
+
+        # Snapshot with wiped/null peak_profit
+        reset_snapshot = {
+            "cycle_id": cycle_id,
+            "call_strike": 22600,
+            "put_strike": 22900,
+            "peak_profit": None,
+        }
+
+        with patch("common.profit_monitor.on_new_peak") as mock_on_peak:
+            state, triggered, reason = evaluate_peak_profit(
+                snapshot=reset_snapshot,
+                nifty_ltp=23261.25,
+                call_strike=22600,
+                call_ltp=663.50,
+                call_buy=263.45,
+                put_strike=22900,
+                put_ltp=17.55,
+                put_buy=224.10,
+                track="thursday",
+            )
+            self.assertFalse(triggered)
+            self.assertIn("already dispatched", reason)
+            mock_on_peak.assert_not_called()
+
+    def test_atomic_claim_prevents_duplicate_dispatch(self):
+        """Verify that atomic SQLite claim ensures only one process can claim dispatch."""
+        from common.profit_monitor import claim_peak_alert_dispatch
+        c_id = "CYCLE-TUE-TEST-ATOMIC"
+        trk = "weekly"
+        res1 = claim_peak_alert_dispatch(c_id, trk, 123456, 25.0, 50.0)
+        self.assertTrue(res1)
+        # Second concurrent claim must return False
+        res2 = claim_peak_alert_dispatch(c_id, trk, 123457, 26.0, 52.0)
+        self.assertFalse(res2)
+
+    def test_fsm_solo_call_and_flat_leg_status(self):
+        """Verify that SOLO_CALL maps to PUT closed, and FLAT requires actual closed leg data."""
+        posted = []
+        def mock_post(url, json=None, headers=None, timeout=None):
+            class Resp:
+                status_code = 204
+            posted.append(json)
+            return Resp()
+
+        base_event = {
+            "cycle_id": "20261029-test",
+            "timestamp": TS_TUE_1300,
+            "nifty_ltp": 23260.0,
+            "combined_pnl_pts": 50.0,
+            "combined_pnl_pct": 25.0,
+            "combined_pnl_inr": 3250.0,
+            "call_strike": 22600,
+            "call_buy": 250.0,
+            "call_ltp": 450.0,
+            "call_pnl_pts": 200.0,
+            "put_strike": 22900,
+            "put_buy": 250.0,
+            "put_ltp": 100.0,
+            "put_pnl_pts": -150.0,
+            "track_label": "3-Day Thursday Strategy",
+        }
+
+        with patch.dict(os.environ, {"DISCORD_URL": "https://discord.com/mock"}), \
+             patch("requests.post", side_effect=mock_post):
+            # Case 1: SOLO_CALL -> Closed: PUT | Pending to close: CALL
+            event1 = dict(base_event, fsm_state="SOLO_CALL")
+            send_peak_alert_discord(event1)
+            status_val = [f for f in posted[-1]["embeds"][0]["fields"] if f["name"] == "📌 Leg Status"][0]["value"]
+            self.assertIn("Closed: PUT", status_val)
+            self.assertIn("Pending to close: CALL", status_val)
+
+            # Case 2: SOLO_PUT -> Closed: CALL | Pending to close: PUT
+            event2 = dict(base_event, fsm_state="SOLO_PUT")
+            send_peak_alert_discord(event2)
+            status_val = [f for f in posted[-1]["embeds"][0]["fields"] if f["name"] == "📌 Leg Status"][0]["value"]
+            self.assertIn("Closed: CALL", status_val)
+            self.assertIn("Pending to close: PUT", status_val)
+
+            # Case 3: FLAT with empty legs -> NOT cycle complete
+            event3 = dict(base_event, fsm_state="FLAT", call_is_closed=False, put_is_closed=False)
+            send_peak_alert_discord(event3)
+            status_val = [f for f in posted[-1]["embeds"][0]["fields"] if f["name"] == "📌 Leg Status"][0]["value"]
+            self.assertIn("Both legs open", status_val)
+
+            # Case 4: FLAT with closed legs -> Cycle Complete
+            event4 = dict(base_event, fsm_state="FLAT", call_is_closed=True, put_is_closed=True)
+            send_peak_alert_discord(event4)
+            status_val = [f for f in posted[-1]["embeds"][0]["fields"] if f["name"] == "📌 Leg Status"][0]["value"]
+            self.assertIn("Both Legs Closed — Cycle Complete", status_val)
+
+            # Case 5: FLAT with only ONE closed leg -> Must NOT show Cycle Complete
+            event5 = dict(base_event, fsm_state="FLAT", call_is_closed=True, put_is_closed=False)
+            send_peak_alert_discord(event5)
+            status_val = [f for f in posted[-1]["embeds"][0]["fields"] if f["name"] == "📌 Leg Status"][0]["value"]
+            self.assertNotIn("Cycle Complete", status_val)
+            self.assertIn("Closed: CALL", status_val)
+            self.assertIn("Pending to close: PUT", status_val)
+
+    def test_seeding_sqlite_from_json_snapshot(self):
+        """Verify that when JSON snapshot has alert_dispatched=True, it seeds SQLite so subsequent wipes cannot duplicate."""
+        from common.profit_monitor import evaluate_peak_profit, has_peak_alert_dispatched
+        cycle_id = "CYCLE-SEED-TEST-2026"
+        track = "thursday"
+
+        self.assertFalse(has_peak_alert_dispatched(cycle_id, track))
+
+        json_notified_snapshot = {
+            "cycle_id": cycle_id,
+            "call_strike": 22600,
+            "put_strike": 22900,
+            "peak_profit": {
+                "cycle_id": cycle_id,
+                "alert_dispatched": True,
+                "last_notified_pts": 55.0,
+                "last_notified_pct": 27.5,
+                "last_notified_timestamp": 1793248353,
+                "alerts_sent_today": 1,
+            }
+        }
+
+        # 1. First run: JSON has alert_dispatched=True, SQLite is empty. Must seed SQLite!
+        with patch("common.profit_monitor.on_new_peak") as mock_on_peak:
+            state, triggered, reason = evaluate_peak_profit(
+                snapshot=json_notified_snapshot,
+                nifty_ltp=23261.25,
+                call_strike=22600,
+                call_ltp=663.50,
+                call_buy=263.45,
+                put_strike=22900,
+                put_ltp=17.55,
+                put_buy=224.10,
+                track="thursday",
+                dry_run=False,
+            )
+            self.assertFalse(triggered)
+            self.assertTrue(has_peak_alert_dispatched(cycle_id, track), "SQLite must be seeded from JSON snapshot!")
+            mock_on_peak.assert_not_called()
+
+        # 2. Verify seeding happens even when current profit drops below previous stored peak (e.g. 248 pts < 257.35 pts peak)
+        cycle_id_lower = "CYCLE-SEED-LOWER-THAN-PEAK"
+        snapshot_lower = {
+            "cycle_id": cycle_id_lower,
+            "call_strike": 22600,
+            "put_strike": 22900,
+            "peak_profit": {
+                "cycle_id": cycle_id_lower,
+                "peak_pnl_pts": 257.35,
+                "alert_dispatched": True,
+                "last_notified_pts": 257.35,
+                "last_notified_pct": 52.8,
+                "last_notified_timestamp": 1793248353,
+                "alerts_sent_today": 1,
+            }
+        }
+        with patch("common.profit_monitor.on_new_peak") as mock_on_peak:
+            state, triggered, reason = evaluate_peak_profit(
+                snapshot=snapshot_lower,
+                nifty_ltp=23261.25,
+                call_strike=22600,
+                call_ltp=450.00,  # Profit is lower: 450 + 17.55 - (263.45 + 224.10) = -20 pts < 257.35 peak
+                call_buy=263.45,
+                put_strike=22900,
+                put_ltp=17.55,
+                put_buy=224.10,
+                track="thursday",
+                dry_run=False,
+            )
+            self.assertFalse(triggered)
+            self.assertTrue(has_peak_alert_dispatched(cycle_id_lower, track), "SQLite must be seeded even when current profit < stored peak!")
+            mock_on_peak.assert_not_called()
+
+        # 2. Now wipe JSON peak_profit completely (as happened on server during morning reset)
+        wiped_snapshot = {
+            "cycle_id": cycle_id,
+            "call_strike": 22600,
+            "put_strike": 22900,
+            "peak_profit": None,
+        }
+        with patch("common.profit_monitor.on_new_peak") as mock_on_peak:
+            state2, triggered2, reason2 = evaluate_peak_profit(
+                snapshot=wiped_snapshot,
+                nifty_ltp=23261.25,
+                call_strike=22600,
+                call_ltp=663.50,
+                call_buy=263.45,
+                put_strike=22900,
+                put_ltp=17.55,
+                put_buy=224.10,
+                track="thursday",
+                dry_run=False,
+            )
+            self.assertFalse(triggered2)
+            self.assertIn("already dispatched", reason2)
+            mock_on_peak.assert_not_called()
+
+    def test_alpha_fsm_status_key_recognized(self):
+        """Verify that alpha_fsm status key ('status') is recognized for closed legs."""
+        from common.profit_monitor import evaluate_peak_profit
+        snapshot = {
+            "cycle_id": "CYCLE-STATUS-KEY-TEST",
+            "call_strike": 22600,
+            "put_strike": 22900,
+            "alpha_fsm": {
+                "call_leg": {
+                    "status": "HARVESTED_CLOSED",  # Uses status key instead of state
+                    "exit_price": 500.0,
+                },
+                "put_leg": {
+                    "status": "ACTIVE",
+                    "exit_price": None,
+                }
+            }
+        }
+        state, triggered, reason = evaluate_peak_profit(
+            snapshot=snapshot,
+            nifty_ltp=23200.0,
+            call_strike=22600,
+            call_ltp=999.0,  # Live LTP drifted
+            call_buy=250.0,
+            put_strike=22900,
+            put_ltp=50.0,
+            put_buy=250.0,
+            dry_run=True,
+        )
+        self.assertAlmostEqual(state["peak_pnl_pts"], 50.0, places=1)
+
+    def test_closed_leg_exit_price_preserved(self):
+        """Verify that evaluate_peak_profit preserves closed leg exit_price rather than live fluctuating LTP."""
+        from common.profit_monitor import evaluate_peak_profit
+        snapshot = {
+            "cycle_id": "CYCLE-CLOSED-LEG-TEST",
+            "call_strike": 22600,
+            "put_strike": 22900,
+            "alpha_fsm": {
+                "call_leg": {
+                    "state": "HARVESTED_CLOSED",
+                    "exit_price": 500.0,
+                },
+                "put_leg": {
+                    "state": "ACTIVE",
+                    "exit_price": None,
+                }
+            }
+        }
+        with patch("common.profit_monitor.on_new_peak"):
+            state, triggered, reason = evaluate_peak_profit(
+                snapshot=snapshot,
+                nifty_ltp=23200.0,
+                call_strike=22600,
+                call_ltp=999.0,  # Live LTP drifted to 999.0
+                call_buy=250.0,
+                put_strike=22900,
+                put_ltp=50.0,
+                put_buy=250.0,
+                dry_run=True,
+            )
+            # Call profit should be 500 - 250 = 250 pts (NOT 999 - 250 = 749 pts)
+            # Put profit is 50 - 250 = -200 pts
+            # Combined pts = 250 - 200 = 50 pts
+            # Combined pct = 50 / (250 + 250) = 10.0%
+            self.assertAlmostEqual(state["peak_pnl_pts"], 50.0, places=1)
 
 
 if __name__ == "__main__":
