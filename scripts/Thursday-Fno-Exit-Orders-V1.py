@@ -137,6 +137,15 @@ def set_api_logging(enabled: bool):
     LOG_API = bool(enabled)
 
 
+def _log_api_request(method: str, url: str, headers: Dict[str, Any], payload: Any) -> None:
+    safe_headers = {k: ("***" if k.lower() in _SENSITIVE_HEADERS else v) for k, v in (headers or {}).items()}
+    logger.debug("[API REQ] %s %s | headers: %s | payload: %s", method, url, safe_headers, payload)
+
+
+def _log_api_response(method: str, url: str, resp: Any) -> None:
+    logger.debug("[API RESP] %s %s | status: %s | text: %s", method, url, getattr(resp, "status_code", None), getattr(resp, "text", "")[:300])
+
+
 def is_market_hours_ist(ref_dt: Optional[datetime] = None) -> Tuple[bool, str]:
     """
     Check if current IST time is within NSE equity derivatives trading hours:

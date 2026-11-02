@@ -626,7 +626,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             from common.unified_strategy_store import init_or_rotate_cycle, update_locked_prices
             init_or_rotate_cycle("3day_strategy", {
                 "cycle_id": cycle_id,
-                "start_date": cycle_start_date.strftime("%Y-%m-%d"),
+                "start_date": week_start.strftime("%Y-%m-%d"),
                 "expiry_date": expiry_date.strftime("%Y-%m-%d"),
                 "call_strike": call_strike,
                 "put_strike": put_strike,
