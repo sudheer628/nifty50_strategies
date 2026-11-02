@@ -257,16 +257,40 @@ def evaluate_peak_profit(
     Returns:
         (peak_state, alert_triggered, reason_message)
     """
-    if snapshot.get("status") == "closed":
-        return snapshot.get("peak_profit", {}), False, "Cycle is closed; peak profit evaluation skipped"
-
-    if call_buy is None or put_buy is None:
-        return snapshot.get("peak_profit", {}), False, "Buy prices not locked yet"
-
     if current_ts is None:
         current_ts = int(datetime.now(timezone.utc).timestamp())
 
     today_ist = _get_ist_date_str(current_ts)
+
+    peak_state = snapshot.get("peak_profit") or {}
+    cycle_id = snapshot.get("cycle_id")
+    track_slug = track or ("thursday" if ("3" in str(track_label).lower() or "thu" in str(track_label).lower()) else "weekly")
+    if not cycle_id:
+        ws = snapshot.get("week_start_date") or today_ist.replace("-", "")
+        cycle_id = f"CYCLE-{'THU' if track_slug == 'thursday' else 'TUE'}-{ws}"
+
+    # Self-healing migration: Seed SQLite from JSON snapshot immediately before any early returns.
+    # Even if cycle is closed or profit pulled back, ensure existing dispatched alert is seeded!
+    last_notified_pts = peak_state.get("last_notified_pts")
+    last_notified_pct = peak_state.get("last_notified_pct")
+    json_already_dispatched = (
+        last_notified_pts is not None
+        or bool(peak_state.get("alert_dispatched"))
+    )
+    if json_already_dispatched and not dry_run and not has_peak_alert_dispatched(cycle_id, track_slug):
+        record_peak_alert_dispatched(
+            cycle_id=cycle_id,
+            track=track_slug,
+            ts=peak_state.get("last_notified_timestamp") or current_ts,
+            pnl_pct=peak_state.get("last_notified_pct") or 0.0,
+            pnl_pts=peak_state.get("last_notified_pts") or 0.0,
+        )
+
+    if snapshot.get("status") == "closed":
+        return peak_state, False, "Cycle is closed; peak profit evaluation skipped"
+
+    if call_buy is None or put_buy is None:
+        return peak_state, False, "Buy prices not locked yet"
 
     alpha_fsm = snapshot.get("alpha_fsm") or {}
     call_leg_data = alpha_fsm.get("call_leg") or {}

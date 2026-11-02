@@ -1012,6 +1012,42 @@ class ProfitMonitorTests(unittest.TestCase):
             # Combined pct = 50 / (250 + 250) = 10.0%
             self.assertAlmostEqual(state["peak_pnl_pts"], 50.0, places=1)
 
+    def test_closed_cycle_seeds_dispatched_alert_to_sqlite(self):
+        """Verify that evaluate_peak_profit seeds SQLite even if snapshot status is 'closed'."""
+        from common.profit_monitor import evaluate_peak_profit, has_peak_alert_dispatched
+        cycle_id = "CYCLE-CLOSED-SEED-TEST"
+        track = "weekly"
+        snapshot = {
+            "status": "closed",
+            "cycle_id": cycle_id,
+            "call_strike": 22600,
+            "call_buy_price": 250.0,
+            "put_strike": 22900,
+            "put_buy_price": 250.0,
+            "peak_profit": {
+                "alert_dispatched": True,
+                "last_notified_pts": 120.0,
+                "last_notified_pct": 24.0,
+                "last_notified_timestamp": 1793248000,
+            }
+        }
+        state, triggered, reason = evaluate_peak_profit(
+            snapshot=snapshot,
+            nifty_ltp=23000.0,
+            call_strike=22600,
+            call_ltp=0.0,
+            call_buy=250.0,
+            put_strike=22900,
+            put_ltp=0.0,
+            put_buy=250.0,
+            track=track,
+            dry_run=False,
+        )
+        self.assertFalse(triggered)
+        self.assertIn("closed", reason)
+        self.assertTrue(has_peak_alert_dispatched(cycle_id, track), "Closed cycle must seed dispatched alert to SQLite!")
+
+
 
 if __name__ == "__main__":
     unittest.main()
