@@ -1,6 +1,6 @@
 ---
 name: nifty50-strategies-engineering
-description: Specialized engineering, debugging, and operational workflow for the nifty50_strategies repository on the Ubuntu VM. Enforces prompt-scoped changes, live crontab inspection (crontab -l), production log analysis (/home/ubuntu/logs/), cross-system review of sentinel-hermes and sibling directories, and a strict prohibition on triggering live broker orders.
+description: Specialized engineering, debugging, and operational workflow for the nifty50_strategies repository on the Ubuntu VM. Enforces prompt-scoped changes, live crontab inspection (crontab -l), production log analysis (/home/ubuntu/logs/), cross-system review of sentinel-hermes and sibling directories, pragmatic infrastructure failure assumptions, and a strict prohibition on triggering live broker orders.
 ---
 
 # NIFTY50 Strategies Engineering Workflow
@@ -97,8 +97,9 @@ Verify `cycle_id`, `status` (`"ongoing"` vs `"closed"`), strikes, entry prices, 
 
 ---
 
-## 4. Strict Scope Bounding (Prompt-Driven Only)
+## 4. Strict Scope Bounding & Practical Failure Assumptions
 
+### Step 4.1: Prompt-Driven Scope Only
 - **Make changes strictly as requested in the user prompt**: Do not add unsolicited features, opportunistic refactors, or stylistic churn.
 - **Preserve Business Logic & Risk Invariants**: Unless explicitly directed by the user prompt, DO NOT modify:
   - Strike selection algorithms or grids (50-pt AI grid, 100-pt static fallback).
@@ -107,6 +108,13 @@ Verify `cycle_id`, `status` (`"ongoing"` vs `"closed"`), strikes, entry prices, 
   - Harvest rule (+50% leg profit) or salvage stop rules (-50% ITM / -55% OTM).
   - Peak-profit threshold ($\ge 20\%$) and anti-spam deduplication rules.
   - Track segregation boundaries (Tuesday = Upstox; Thursday = AngelOne SmartAPI).
+
+### Step 4.2: Avoid Over-Engineering Impractical Failure Scenarios
+AI models often become excessively cautious about rare or extreme failure scenarios, adding defensive bloat and speculative fallbacks. In this repository, follow these pragmatic ground rules:
+- **Assume Managed Infrastructure is Operational**: Avoid designing elaborate workarounds, offline queues, or complex multi-tiered fallback cascades for core managed infrastructure being down or unreachable (e.g., **Redis Cloud**, **MongoDB Atlas**, or **OpenRouter API**).
+- **Standard Error Handling is Sufficient**: A straightforward `try...except` block with a clear log message and a safe return (e.g., logging a warning and safely skipping a cycle or falling back to deterministic static strikes) is completely sufficient.
+- **No Defensive Bloat**: Never introduce local queue synchronizers, secondary fallback broker adapters, emergency offline stores, or redundant connection pools to guard against catastrophic cloud outages unless the user prompt explicitly requests them.
+- **Focus on Core Trading Logic**: Dedicate engineering effort to signal accuracy, correct strike math, accurate P&L tracking, and fulfilling the user's specific prompt rather than speculating on catastrophic cloud-provider outages.
 
 ---
 
