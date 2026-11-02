@@ -11,13 +11,15 @@ Usage:
   # Historical simulation / backtest replay mode:
   python -m strategies.opening_straddle_selector --simulate-file /path/to/ticks.json
 """
+from __future__ import annotations
+
 import argparse
 import logging
 import os
 import sys
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from common.angelone_client import (
     get_nifty_spot,
