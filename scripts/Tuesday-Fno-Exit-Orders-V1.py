@@ -73,6 +73,10 @@ from common.fno_keys import (
     normalize_expiry,
     parse_enabled_key,
 )
+from common.entry_order_manager import (
+    dispatch_order_failure_discord,
+    clear_order_failure_cooldown,
+)
 
 try:
     import redis
@@ -410,6 +414,8 @@ def build_trail_redis_keys(
         "details": details,
         "contract_suffix": contract_suffix,
         "expiry_iso": expiry_iso,
+        "symbol": tradingsymbol,
+        "tradingsymbol": tradingsymbol,
     }
 
 
@@ -869,7 +875,7 @@ def _save_trailing_state(r, keys: Dict[str, str], max_val: float, sl_val: float,
         return False
 
 
-def _cleanup_tuesday_leg_state(r, keys: Dict[str, str]) -> None:
+def _cleanup_tuesday_leg_state(r, keys: Dict[str, str], broker: str = "upstox", symbol: Optional[str] = None) -> None:
     """Clean up Redis trailing state and authorization for a closed Tuesday leg."""
     if not r:
         return
@@ -898,6 +904,13 @@ def _cleanup_tuesday_leg_state(r, keys: Dict[str, str]) -> None:
         logger.info("Cleared Redis trailing state & authorization for %s", keys["enabled"])
     except Exception as exc:
         logger.error("Failed to clear Redis leg state: %s", exc)
+
+    # Position confirmed flat/closed: clear failure alert cooldown
+    try:
+        clean_sym = symbol or keys.get("symbol") or keys.get("tradingsymbol") or (keys.get("details") or {}).get("tradingsymbol")
+        clear_order_failure_cooldown(r, broker=broker, track=CYCLE_TRACK, symbol=clean_sym)
+    except Exception as exc:
+        logger.warning("Failed to clear order failure cooldown for closed leg: %s", exc)
 
 
 def _check_and_reset_orders_live_tue(r, broker: str = "upstox", has_short_positions: bool = False) -> bool:
@@ -1038,7 +1051,7 @@ def reconcile_cycle_legs(
         eff_symbol = leg_symbol or f"NIFTY{leg_strike}{leg_opt}"
         eff_token = leg_token or "NOTOKEN"
         leg_keys = build_trail_redis_keys(broker, eff_symbol, eff_token, active_expiry=eff_expiry)
-        _cleanup_tuesday_leg_state(r, leg_keys)
+        _cleanup_tuesday_leg_state(r, leg_keys, broker=broker, symbol=eff_symbol)
 
         # Comprehensive trailing & detailed keys purge restricted strictly to this leg AND expiry
         try:
@@ -1263,7 +1276,7 @@ def manage_tuesday_exit_orders(
         total_broker_qty = int(_to_float(pos.get("quantity")))
         if total_broker_qty <= 0:
             # Position has 0 quantity (closed) -> clean up leg state
-            _cleanup_tuesday_leg_state(r, keys)
+            _cleanup_tuesday_leg_state(r, keys, broker=broker, symbol=symbol)
             _check_and_reset_orders_live_tue(r, broker=broker)
             continue
 
@@ -1435,12 +1448,24 @@ def manage_tuesday_exit_orders(
 
                 cancel_res = cancel_order(token, existing_order_id, broker=broker)
                 if not cancel_res.get("success"):
+                    cancel_err = cancel_res.get("error")
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="SELL_SLM_CANCEL_FAILED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=f"Failed to cancel existing SL-M order {existing_order_id} before market exit: {cancel_err}",
+                        details={"order_id": existing_order_id, "error": cancel_err, "result": cancel_res},
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
                     base = {
                         "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
                         "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
                         "total_broker_qty": total_broker_qty, "status": "cancel_slm_failed",
                         "order_id": existing_order_id, "mode": "immediate",
-                        "error": cancel_res.get("error"), "success": False,
+                        "error": cancel_err, "success": False,
                     }
                     actions.append(base)
                     alerts.append({"severity": "CRITICAL", **base})
@@ -1451,16 +1476,28 @@ def manage_tuesday_exit_orders(
                 fresh_orders = fetch_order_book(token, broker=broker)
                 fresh_existing = next((o for o in fresh_orders if str(o.get("order_id") or o.get("orderid") or "") == existing_order_id), None)
                 if fresh_existing is None:
+                    missing_msg = f"SL-M order {existing_order_id} missing from follow-up order book; deferring market order until terminal confirmation"
                     logger.warning(
                         "[%s] SL-M %s missing from follow-up order book after cancel. Retaining Redis state and deferring market order.",
                         symbol, existing_order_id
+                    )
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="IMMEDIATE_EXIT_BLOCKED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=missing_msg,
+                        details={"order_id": existing_order_id, "status": "cancel_slm_missing"},
+                        redis_client=r,
+                        cooldown_seconds=600,
                     )
                     base = {
                         "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
                         "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
                         "total_broker_qty": total_broker_qty, "status": "cancel_slm_missing",
                         "order_id": existing_order_id, "mode": "immediate",
-                        "reason": f"SL-M order {existing_order_id} missing from follow-up order book; deferring market order until terminal confirmation",
+                        "reason": missing_msg,
                         "success": False,
                     }
                     actions.append(base)
@@ -1491,16 +1528,28 @@ def manage_tuesday_exit_orders(
                     actions.append(base)
                     continue
                 elif fresh_status not in TERMINAL_CANCELLED_STATUSES:
+                    unknown_msg = f"SL-M order {existing_order_id} has unrecognized status '{fresh_status}'; deferring market order until confirmed terminal"
                     logger.warning(
                         "[%s] SL-M %s has unknown/unrecognized status '%s'. Retaining Redis state and deferring market order.",
                         symbol, existing_order_id, fresh_status
+                    )
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="IMMEDIATE_EXIT_BLOCKED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=unknown_msg,
+                        details={"order_id": existing_order_id, "status": "cancel_slm_unknown_status", "broker_status": fresh_status},
+                        redis_client=r,
+                        cooldown_seconds=600,
                     )
                     base = {
                         "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
                         "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
                         "total_broker_qty": total_broker_qty, "status": "cancel_slm_unknown_status",
                         "order_id": existing_order_id, "mode": "immediate",
-                        "reason": f"SL-M order {existing_order_id} has unrecognized status '{fresh_status}'; deferring market order until confirmed terminal",
+                        "reason": unknown_msg,
                         "success": False,
                     }
                     actions.append(base)
@@ -1513,7 +1562,7 @@ def manage_tuesday_exit_orders(
                 remaining_qty = int(_position_quantity(fresh_pos)) if fresh_pos else 0
                 if remaining_qty <= 0:
                     logger.info("[%s] Position flat after SL-M cancellation. Cleaning up.", symbol)
-                    _cleanup_tuesday_leg_state(r, keys)
+                    _cleanup_tuesday_leg_state(r, keys, broker=broker, symbol=symbol)
                     continue
                 managed_qty = min(remaining_qty, leg_target_qty)
 
@@ -1522,16 +1571,28 @@ def manage_tuesday_exit_orders(
             if not existing and stored_order_id:
                 prior_slm = next((o for o in orders if str(o.get("order_id") or o.get("orderid") or "") == stored_order_id), None)
                 if prior_slm is None:
+                    prior_missing_msg = f"Prior managed SL-M {stored_order_id} missing from order book; deferring market order until confirmed terminal"
                     logger.warning(
                         "[%s] Prior managed SL-M %s in Redis is missing from broker order book. Retaining Redis state and deferring market order.",
                         symbol, stored_order_id
+                    )
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="IMMEDIATE_EXIT_BLOCKED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=prior_missing_msg,
+                        details={"order_id": stored_order_id, "status": "cancel_slm_missing"},
+                        redis_client=r,
+                        cooldown_seconds=600,
                     )
                     base = {
                         "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
                         "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
                         "total_broker_qty": total_broker_qty, "status": "cancel_slm_missing",
                         "order_id": stored_order_id, "mode": "immediate",
-                        "reason": f"Prior managed SL-M {stored_order_id} missing from order book; deferring market order until confirmed terminal",
+                        "reason": prior_missing_msg,
                         "success": False,
                     }
                     actions.append(base)
@@ -1562,16 +1623,28 @@ def manage_tuesday_exit_orders(
                     actions.append(base)
                     continue
                 elif prior_slm_status not in TERMINAL_CANCELLED_STATUSES:
+                    prior_unknown_msg = f"Prior managed SL-M {stored_order_id} has unrecognized status '{prior_slm_status}'; deferring market order"
                     logger.warning(
                         "[%s] Prior managed SL-M %s has unknown status '%s'. Retaining Redis state and deferring market order.",
                         symbol, stored_order_id, prior_slm_status
+                    )
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="IMMEDIATE_EXIT_BLOCKED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=prior_unknown_msg,
+                        details={"order_id": stored_order_id, "status": "cancel_slm_unknown_status", "broker_status": prior_slm_status},
+                        redis_client=r,
+                        cooldown_seconds=600,
                     )
                     base = {
                         "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
                         "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
                         "total_broker_qty": total_broker_qty, "status": "cancel_slm_unknown_status",
                         "order_id": stored_order_id, "mode": "immediate",
-                        "reason": f"Prior managed SL-M {stored_order_id} has unrecognized status '{prior_slm_status}'; deferring market order",
+                        "reason": prior_unknown_msg,
                         "success": False,
                     }
                     actions.append(base)
@@ -1631,14 +1704,41 @@ def manage_tuesday_exit_orders(
                     logger.info("[%s] Market orders already filled authorized qty (%d/%d); awaiting flat position confirmation", symbol, total_market_filled, leg_target_qty)
                     continue
 
-                # Case 2: Prior market order was rejected with 0 fills
-                if prior_status == "rejected" and total_market_filled == 0:
+                # Case 2: Prior market order was rejected/cancelled with 0 fills
+                if prior_status in TERMINAL_CANCELLED_STATUSES and total_market_filled == 0:
+                    reject_reason = (
+                        (prior_order or {}).get("status_message")
+                        or (prior_order or {}).get("message")
+                        or (prior_order or {}).get("rejection_reason")
+                        or (prior_order or {}).get("text")
+                        or f"Prior market order {stored_market_id} terminated with status {prior_status}"
+                    )
+                    logger.critical("[%s] In-flight market exit order %s was rejected/cancelled by broker: %s (%s)",
+                                    symbol, stored_market_id, prior_status, reject_reason)
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="SELL_MARKET_TERMINAL_REJECTED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=f"Order {stored_market_id} ({prior_status}): {reject_reason}",
+                        details={
+                            "order_id": stored_market_id,
+                            "broker_status": prior_status,
+                            "symbol": symbol,
+                            "quantity": managed_qty,
+                            "rejection_reason": reject_reason,
+                            "order_data": prior_order,
+                        },
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
                     base = {
                         "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
                         "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
                         "total_broker_qty": total_broker_qty, "status": "market_order_rejected",
                         "order_id": stored_market_id, "mode": "immediate",
-                        "error": f"Prior market order {stored_market_id} was rejected", "success": False,
+                        "error": f"Prior market order {stored_market_id} was {prior_status}: {reject_reason}", "success": False,
                         "product": product_for_position,
                     }
                     actions.append(base)
@@ -1741,6 +1841,17 @@ def manage_tuesday_exit_orders(
                 else:
                     base["error"] = result.get("error")
                     logger.error("[%s] Market order placement failed: %s", symbol, result.get("error"))
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="SELL_MARKET",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=str(result.get("error")),
+                        details=result,
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
             except Exception as exc:
                 base = {
                     "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
@@ -1749,6 +1860,16 @@ def manage_tuesday_exit_orders(
                     "status": "execution_failed", "error": str(exc), "success": False, "mode": "immediate",
                 }
                 logger.error("[%s] Exception during market order placement: %s", symbol, exc)
+                dispatch_order_failure_discord(
+                    broker=broker,
+                    action="SELL_MARKET",
+                    track=CYCLE_TRACK,
+                    symbol=symbol,
+                    quantity=managed_qty,
+                    error_reason=str(exc),
+                    redis_client=r,
+                    cooldown_seconds=600,
+                )
             actions.append(base)
             continue
 
@@ -1809,6 +1930,43 @@ def manage_tuesday_exit_orders(
             "final_stop": round(final_stop, 2), "phase": phase, "existing_order_id": existing_order_id or None,
         }
 
+        # Check if prior SL-M protection order was rejected/cancelled in broker order book
+        if not existing and stored_order_id:
+            prior_slm = next((o for o in orders if str(o.get("order_id") or o.get("orderid") or "") == stored_order_id), None)
+            if prior_slm:
+                prior_status = normalize_order_status(prior_slm.get("status"))
+                prior_filled = order_filled_quantity(prior_slm)
+                if prior_status in TERMINAL_CANCELLED_STATUSES and prior_filled == 0:
+                    reject_reason = (
+                        prior_slm.get("status_message")
+                        or prior_slm.get("message")
+                        or prior_slm.get("rejection_reason")
+                        or prior_slm.get("text")
+                        or f"Prior SL-M protection order {stored_order_id} terminated with status {prior_status}"
+                    )
+                    logger.critical(
+                        "[%s] In-flight SL-M protection order %s was rejected/cancelled by broker: %s (%s)",
+                        symbol, stored_order_id, prior_status, reject_reason
+                    )
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="SELL_SLM_TERMINAL_REJECTED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=f"Protection order {stored_order_id} ({prior_status}): {reject_reason}",
+                        details={
+                            "order_id": stored_order_id,
+                            "broker_status": prior_status,
+                            "symbol": symbol,
+                            "quantity": managed_qty,
+                            "rejection_reason": reject_reason,
+                            "order_data": prior_slm,
+                        },
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+
         # Stop Breached check
         if ltp <= final_stop:
             base.update({
@@ -1867,6 +2025,7 @@ def manage_tuesday_exit_orders(
         # If existing order already satisfies protection and quantity matches, persist state and skip API call
         if existing and not trigger_needs_modify and not quantity_mismatch:
             state_saved = _save_trailing_state(r, keys, new_max, max(final_stop, existing_trigger), avg_price, managed_qty, existing_order_id, entry_order_id)
+            clear_order_failure_cooldown(r, broker=broker, track=CYCLE_TRACK, symbol=symbol)
             base.update({"status": "unchanged", "success": True, "state_saved": state_saved, "reason": "trigger already meets required stop"})
             actions.append(base)
             continue
@@ -1887,9 +2046,32 @@ def manage_tuesday_exit_orders(
                 logger.info("[%s] Successfully executed %s order for %d qty at trigger %.2f (order_id: %s)", symbol, base["status"], managed_qty, final_stop, new_order_id)
             else:
                 logger.error("[%s] Order execution failed: %s", symbol, result.get("error"))
+                act = "SELL_SLM_MODIFY" if existing else "SELL_SLM_PLACE"
+                dispatch_order_failure_discord(
+                    broker=broker,
+                    action=act,
+                    track=CYCLE_TRACK,
+                    symbol=symbol,
+                    quantity=managed_qty,
+                    error_reason=str(result.get("error")),
+                    details=result,
+                    redis_client=r,
+                    cooldown_seconds=600,
+                )
         except Exception as exc:
             base.update({"status": "execution_failed", "error": str(exc), "success": False})
             logger.error("[%s] Exception during order execution: %s", symbol, exc)
+            act = "SELL_SLM_MODIFY" if existing else "SELL_SLM_PLACE"
+            dispatch_order_failure_discord(
+                broker=broker,
+                action=act,
+                track=CYCLE_TRACK,
+                symbol=symbol,
+                quantity=managed_qty,
+                error_reason=str(exc),
+                redis_client=r,
+                cooldown_seconds=600,
+            )
 
         actions.append(base)
 

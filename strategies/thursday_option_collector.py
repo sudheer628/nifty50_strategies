@@ -54,7 +54,11 @@ from common.calendar_utils import (
 from common.ai_strike_selector import select_strikes
 
 from common.entry_gate import evaluate_entry_gate
-from common.entry_order_manager import TERMINAL_ENTRY_ABORT_STATUSES
+from common.entry_order_manager import (
+    TERMINAL_ENTRY_ABORT_STATUSES,
+    dispatch_order_failure_with_retry,
+    retry_pending_order_alerts,
+)
 
 from common.angelone_client import (
     get_nifty_spot,
@@ -229,6 +233,12 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
     Active only on Thursday, Friday, and Monday (or deferred Tuesday close).
     Clean no-op on Tuesday/Wednesday.
     """
+    if not dry_run:
+        try:
+            retry_pending_order_alerts(track="3day_strategy")
+        except Exception as alert_retry_exc:
+            logger.warning("[Thursday Track] Failed to retry pending order alerts: %s", alert_retry_exc)
+
     today = _today_ist()
 
     # Gate 1: Check market holiday or weekend
@@ -502,6 +512,22 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 entry_status = buy_res.get("status", "FAILED")
                 logger.critical("[Thursday Track] Paired market entry unsuccessful: %s. State: %s",
                                 buy_res.get("error"), entry_status)
+                if entry_status != "UNWIND_FAILED":
+                    try:
+                        dispatch_order_failure_with_retry(
+                            notification_id=f"paired-buy:{cycle_id}",
+                            broker="angelone",
+                            action="PAIRED_BUY",
+                            track="3day_strategy",
+                            symbol=f"CALL {call_strike}CE / PUT {put_strike}PE",
+                            quantity=qty,
+                            error_reason=f"[{entry_status}] {buy_res.get('error') or buy_res.get('message')}",
+                            details={"call_ref_ltp": call_ref_ltp, "put_ref_ltp": put_ref_ltp, "metrics": buy_res.get("metrics")},
+                        )
+                    except Exception as notify_exc:
+                        logger.error("[Thursday Track] Failed to dispatch Discord BUY failure alert: %s", notify_exc)
+                else:
+                    logger.info("[Thursday Track] Suppressing generic BUY failure alert; critical UNWIND_FAILED alert was already dispatched.")
                 abort_snapshot = {
                     "strategy_name": STRATEGY_NAME_THURSDAY,
                     "cycle_id": cycle_id,
