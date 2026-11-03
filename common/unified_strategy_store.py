@@ -43,6 +43,8 @@ from config import (
     logger,
     SNAPSHOT_DIR,
     ACTIVE_STRATEGIES_JSON,
+    ACTIVE_SNAPSHOT_FILE,
+    THURSDAY_SNAPSHOT_FILE,
     MONGODB_URI,
     MONGODB_DATABASE,
     MONGODB_COLLECTION_DERIVATIVE_ACTIVE_CYCLES,
@@ -311,6 +313,113 @@ def load_active_strategies(filepath: Optional[str] = None) -> Dict[str, Any]:
         except (json.JSONDecodeError, OSError) as e:
             logger.warning("Could not read %s (%s). Returning default template.", target, e)
             return create_default_active_strategies()
+
+
+def get_active_leg_entry_details(
+    track: str,
+    strike: int,
+    option_type: str,
+    expiry: Optional[str] = None,
+    filepath: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the entry order ID and fill basis owned by one track/option leg.
+
+    Broker position APIs report net positions, which can combine both tracks
+    when they use the same broker and contract. Prefer the per-cycle BUY order
+    ID and locked fill price; never infer this leg's entry from the most recent
+    BUY for the shared symbol.
+    """
+    norm = normalize_track(track)
+    opt = str(option_type or "").upper().strip()
+    if opt not in ("CE", "PE"):
+        return {}
+    prefix = "call" if opt == "CE" else "put"
+    strike_field = f"{prefix}_strike"
+
+    active = load_active_strategies(filepath=filepath)
+    strategy = active.get(norm) or {}
+    active_strike = strategy.get(strike_field)
+    if active_strike is not None and int(active_strike) != int(strike):
+        strategy = {}
+
+    locked = strategy.get("day1_locked_price") or {}
+    details: Dict[str, Any] = {
+        "cycle_id": strategy.get("cycle_id"),
+        "expiry": strategy.get("expiry_date") or strategy.get("expiry"),
+        "broker": strategy.get("broker") or locked.get("broker"),
+        "entry_status": strategy.get("entry_status") or locked.get("entry_status"),
+        "entry_order_id": locked.get(f"{prefix}_order_id") or strategy.get(f"{prefix}_order_id"),
+        "entry_price": locked.get(f"{prefix}_buy_price") or strategy.get(f"{prefix}_buy_price"),
+    }
+
+    # The active snapshot is a compatibility source for cycles restored before
+    # the unified store was initialized or for snapshots not yet bootstrapped.
+    if not details.get("entry_order_id") or not details.get("entry_price") or not details.get("broker"):
+        snapshot_path = ACTIVE_SNAPSHOT_FILE if norm == "5day_strategy" else THURSDAY_SNAPSHOT_FILE
+        try:
+            with open(snapshot_path, "r", encoding="utf-8") as snapshot_file:
+                snapshot = json.load(snapshot_file)
+            if int(snapshot.get(strike_field) or 0) == int(strike):
+                details["cycle_id"] = details.get("cycle_id") or snapshot.get("cycle_id")
+                details["expiry"] = details.get("expiry") or snapshot.get("expiry_date") or snapshot.get("expiry")
+                details["broker"] = details.get("broker") or snapshot.get("broker")
+                details["entry_status"] = details.get("entry_status") or snapshot.get("entry_status")
+                details["entry_order_id"] = details.get("entry_order_id") or snapshot.get(f"{prefix}_order_id")
+                details["entry_price"] = details.get("entry_price") or snapshot.get(f"{prefix}_buy_price")
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    try:
+        details["entry_price"] = float(details.get("entry_price") or 0.0)
+    except (TypeError, ValueError):
+        details["entry_price"] = 0.0
+    details["entry_order_id"] = str(details.get("entry_order_id") or "")
+
+    current_status = str(details.get("entry_status") or "").upper().strip()
+    details["entry_status"] = current_status
+
+    # If both live tracks own this exact contract in the same account, the
+    # broker's net average price and latest BUY are not track-specific.
+    other_track = "3day_strategy" if norm == "5day_strategy" else "5day_strategy"
+    other = active.get(other_track) or {}
+    other_locked = other.get("day1_locked_price") or {}
+    other_entry_status = str(
+        other.get("entry_status") or other_locked.get("entry_status") or ""
+    ).upper().strip()
+    other_broker = other.get("broker") or other_locked.get("broker")
+    other_active_strike = other.get(strike_field)
+    current_broker = details.get("broker")
+    current_expiry = normalize_expiry(expiry or details.get("expiry"))
+    other_expiry = normalize_expiry(other.get("expiry_date") or other.get("expiry"))
+    same_expiry = (
+        current_expiry == other_expiry
+        if current_expiry != "UNKNOWN" and other_expiry != "UNKNOWN"
+        else True
+    )
+    if not current_broker or not other_broker:
+        try:
+            from config import get_broker_for_track
+            current_broker = current_broker or get_broker_for_track(norm)
+            other_broker = other_broker or get_broker_for_track(other_track)
+        except ValueError:
+            pass
+
+    other_status = str(other.get("status") or "").lower().strip()
+    details["same_broker_contract_overlap"] = bool(
+        current_status == "FILLED"
+        and other_entry_status == "FILLED"
+        and other_status not in ("closed", "aborted", "skipped", "pending_entry")
+        and other_broker
+        and current_broker
+        and str(other_broker).lower() == str(current_broker).lower()
+        and other_active_strike is not None
+        and int(other_active_strike) == int(strike)
+        and same_expiry
+    )
+    details["ambiguous_entry_attribution"] = bool(
+        details["same_broker_contract_overlap"] and not details["entry_order_id"]
+    )
+    return details
 
 
 def save_active_strategies(data: Dict[str, Any], filepath: Optional[str] = None) -> None:
@@ -768,8 +877,41 @@ def publish_exit_authorization_to_redis(
         return []
 
     cycle = "tue" if normalize_track(track) == "5day_strategy" else "thu"
+    locked_entry = strategy_data.get("day1_locked_price") or {}
+    entry_status = str(
+        strategy_data.get("entry_status")
+        or locked_entry.get("entry_status")
+        or strategy_data.get("cycle_status")
+        or ""
+    ).upper().strip()
+    if entry_status == "PAPER_ENTRY":
+        logger.info(
+            "Track %s cycle %s has status 'PAPER_ENTRY'. Refusing live exit authorization publishing.",
+            track, strategy_data.get("cycle_id")
+        )
+        return []
+
+    from config import get_broker_for_track, SUPPORTED_BROKERS
+
     if not broker:
-        broker = "upstox" if cycle == "tue" else "angelone"
+        broker = strategy_data.get("broker") or locked_entry.get("broker")
+        if not broker:
+            broker = get_broker_for_track(track)
+
+    broker = str(broker or "").lower().strip()
+    if broker in ("paper", "simulation"):
+        logger.info(
+            "Track %s cycle %s uses paper trading broker '%s'. Refusing live exit authorization publishing.",
+            track, strategy_data.get("cycle_id"), broker
+        )
+        return []
+
+    if broker not in SUPPORTED_BROKERS:
+        logger.error(
+            "Cannot publish exit authorization: broker '%s' is not supported (%s). Failing closed.",
+            broker, SUPPORTED_BROKERS
+        )
+        return []
     lot_size = int(os.getenv("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
     lots_env = "LOTS_TUESDAY" if cycle == "tue" else "LOTS_THURSDAY"
     default_lots = 2 if cycle == "tue" else 1
@@ -929,12 +1071,14 @@ def record_exit_signal_and_sync_mongo(
 
     # Publish Redis exit authorization strictly for Alpha FSM exits
     if cat == "alpha_fsm":
+        strat_broker = strat.get("broker") or (strat.get("day1_locked_price") or {}).get("broker")
         publish_exit_authorization_to_redis(
             track=norm,
             call_exit=call_exit,
             put_exit=put_exit,
             strategy_data=strat,
             redis_client=redis_client,
+            broker=strat_broker,
         )
 
     # Get latest pricing context for event log row

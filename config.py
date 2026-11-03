@@ -42,6 +42,43 @@ for _lib in ("redis", "urllib3", "requests"):
 STRATEGY_NAME = "nifty50_weekly_option_collector"
 STRATEGY_NAME_THURSDAY = "nifty50_thursday_3day_collector"
 
+# ---------------------------------------------------------------------------
+# Configurable Broker Routing per Strategy Cycle
+# ---------------------------------------------------------------------------
+TUESDAY_BROKER = os.getenv("TUESDAY_BROKER", "upstox").lower().strip()
+THURSDAY_BROKER = os.getenv("THURSDAY_BROKER", "angelone").lower().strip()
+SUPPORTED_BROKERS = ("upstox", "angelone")
+
+
+def get_broker_for_track(track: str) -> str:
+    """
+    Resolve and validate the configured broker for a strategy track.
+
+    Accepts:
+      - '5day_strategy', '5day', 'tuesday', 'tue', 'weekly' -> returns TUESDAY_BROKER
+      - '3day_strategy', '3day', 'thursday', 'thu' -> returns THURSDAY_BROKER
+
+    Returns:
+      Normalized broker name ('upstox' or 'angelone').
+
+    Raises:
+      ValueError if track is unrecognized or resolved broker is unsupported.
+    """
+    norm = str(track or "").lower().strip()
+    if norm in ("5day_strategy", "5day", "tuesday", "tue", "weekly"):
+        broker = os.getenv("TUESDAY_BROKER", TUESDAY_BROKER).lower().strip()
+    elif norm in ("3day_strategy", "3day", "thursday", "thu"):
+        broker = os.getenv("THURSDAY_BROKER", THURSDAY_BROKER).lower().strip()
+    else:
+        raise ValueError(f"Unknown strategy track '{track}'. Expected '5day_strategy' or '3day_strategy'.")
+
+    if broker not in SUPPORTED_BROKERS:
+        raise ValueError(
+            f"Unsupported broker '{broker}' configured for track '{track}'. "
+            f"Must be one of {SUPPORTED_BROKERS}."
+        )
+    return broker
+
 
 # ---------------------------------------------------------------------------
 # Trading parameters

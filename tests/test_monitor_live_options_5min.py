@@ -28,7 +28,7 @@ class MonitorLiveOptions5MinTests(unittest.TestCase):
             "status": "active",
             "call_strike": 22900,
             "put_strike": 23100,
-            "expiry_date": "20261102",
+            "expiry_date": "20991231",
             "day1_locked_price": {
                 "combined_buy_price": 460.0,
             },

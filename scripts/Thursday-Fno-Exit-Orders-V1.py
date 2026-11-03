@@ -80,6 +80,14 @@ from common.entry_order_manager import (
     dispatch_order_failure_discord,
     clear_order_failure_cooldown,
 )
+from common.broker_adapters import (
+    get_broker_adapter,
+    round_to_tick,
+    order_filled_quantity,
+    order_pending_quantity,
+    normalize_order_status,
+)
+from config import get_broker_for_track, SUPPORTED_BROKERS, THURSDAY_BROKER
 
 try:
     import redis
@@ -105,7 +113,7 @@ ORDER_TYPE_SL = "STOPLOSS_LIMIT"
 VALIDITY_DAY = "DAY"
 TICK_SIZE = 0.05
 DEFAULT_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
-DEFAULT_BROKER = "angelone"
+DEFAULT_BROKER = os.getenv("THURSDAY_BROKER", "angelone").lower().strip()
 DEFAULT_LOCK_KEY = "fno:lock:exit_order_manager:thursday"
 
 OPEN_ORDER_STATUSES = {
@@ -187,6 +195,39 @@ def is_market_hours_ist(ref_dt: Optional[datetime] = None) -> Tuple[bool, str]:
         return False, f"Post-market ({now_ist.strftime('%H:%M:%S')} IST >= 15:30:00 IST); market is closed"
 
     return True, f"Market is open ({now_ist.strftime('%H:%M:%S')} IST)"
+
+
+@contextmanager
+def combined_execution_lock(
+    r,
+    cycle_name: str,
+    broker: str,
+    timeout: int = 60,
+    retry_delay: float = 0.2,
+    max_wait: float = 10.0,
+    abort_event: Optional[Any] = None,
+):
+    """
+    Acquire dual distributed locks:
+    1. Track-level lock (e.g. fno:lock:exit_order_manager:thursday)
+    2. Broker-level lock (e.g. fno:lock:broker:angelone)
+    Ensures safe serialization when both tracks share the same broker account.
+    """
+    cycle_lock_key = f"fno:lock:exit_order_manager:{cycle_name}"
+    broker_lock_key = f"fno:lock:broker:{broker}"
+    with fno_execution_lock(
+        r, lock_key=cycle_lock_key, timeout=timeout, retry_delay=retry_delay, max_wait=max_wait, abort_event=abort_event
+    ) as cycle_acquired:
+        if not cycle_acquired:
+            yield False, f"Track lock '{cycle_lock_key}' is held by another process"
+            return
+        with fno_execution_lock(
+            r, lock_key=broker_lock_key, timeout=timeout, retry_delay=retry_delay, max_wait=max_wait, abort_event=abort_event
+        ) as broker_acquired:
+            if not broker_acquired:
+                yield False, f"Broker lock '{broker_lock_key}' is held by another strategy running on the same account"
+                return
+            yield True, None
 
 
 @contextmanager
@@ -393,6 +434,30 @@ def get_active_strategy_expiry(track: str = "3day_strategy") -> Optional[str]:
     return None
 
 
+def get_active_strategy_broker(track: str = "3day_strategy") -> Optional[str]:
+    """Retrieve active cycle broker from active_strategies.json or snapshot file."""
+    try:
+        from common.unified_strategy_store import load_active_strategies
+        active = load_active_strategies()
+        strat = active.get(track, {})
+        broker = strat.get("broker") or (strat.get("day1_locked_price") or {}).get("broker")
+        if broker:
+            return str(broker).lower().strip()
+    except Exception:
+        pass
+    try:
+        from config import THURSDAY_SNAPSHOT_FILE
+        if os.path.exists(THURSDAY_SNAPSHOT_FILE):
+            with open(THURSDAY_SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+                b = snap.get("broker")
+                if b:
+                    return str(b).lower().strip()
+    except Exception:
+        pass
+    return None
+
+
 def build_trail_redis_keys(
     broker: str,
     tradingsymbol: str,
@@ -472,68 +537,9 @@ def parse_positions(raw: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]
     """
     Parse AngelOne / Upstox positions response.
     Returns: (long_positions, short_positions)
-      - long_positions: derivative positions with net quantity > 0 (managed for exits)
-      - short_positions: derivative positions with net quantity < 0 (unexpected short exposure)
     """
-    if not isinstance(raw, dict):
-        raise ValueError("Unexpected positions response: expected a JSON object")
-    data = raw.get("data")
-    if isinstance(data, list):
-        source_positions = data
-    elif isinstance(data, dict):
-        if isinstance(data.get("net"), list):
-            source_positions = data["net"]
-        elif isinstance(data.get("positions"), list):
-            source_positions = data["positions"]
-        elif not data:
-            source_positions = []
-        else:
-            raise ValueError(f"Unsupported positions response shape: data keys={list(data.keys())}")
-    elif data is None or not data:
-        source_positions = []
-    else:
-        raise ValueError("Unsupported positions payload")
-
-    long_positions = []
-    short_positions = []
-    for p in source_positions:
-        if isinstance(p, dict):
-            norm_p = dict(p)
-            tok = str(p.get("symboltoken") or p.get("instrument_token") or "").strip()
-            sym = str(p.get("tradingsymbol") or p.get("trading_symbol") or "").strip().upper()
-            prod = str(p.get("producttype") or p.get("product") or "CARRYFORWARD").strip().upper()
-            if prod in ("D", "NRML"):
-                prod = "CARRYFORWARD"
-            elif prod in ("I", "MIS"):
-                prod = "INTRADAY"
-
-            qty = _position_quantity(p)
-            if qty == 0:
-                buy_q = _to_float(p.get("cfbuyqty") or p.get("buyqty") or 0)
-                sell_q = _to_float(p.get("cfsellqty") or p.get("sellqty") or 0)
-                if buy_q != 0 or sell_q != 0:
-                    qty = buy_q - sell_q
-
-            avg_price = _to_float(p.get("cfbuyavgprice") or p.get("buyavgprice") or p.get("buy_price") or p.get("average_price") or 0.0)
-
-            norm_p["instrument_token"] = tok
-            norm_p["symboltoken"] = tok
-            norm_p["tradingsymbol"] = sym
-            norm_p["trading_symbol"] = sym
-            norm_p["product"] = prod
-            norm_p["producttype"] = prod
-            norm_p["quantity"] = qty
-            norm_p["net_quantity"] = qty
-            norm_p["netqty"] = qty
-            norm_p["buy_price"] = avg_price
-            norm_p["average_price"] = avg_price
-
-            if is_derivative_position(norm_p):
-                if qty > 0:
-                    long_positions.append(norm_p)
-                elif qty < 0:
-                    short_positions.append(norm_p)
-    return long_positions, short_positions
+    from common.broker_adapters import parse_positions as adapter_parse_positions
+    return adapter_parse_positions(raw)
 
 
 def normalize_order_status(status: Any) -> str:
@@ -552,64 +558,9 @@ def is_open_sell_order(order: Dict[str, Any]) -> bool:
 
 
 def parse_order_book(raw: Any) -> List[Dict[str, Any]]:
-    if isinstance(raw, list):
-        raw_orders = [o for o in raw if isinstance(o, dict)]
-    elif isinstance(raw, dict):
-        data = raw.get("data")
-        if isinstance(data, list):
-            raw_orders = [o for o in data if isinstance(o, dict)]
-        elif data is None or data == []:
-            raw_orders = []
-        else:
-            raise ValueError(f"Unexpected order book response shape: data is {type(data).__name__}, expected list")
-    elif raw is None:
-        raw_orders = []
-    else:
-        raise ValueError(f"Unexpected order book response shape: {type(raw).__name__}, expected dict or list")
-
-    normalized = []
-    for o in raw_orders:
-        norm_o = dict(o)
-        oid = str(o.get("orderid") or o.get("order_id") or "").strip()
-        tok = str(o.get("symboltoken") or o.get("instrument_token") or "").strip()
-        sym = str(o.get("tradingsymbol") or o.get("trading_symbol") or "").strip().upper()
-        status = str(o.get("orderstatus") or o.get("status") or "").strip()
-        ttype = str(o.get("transactiontype") or o.get("transaction_type") or "").strip().upper()
-        otype = str(o.get("ordertype") or o.get("order_type") or "").strip().upper()
-        ptype = str(o.get("producttype") or o.get("product") or "CARRYFORWARD").strip().upper()
-        if ptype in ("D", "NRML"):
-            ptype = "CARRYFORWARD"
-        elif ptype in ("I", "MIS"):
-            ptype = "INTRADAY"
-
-        qty = _to_float(o.get("quantity") or 0)
-        filled = _to_float(o.get("filledshares") or o.get("filled_quantity") or 0)
-        unfilled = _to_float(o.get("unfilledshares") or o.get("pending_quantity") or max(0, qty - filled))
-        trig = _to_float(o.get("triggerprice") or o.get("trigger_price") or 0.0)
-        tag = str(o.get("tag") or "").strip()
-
-        norm_o["order_id"] = oid
-        norm_o["orderid"] = oid
-        norm_o["instrument_token"] = tok
-        norm_o["symboltoken"] = tok
-        norm_o["trading_symbol"] = sym
-        norm_o["tradingsymbol"] = sym
-        norm_o["status"] = status
-        norm_o["orderstatus"] = status
-        norm_o["transaction_type"] = ttype
-        norm_o["transactiontype"] = ttype
-        norm_o["order_type"] = otype
-        norm_o["ordertype"] = otype
-        norm_o["product"] = ptype
-        norm_o["producttype"] = ptype
-        norm_o["quantity"] = qty
-        norm_o["filled_quantity"] = filled
-        norm_o["pending_quantity"] = unfilled
-        norm_o["trigger_price"] = trig
-        norm_o["triggerprice"] = trig
-        norm_o["tag"] = tag
-        normalized.append(norm_o)
-    return normalized
+    """Parse Upstox or AngelOne order book response into normalized order dicts."""
+    from common.broker_adapters import parse_order_book as adapter_parse_order_book
+    return adapter_parse_order_book(raw)
 
 
 def order_tag(order: Dict[str, Any]) -> str:
@@ -681,149 +632,25 @@ def latest_filled_buy_order(position: Dict[str, Any], orders: List[Dict[str, Any
 
 
 def get_access_token(broker: str = "angelone", r: Optional[Any] = None) -> str:
-    broker = (broker or "angelone").lower().strip()
-    if broker not in ("angelone", "angel"):
-        raise RuntimeError(f"Thursday F&O exit orders strictly support 'angelone' (requested '{broker}')")
-
-    if r is None:
-        try:
-            r = get_redis_client()
-        except Exception:
-            r = None
-
-    # 1. Read JWT from Redis key angelone_jwt_feed
-    if r is not None:
-        try:
-            raw = r.get("angelone_jwt_feed")
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    jwt = data.get("jwtToken") or data.get("token") or ""
-                except Exception:
-                    jwt = str(raw).strip()
-                if jwt.startswith("Bearer "):
-                    jwt = jwt[7:]
-                if jwt:
-                    return jwt
-        except Exception as exc:
-            logger.warning("Failed to read angelone_jwt_feed from Redis: %s", exc)
-
-    # 2. Check environment variables
-    for env_var in ("ANGELONE_JWT_TOKEN", "ANGELONE_ACCESS_TOKEN", "ANGEL_JWT_TOKEN"):
-        val = os.getenv(env_var)
-        if val:
-            if val.startswith("Bearer "):
-                val = val[7:]
-            return val
-
-    candidates = ["angelone_jwt_feed (Redis)", "ANGELONE_JWT_TOKEN (.env)", "ANGELONE_ACCESS_TOKEN (.env)"]
-    raise RuntimeError(f"No access token found for broker '{broker}'. Checked {candidates}")
+    adapter = get_broker_adapter(broker)
+    client = r if r is not None else get_redis_client()
+    return adapter.get_access_token(redis_client=client)
 
 
 def fetch_positions(token: str, broker: str = "angelone") -> Dict[str, Any]:
-    broker = (broker or "angelone").lower().strip()
-    if broker not in ("angelone", "angel"):
-        raise RuntimeError(f"fetch_positions not implemented for broker '{broker}'")
-    if token == MOCK_TOKEN:
-        return _MOCK_POSITIONS
-    url = f"{ANGELONE_BASE}/rest/secure/angelbroking/order/v1/getPosition"
-    headers = _headers(token)
-    if LOG_API:
-        _log_api_request("GET", url, headers, None)
-    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    if LOG_API:
-        _log_api_response("GET", url, resp)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Positions HTTP {resp.status_code}: {resp.text[:300]}")
-    body = resp.json()
-    if isinstance(body, dict) and body.get("status") is False:
-        raise RuntimeError(f"Positions API error: {body.get('message') or body.get('errorcode') or body}")
-    return body
+    return get_broker_adapter(broker).fetch_positions(token)
 
 
 def fetch_order_book(token: str, broker: str = "angelone") -> List[Dict[str, Any]]:
-    broker = (broker or "angelone").lower().strip()
-    if broker not in ("angelone", "angel"):
-        raise RuntimeError(f"fetch_order_book not implemented for broker '{broker}'")
-    if token == MOCK_TOKEN:
-        return parse_order_book(_MOCK_ORDER_BOOK)
-    url = f"{ANGELONE_BASE}/rest/secure/angelbroking/order/v1/getOrderBook"
-    headers = _headers(token)
-    if LOG_API:
-        _log_api_request("GET", url, headers, None)
-    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    if LOG_API:
-        _log_api_response("GET", url, resp)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Order book HTTP {resp.status_code}: {resp.text[:300]}")
-    body = resp.json()
-    if isinstance(body, dict) and body.get("status") is False:
-        raise RuntimeError(f"Order book API error: {body.get('message') or body.get('errorcode') or body}")
-    return parse_order_book(body)
+    return get_broker_adapter(broker).fetch_order_book(token)
 
 
 def fetch_ltp(token: str, instrument_token: str, broker: str = "angelone", trading_symbol: str = "", exchange: str = "NFO") -> Optional[float]:
-    broker = (broker or "angelone").lower().strip()
-    if broker not in ("angelone", "angel"):
-        raise RuntimeError(f"fetch_ltp not implemented for broker '{broker}'")
-    if token == MOCK_TOKEN:
-        return None
-    if not instrument_token:
-        return None
-    url = f"{ANGELONE_BASE}/rest/secure/angelbroking/market/v1/quote/"
-    payload = {
-        "mode": "LTP",
-        "exchangeTokens": {
-            exchange: [str(instrument_token)]
-        }
-    }
-    headers = _headers(token)
-    if LOG_API:
-        _log_api_request("POST", url, headers, payload)
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-        if LOG_API:
-            _log_api_response("POST", url, resp)
-        if resp.status_code != 200 or not resp.text.strip():
-            logger.error("Quote HTTP %d: %s", resp.status_code, resp.text[:300])
-            return None
-        body = resp.json()
-        if body.get("status") is not True:
-            logger.error("Quote API error: %s", body.get("message") or body)
-            return None
-        fetched = (body.get("data") or {}).get("fetched", [])
-        if fetched and isinstance(fetched, list):
-            ltp_val = _to_float(fetched[0].get("ltp"))
-            if ltp_val > 0:
-                return ltp_val
-    except Exception as exc:
-        logger.error("fetch_ltp exception for token %s: %s", instrument_token, exc)
-    return None
+    return get_broker_adapter(broker).fetch_ltp(token, instrument_token, trading_symbol=trading_symbol, exchange=exchange)
 
 
 def cancel_order(token: str, order_id: str, broker: str = "angelone", variety: str = "STOPLOSS") -> Dict[str, Any]:
-    broker = (broker or "angelone").lower().strip()
-    if broker not in ("angelone", "angel"):
-        raise RuntimeError(f"Cancel adapter is not implemented for broker '{broker}'")
-    if token == MOCK_TOKEN:
-        return {"action": "cancel", "order_id": order_id, "success": True, "http_status": 200, "response": {"status": True}}
-    url = f"{ANGELONE_BASE}/rest/secure/angelbroking/order/v1/cancelOrder"
-    payload = {
-        "variety": variety,
-        "orderid": str(order_id),
-    }
-    headers = _headers(token)
-    if LOG_API:
-        _log_api_request("POST", url, headers, payload)
-    resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-    if LOG_API:
-        _log_api_response("POST", url, resp)
-    try:
-        body = resp.json()
-    except Exception:
-        body = {"raw": getattr(resp, "text", "")[:300]}
-    success = (200 <= getattr(resp, "status_code", 0) < 300 and isinstance(body, dict) and body.get("status") is True)
-    return {"action": "cancel", "order_id": order_id, "success": success, "http_status": getattr(resp, "status_code", None), "response": body}
+    return get_broker_adapter(broker).cancel_order(token, order_id, variety=variety)
 
 
 def compute_trailing_sl(max_price: float, trail_pct: float) -> float:
@@ -841,16 +668,7 @@ def compute_initial_sl(avg_price: float, initial_stop_pct: float) -> float:
 
 
 def get_exit_product(position: Dict[str, Any], broker: str = "angelone", cli_product: Optional[str] = None) -> Optional[str]:
-    raw = str(position.get("product") or position.get("producttype") or "").upper().strip()
-    if raw in ("CARRYFORWARD", "NRML", "CNC", "D"):
-        return "CARRYFORWARD"
-    if raw in ("INTRADAY", "MIS", "I"):
-        return "INTRADAY"
-    if cli_product:
-        cli = str(cli_product).upper().strip()
-        if cli in ("CARRYFORWARD", "INTRADAY"):
-            return cli
-    return "CARRYFORWARD"
+    return get_broker_adapter(broker).get_exit_product(position, cli_product=cli_product)
 
 
 def place_exit_order_slm(
@@ -858,93 +676,22 @@ def place_exit_order_slm(
     position: Dict[str, Any],
     target_qty: int,
     trigger_price: float,
-    product: str = PRODUCT_NRML,
+    product: Optional[str] = None,
     tag: str = DEFAULT_TAG,
     broker: str = "angelone",
 ) -> Dict[str, Any]:
-    broker = (broker or "angelone").lower().strip()
-    if broker not in ("angelone", "angel"):
-        raise RuntimeError(f"Live order adapter is not implemented for broker '{broker}'")
-    trigger_price = round_to_tick(trigger_price)
-    sym = position.get("tradingsymbol") or position.get("trading_symbol")
-    tok = str(position.get("symboltoken") or position.get("instrument_token") or "")
-    exch = str(position.get("exchange") or "NFO").upper()
-    prod = str(product or position.get("producttype") or position.get("product") or "CARRYFORWARD").upper()
-    if prod in ("D", "NRML"):
-        prod = "CARRYFORWARD"
-    elif prod in ("I", "MIS"):
-        prod = "INTRADAY"
-
-    payload = {
-        "variety": "STOPLOSS",
-        "tradingsymbol": sym,
-        "symboltoken": tok,
-        "transactiontype": "SELL",
-        "exchange": exch,
-        "ordertype": "STOPLOSS_MARKET",
-        "producttype": prod,
-        "duration": "DAY",
-        "price": "0",
-        "triggerprice": f"{trigger_price:.2f}",
-        "quantity": str(int(target_qty)),
-    }
-    if token == MOCK_TOKEN:
-        mock_oid = f"mock_{int(time.time()*1000)}"
-        return {"action": "place", "request": payload, "success": True, "order_id": mock_oid, "response": {"status": True, "data": {"orderid": mock_oid}}}
-    url = f"{ANGELONE_BASE}/rest/secure/angelbroking/order/v1/placeOrder"
-    headers = _headers(token)
-    if LOG_API:
-        _log_api_request("POST", url, headers, payload)
-    resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-    if LOG_API:
-        _log_api_response("POST", url, resp)
-    return _order_response("place", resp, payload)
+    return get_broker_adapter(broker).place_exit_order_slm(token, position, target_qty, trigger_price, product=product, tag=tag)
 
 
 def place_exit_order_market(
     token: str,
     position: Dict[str, Any],
     target_qty: int,
-    product: str = PRODUCT_NRML,
+    product: Optional[str] = None,
     tag: str = DEFAULT_TAG,
     broker: str = "angelone",
 ) -> Dict[str, Any]:
-    broker = (broker or "angelone").lower().strip()
-    if broker not in ("angelone", "angel"):
-        raise RuntimeError(f"Live order adapter is not implemented for broker '{broker}'")
-    sym = position.get("tradingsymbol") or position.get("trading_symbol")
-    tok = str(position.get("symboltoken") or position.get("instrument_token") or "")
-    exch = str(position.get("exchange") or "NFO").upper()
-    prod = str(product or position.get("producttype") or position.get("product") or "CARRYFORWARD").upper()
-    if prod in ("D", "NRML"):
-        prod = "CARRYFORWARD"
-    elif prod in ("I", "MIS"):
-        prod = "INTRADAY"
-
-    payload = {
-        "variety": "NORMAL",
-        "tradingsymbol": sym,
-        "symboltoken": tok,
-        "transactiontype": "SELL",
-        "exchange": exch,
-        "ordertype": "MARKET",
-        "producttype": prod,
-        "duration": "DAY",
-        "price": "0",
-        "triggerprice": "0",
-        "quantity": str(int(target_qty)),
-    }
-    if token == MOCK_TOKEN:
-        mock_oid = f"mock_{int(time.time()*1000)}"
-        return {"action": "place_market", "request": payload, "success": True, "order_id": mock_oid, "response": {"status": True, "data": {"orderid": mock_oid}}}
-    url = f"{ANGELONE_BASE}/rest/secure/angelbroking/order/v1/placeOrder"
-    headers = _headers(token)
-    if LOG_API:
-        _log_api_request("POST", url, headers, payload)
-    resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-    if LOG_API:
-        _log_api_response("POST", url, resp)
-    return _order_response("place_market", resp, payload)
+    return get_broker_adapter(broker).place_exit_order_market(token, position, target_qty, product=product, tag=tag)
 
 
 def modify_exit_order_slm(
@@ -955,39 +702,7 @@ def modify_exit_order_slm(
     tag: str = DEFAULT_TAG,
     broker: str = "angelone",
 ) -> Dict[str, Any]:
-    broker = (broker or "angelone").lower().strip()
-    if broker not in ("angelone", "angel"):
-        raise RuntimeError(f"Live order adapter is not implemented for broker '{broker}'")
-    trigger_price = round_to_tick(trigger_price)
-    total_qty = order_filled_quantity(order) + target_qty
-    oid = str(order.get("order_id") or order.get("orderid") or "")
-    sym = order.get("trading_symbol") or order.get("tradingsymbol")
-    tok = str(order.get("instrument_token") or order.get("symboltoken") or "")
-    exch = str(order.get("exchange") or "NFO").upper()
-    prod = str(order.get("product") or order.get("producttype") or "CARRYFORWARD").upper()
-    if prod in ("D", "NRML"):
-        prod = "CARRYFORWARD"
-
-    payload = {
-        "variety": "STOPLOSS",
-        "orderid": oid,
-        "ordertype": "STOPLOSS_MARKET",
-        "producttype": prod,
-        "duration": "DAY",
-        "price": "0",
-        "triggerprice": f"{trigger_price:.2f}",
-        "quantity": str(int(total_qty)),
-        "tradingsymbol": sym,
-        "symboltoken": tok,
-        "exchange": exch,
-    }
-    if token == MOCK_TOKEN:
-        return {"action": "modify", "request": payload, "success": True, "order_id": oid, "response": {"status": True, "data": {"orderid": oid}}}
-    url = f"{ANGELONE_BASE}/rest/secure/angelbroking/order/v1/modifyOrder"
-    headers = _headers(token)
-    if LOG_API:
-        _log_api_request("POST", url, headers, payload)
-    resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+    return get_broker_adapter(broker).modify_exit_order_slm(token, order, target_qty, trigger_price, tag=tag)
     if LOG_API:
         _log_api_response("POST", url, resp)
     return _order_response("modify", resp, payload)
@@ -1114,7 +829,17 @@ def _redis_text(r, key: str) -> str:
         return ""
 
 
-def _save_trailing_state(r, keys: Dict[str, str], max_val: float, sl_val: float, avg_val: float, qty_val: int, order_id: str, entry_order_id: Optional[str]) -> bool:
+def _save_trailing_state(
+    r,
+    keys: Dict[str, str],
+    max_val: float,
+    sl_val: float,
+    avg_val: float,
+    qty_val: int,
+    order_id: str,
+    entry_order_id: Optional[str],
+    broker: str = "angelone",
+) -> bool:
     if not r:
         return False
     try:
@@ -1126,6 +851,9 @@ def _save_trailing_state(r, keys: Dict[str, str], max_val: float, sl_val: float,
         pipe.set(keys["order_id"], str(order_id or ""))
         if entry_order_id:
             pipe.set(keys["entry_order_id"], str(entry_order_id))
+        if order_id:
+            pipe.sadd(f"fno:{broker}:managed_order_ids:thu", str(order_id))
+            pipe.sadd(f"fno:{broker}:managed_order_ids", str(order_id))
         pipe.execute()
         return True
     except Exception as exc:
@@ -1138,6 +866,9 @@ def _cleanup_thursday_leg_state(r, keys: Dict[str, str], broker: str = "angelone
     if not r:
         return
     try:
+        stored_oid = _redis_text(r, keys.get("order_id")) if keys.get("order_id") else None
+        stored_mkt_id = _redis_text(r, keys.get("market_order_id")) if keys.get("market_order_id") else None
+
         pipe = r.pipeline()
         if keys.get("enabled_canonical"):
             pipe.delete(keys["enabled_canonical"])
@@ -1158,6 +889,12 @@ def _cleanup_thursday_leg_state(r, keys: Dict[str, str], broker: str = "angelone
             pipe.delete(keys["sl_short"])
         if keys.get("avg_short"):
             pipe.delete(keys["avg_short"])
+
+        for oid in (stored_oid, stored_mkt_id):
+            if oid:
+                pipe.srem(f"fno:{broker}:managed_order_ids:thu", str(oid))
+                pipe.srem(f"fno:{broker}:managed_order_ids", str(oid))
+
         pipe.execute()
         logger.info("Cleared Redis trailing state & authorization for %s", keys["enabled"])
     except Exception as exc:
@@ -1226,6 +963,16 @@ def reconcile_cycle_legs(
         logger.error("Failed to scan enabled keys for reconciliation: %s", exc)
         return []
 
+    cycle_managed_order_ids = set()
+    try:
+        raw_ids = r.smembers(f"fno:{broker}:managed_order_ids:thu") or set()
+        for raw_id in raw_ids:
+            cycle_managed_order_ids.add(
+                raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
+            )
+    except Exception as exc:
+        logger.warning("Failed to scan Thursday managed order IDs during reconciliation: %s", exc)
+
     for enabled_key in active_keys:
         parsed = parse_enabled_key(enabled_key, broker=broker, cycle=cycle)
         if not parsed:
@@ -1288,15 +1035,21 @@ def reconcile_cycle_legs(
         eff_symbol = leg_symbol or f"NIFTY{leg_strike}{leg_opt}"
         eff_token = leg_token or "NOTOKEN"
         leg_keys = build_trail_redis_keys(broker, eff_symbol, eff_token, active_expiry=eff_expiry)
-        stored_order_id = _redis_text(r, leg_keys["order_id"]) if r else None
+        stored_order_ids = {
+            _redis_text(r, leg_keys.get(key))
+            for key in ("order_id", "market_order_id")
+            if leg_keys.get(key)
+        }
+        stored_order_ids.discard("")
 
         for o in orders:
-            if not is_open_sell_order(o):
-                continue
-            oid = str(o.get("order_id") or o.get("orderid") or "").strip()
-            o_tag = order_tag(o).upper()
-            is_managed = (o_tag == tag.upper()) or (stored_order_id and oid and oid == stored_order_id)
-            if not is_managed:
+            order_id = str(o.get("order_id") or o.get("orderid") or "").strip()
+            is_managed = (
+                order_tag(o).upper() == tag.upper()
+                or order_id in stored_order_ids
+                or order_id in cycle_managed_order_ids
+            )
+            if not is_open_sell_order(o) or not is_managed:
                 continue
             o_sym = str(o.get("trading_symbol") or o.get("tradingsymbol") or "").upper().replace(":", "_").replace("|", "_")
             o_tok = str(o.get("instrument_token") or o.get("symboltoken") or "").upper().replace(":", "_").replace("|", "_")
@@ -1309,7 +1062,7 @@ def reconcile_cycle_legs(
             if (leg_strike and leg_opt and o_strike == int(leg_strike) and o_opt == leg_opt and exp_match) \
                or (leg_token and leg_token != "NOTOKEN" and leg_token == o_tok) \
                or (leg_symbol and leg_symbol == o_sym) \
-               or (stored_order_id and oid and oid == stored_order_id):
+               or (order_id in stored_order_ids):
                 has_open_order = True
                 break
 
@@ -1398,8 +1151,9 @@ def manage_thursday_exit_orders(
     if active_expiry is None:
         active_expiry = get_active_strategy_expiry("3day_strategy")
 
-    # Authoritative set of Thursday managed order IDs from Redis (needed because AngelOne does not return tags in orderbook)
+    # Authoritative set of Thursday managed order IDs and other-cycle order IDs from Redis
     managed_order_ids_in_redis = set()
+    other_cycle_order_ids_in_redis = set()
     if r:
         try:
             for k in r.scan_iter(f"fno:{broker}:trail:thu:*:order_id", count=100):
@@ -1410,10 +1164,32 @@ def manage_thursday_exit_orders(
                 val = _redis_text(r, k)
                 if val:
                     managed_order_ids_in_redis.add(str(val))
-            set_ids = r.smembers(f"fno:{broker}:managed_order_ids") or []
+            set_ids = r.smembers(f"fno:{broker}:managed_order_ids:thu") or []
             for sid in set_ids:
                 s_text = sid.decode("utf-8") if isinstance(sid, bytes) else str(sid)
                 if s_text:
+                    managed_order_ids_in_redis.add(s_text)
+
+            # Symmetrically scan Tuesday (other cycle) orders on the same broker
+            for k in r.scan_iter(f"fno:{broker}:trail:tue:*:order_id", count=100):
+                val = _redis_text(r, k)
+                if val:
+                    other_cycle_order_ids_in_redis.add(str(val))
+            for k in r.scan_iter(f"fno:{broker}:trail:tue:*:market_order_id", count=100):
+                val = _redis_text(r, k)
+                if val:
+                    other_cycle_order_ids_in_redis.add(str(val))
+            set_ids_tue = r.smembers(f"fno:{broker}:managed_order_ids:tue") or []
+            for sid in set_ids_tue:
+                s_text = sid.decode("utf-8") if isinstance(sid, bytes) else str(sid)
+                if s_text and s_text not in managed_order_ids_in_redis:
+                    other_cycle_order_ids_in_redis.add(s_text)
+
+            # Legacy fallback
+            set_ids_legacy = r.smembers(f"fno:{broker}:managed_order_ids") or []
+            for sid in set_ids_legacy:
+                s_text = sid.decode("utf-8") if isinstance(sid, bytes) else str(sid)
+                if s_text and s_text not in other_cycle_order_ids_in_redis:
                     managed_order_ids_in_redis.add(s_text)
         except Exception as exc:
             logger.warning("Failed to scan active Thursday managed order IDs from Redis: %s", exc)
@@ -1471,7 +1247,7 @@ def manage_thursday_exit_orders(
     # 2. Check for orphan THU-SL managed orders
     orphan_managed_orders: List[Dict[str, Any]] = []
     for order in orders:
-        order_id = str(order.get("order_id") or "")
+        order_id = str(order.get("order_id") or order.get("orderid") or "").strip()
         is_managed = (order_id in managed_order_ids_in_redis or order_tag(order).upper() == tag.upper())
         if not is_open_sell_order(order) or not is_managed:
             continue
@@ -1595,13 +1371,16 @@ def manage_thursday_exit_orders(
             or str(o.get("order_id") or o.get("orderid") or "") in managed_order_ids_in_redis
             or order_tag(o).upper() == tag.upper()
         ]
-        manual_sells = [
-            o for o in matching_sells
-            if o not in managed_sells and (not order_tag(o) or order_tag(o).upper() not in (OTHER_CYCLE_TAGS | {tag.upper()}))
-        ]
         other_cycle_sells = [
             o for o in matching_sells
-            if o not in managed_sells and order_tag(o).upper() in OTHER_CYCLE_TAGS
+            if o not in managed_sells and (
+                order_tag(o).upper() in OTHER_CYCLE_TAGS
+                or str(o.get("order_id") or o.get("orderid") or "") in other_cycle_order_ids_in_redis
+            )
+        ]
+        manual_sells = [
+            o for o in matching_sells
+            if o not in managed_sells and o not in other_cycle_sells
         ]
 
         if manual_sells:
@@ -1652,7 +1431,66 @@ def manage_thursday_exit_orders(
         existing = managed_sells[0] if managed_sells else None
         existing_order_id = str((existing or {}).get("order_id") or (existing or {}).get("orderid") or "")
 
-        entry_order_id, entry_order, entry_id_source = latest_filled_buy_order(pos, orders)
+        entry_details = {}
+        symbol_details = parse_tradingsymbol(symbol)
+        if symbol_details.get("strike") and symbol_details.get("option_type"):
+            try:
+                from common.unified_strategy_store import get_active_leg_entry_details
+                entry_details = get_active_leg_entry_details(
+                    CYCLE_TRACK,
+                    int(symbol_details["strike"]),
+                    str(symbol_details["option_type"]),
+                    expiry=symbol_details.get("expiry") or active_expiry,
+                )
+            except Exception as exc:
+                logger.warning("[%s] Could not load Thursday cycle BUY attribution: %s", symbol, exc)
+
+        if entry_details.get("ambiguous_entry_attribution"):
+            item = {
+                "symbol": symbol,
+                "instrument_token": token_key,
+                "status": "entry_order_attribution_ambiguous",
+                "reason": "Tuesday and Thursday share this broker contract, but the Thursday cycle has no persisted BUY order ID; refusing to infer ownership from the latest BUY.",
+                "redis_keys": keys,
+            }
+            actions.append(item)
+            alerts.append({"severity": "CRITICAL", **item})
+            logger.critical("[%s] Cannot safely attribute BUY entry to Thursday cycle", symbol)
+            continue
+
+        persisted_entry_id = str(entry_details.get("entry_order_id") or "")
+        if persisted_entry_id:
+            entry_order_id = persisted_entry_id
+            entry_order = next(
+                (
+                    o for o in orders
+                    if str(o.get("order_id") or o.get("orderid") or "") == persisted_entry_id
+                    and str(o.get("transaction_type") or o.get("transactiontype") or "").upper() == "BUY"
+                ),
+                None,
+            )
+            entry_id_source = "active_cycle"
+        else:
+            entry_order_id, entry_order, entry_id_source = latest_filled_buy_order(pos, orders)
+
+        cycle_entry_price = _to_float(entry_details.get("entry_price"))
+        if cycle_entry_price <= 0 and entry_order:
+            cycle_entry_price = _to_float(
+                entry_order.get("average_price") or entry_order.get("averageprice") or entry_order.get("avgprice")
+            )
+        if entry_details.get("same_broker_contract_overlap") and cycle_entry_price <= 0:
+            item = {
+                "symbol": symbol,
+                "instrument_token": token_key,
+                "status": "entry_price_attribution_missing",
+                "reason": "The shared broker position has no track-specific Thursday fill price; refusing to use the net position average for trailing calculations.",
+                "redis_keys": keys,
+            }
+            actions.append(item)
+            alerts.append({"severity": "CRITICAL", **item})
+            logger.critical("[%s] Cannot safely attribute entry price to Thursday cycle", symbol)
+            continue
+
         lifecycle_changed = bool(old_entry_id and entry_order_id and old_entry_id != entry_order_id)
         if lifecycle_changed and existing:
             item = {
@@ -2090,6 +1928,7 @@ def manage_thursday_exit_orders(
                     r.set(keys["mode"], "immediate")
                     r.set(keys["market_order_id"], mock_oid)
                     r.set(keys["order_id"], mock_oid)
+                    r.sadd(f"fno:{broker}:managed_order_ids:thu", mock_oid)
                     r.sadd(f"fno:{broker}:managed_order_ids", mock_oid)
                 base = {
                     "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
@@ -2143,6 +1982,7 @@ def manage_thursday_exit_orders(
                         r.set(keys["mode"], "immediate")
                         r.set(keys["market_order_id"], new_market_id)
                         r.set(keys["order_id"], new_market_id)
+                        r.sadd(f"fno:{broker}:managed_order_ids:thu", new_market_id)
                         r.sadd(f"fno:{broker}:managed_order_ids", new_market_id)
                     logger.info("[%s] Successfully placed immediate MARKET order for %d qty (order_id: %s)", symbol, managed_qty, new_market_id)
                 else:
@@ -2199,7 +2039,7 @@ def manage_thursday_exit_orders(
                 continue
             ltp = fresh_ltp
 
-        avg_price = _to_float(pos.get("average_price"))
+        avg_price = cycle_entry_price if cycle_entry_price > 0 else _to_float(pos.get("average_price"))
         if avg_price <= 0:
             avg_price = old_avg if old_avg > 0 else ltp
 
@@ -2348,7 +2188,7 @@ def manage_thursday_exit_orders(
             base["success"] = result.get("success", False)
             if result.get("success"):
                 new_order_id = result.get("order_id") or existing_order_id
-                _save_trailing_state(r, keys, new_max, final_stop, avg_price, managed_qty, new_order_id, entry_order_id)
+                _save_trailing_state(r, keys, new_max, final_stop, avg_price, managed_qty, new_order_id, entry_order_id, broker=broker)
                 logger.info("[%s] Successfully executed %s order for %d qty at trigger %.2f (order_id: %s)", symbol, base["status"], managed_qty, final_stop, new_order_id)
             else:
                 logger.error("[%s] Order execution failed: %s", symbol, result.get("error"))
@@ -2427,7 +2267,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Explicit dry-run mode (default behavior when --execute is omitted)")
     parser.add_argument("--mock", action="store_true", help="Use built-in offline mock data")
     parser.add_argument("--force", action="store_true", help="Bypass Redis authorization / ORDERS_LIVE checks (testing only)")
-    parser.add_argument("--broker", default=DEFAULT_BROKER, help=f"Broker adapter (default: {DEFAULT_BROKER})")
+    parser.add_argument("--broker", default=None, help=f"Broker adapter (default: track configured broker from THURSDAY_BROKER or '{DEFAULT_BROKER}')")
     parser.add_argument("--lots", type=int, default=int(os.getenv("LOTS_THURSDAY", "1")), help="Allocated lots for Thursday strategy (default from LOTS_THURSDAY or 1)")
     parser.add_argument("--lot-size", type=int, default=DEFAULT_LOT_SIZE, help=f"Nifty contract lot size (default {DEFAULT_LOT_SIZE})")
     parser.add_argument("--trail-pct", type=float, default=DEFAULT_TRAIL_PCT, help=f"Trail %% below high-water mark (default {DEFAULT_TRAIL_PCT})")
@@ -2494,32 +2334,52 @@ def main() -> int:
             }, indent=2))
             return 0
 
-    # 3. Dedicated Broker Selection (Thursday is strictly pinned to AngelOne)
-    requested_broker = (args.broker or DEFAULT_BROKER).lower().strip()
-    if requested_broker not in ("angelone", "angel"):
-        logger.critical("Broker '%s' is not supported. Thursday F&O exit orders strictly support 'angelone'.", requested_broker)
+    # 3. Dynamic Broker Selection per Strategy Cycle
+    configured_broker = (args.broker or get_broker_for_track(CYCLE_TRACK)).lower().strip()
+    stored_broker = get_active_strategy_broker(CYCLE_TRACK)
+
+    if stored_broker:
+        if configured_broker != stored_broker:
+            logger.critical(
+                "Configured broker '%s' contradicts active cycle persisted broker '%s'. "
+                "Failing closed to avoid managing positions under the wrong account.",
+                configured_broker, stored_broker
+            )
+            print(json.dumps({
+                "error": "broker_mismatch",
+                "configured_broker": configured_broker,
+                "persisted_broker": stored_broker,
+                "message": f"Active cycle requires broker '{stored_broker}', but '{configured_broker}' is configured. Failing closed."
+            }, indent=2))
+            return 1
+        active_broker = stored_broker
+    else:
+        active_broker = configured_broker
+
+    if active_broker not in SUPPORTED_BROKERS:
+        logger.critical("Broker '%s' is not supported. Supported brokers are %s.", active_broker, SUPPORTED_BROKERS)
         print(json.dumps({
             "error": "unsupported_broker",
-            "broker": requested_broker,
-            "message": "Only AngelOne is supported for Thursday F&O Exit Orders"
+            "broker": active_broker,
+            "message": f"Only brokers {SUPPORTED_BROKERS} are supported for Thursday F&O Exit Orders"
         }, indent=2))
         return 1
-    active_broker = "angelone"
 
-    # 4. Fetch Positions and Orders under Cycle-Isolated Execution Lock
+    # 4. Fetch Positions and Orders under Cycle & Broker Execution Locks
     abort_event = threading.Event()
-    with fno_execution_lock(
-        r, lock_key=DEFAULT_LOCK_KEY, timeout=60, max_wait=10.0, abort_event=abort_event
-    ) as acquired:
+    with combined_execution_lock(
+        r, cycle_name=CYCLE_NAME, broker=active_broker, timeout=60, max_wait=10.0, abort_event=abort_event
+    ) as (acquired, lock_reason):
         if not acquired:
             logger.warning(
-                "Could not acquire distributed execution lock '%s' within 10s. Another manager is running. Exiting to avoid concurrent order conflict.",
-                DEFAULT_LOCK_KEY
+                "Could not acquire distributed execution lock (%s) within 10s. Another manager is running. Exiting to avoid concurrent order conflict.",
+                lock_reason
             )
             print(json.dumps({
                 "status": "lock_busy",
                 "cycle": CYCLE_NAME,
-                "message": "Distributed lock busy; another manager is running. Skipping this cycle to prevent race condition."
+                "broker": active_broker,
+                "message": f"Distributed lock busy ({lock_reason}). Skipping this cycle to prevent race condition."
             }, indent=2))
             return 0
 

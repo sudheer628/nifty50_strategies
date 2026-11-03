@@ -492,14 +492,33 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         broker_name = "paper"
 
         if is_live_buy:
+            from config import get_broker_for_track
+            track_broker = get_broker_for_track("3day_strategy")
             from common.entry_order_manager import execute_paired_market_buy, NIFTY_LOT_SIZE
-            from common.angelone_client import resolve_option_token
             qty = int(os.getenv("STRATEGY_BUY_QTY") or os.getenv("NIFTY_LOT_SIZE") or NIFTY_LOT_SIZE)
-            call_contract = resolve_option_token(expiry_angelone, call_strike, "CE")
-            put_contract = resolve_option_token(expiry_angelone, put_strike, "PE")
+            if track_broker == "angelone":
+                from common.angelone_client import resolve_option_token
+                call_contract = resolve_option_token(expiry_angelone, call_strike, "CE")
+                put_contract = resolve_option_token(expiry_angelone, put_strike, "PE")
+            else:
+                from common.entry_order_manager import resolve_upstox_option_key
+                call_key = resolve_upstox_option_key(expiry_angelone, call_strike, "CE")
+                put_key = resolve_upstox_option_key(expiry_angelone, put_strike, "PE")
+                call_contract = {
+                    "instrument_token": call_key,
+                    "strike": call_strike,
+                    "option_type": "CE",
+                    "trading_symbol": f"NIFTY{expiry_angelone}{call_strike}CE",
+                }
+                put_contract = {
+                    "instrument_token": put_key,
+                    "strike": put_strike,
+                    "option_type": "PE",
+                    "trading_symbol": f"NIFTY{expiry_angelone}{put_strike}PE",
+                }
 
             buy_res = execute_paired_market_buy(
-                broker="angelone",
+                broker=track_broker,
                 call_contract=call_contract,
                 put_contract=put_contract,
                 quantity=qty,
@@ -516,7 +535,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     try:
                         dispatch_order_failure_with_retry(
                             notification_id=f"paired-buy:{cycle_id}",
-                            broker="angelone",
+                            broker=track_broker,
                             action="PAIRED_BUY",
                             track="3day_strategy",
                             symbol=f"CALL {call_strike}CE / PUT {put_strike}PE",
@@ -543,7 +562,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     "call_order_id": buy_res.get("call_order_id"),
                     "put_order_id": buy_res.get("put_order_id"),
                     "entry_status": entry_status,
-                    "broker": "angelone",
+                    "broker": track_broker,
                     "captured_at": _now_utc_ts(),
                     "alpha_fsm": None,
                 }
@@ -570,7 +589,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                         put_order_id=buy_res.get("put_order_id"),
                         call_ref_ltp=call_ref_ltp,
                         put_ref_ltp=put_ref_ltp,
-                        broker="angelone",
+                        broker=track_broker,
                         entry_status=entry_status,
                     )
                 except Exception as exc:
@@ -582,7 +601,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             call_order_id = buy_res.get("call_order_id")
             put_order_id = buy_res.get("put_order_id")
             entry_status = "FILLED"
-            broker_name = "angelone"
+            broker_name = track_broker
         else:
             call_buy_price = call_ltp
             put_buy_price = put_ltp

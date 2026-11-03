@@ -886,45 +886,48 @@ All production crontab schedules execute in **UTC** on AWS EC2:
 
 ```cron
 # ============================================================================
-# MASTER WEEKLY STRATEGY TRACK (Tuesday - Monday)
+# PROJECT D: Nifty50 Strategy runner
 # ============================================================================
-# Collector: Every 30 minutes during market hours (:01 and :31 past every hour from 09:31 to 15:31 IST)
-# Stagger: Allows upstream collectors (market_signal_agent & nifty_signal_features) to commit :00/:30 data.
-1 4-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
-31 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/options_strategy_$(date +\%F).log 2>&1
+# Runs every 30 mins during market hours at :01 and :31 (09:31 to 15:31 IST = 04:01 to 10:01 UTC)
+1 4-10 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/nifty50_strategies_options_strategy_$(date +\%F).log 2>&1
+31 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/weekly_option_collector.py >> /home/ubuntu/logs/nifty50_strategies_options_strategy_$(date +\%F).log 2>&1
 
-# Standalone Peak-Profit Monitor (Runs :16 and :46, alternating with :01 and :31 collector for 15-min cadence)
-# 09:16 to 15:16 IST = 03:46 to 09:46 UTC
-46 3 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
-16,46 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
+# Post-Market Strategy Weekly Close (Runs Mondays at 10:07 UTC = 15:37 IST; skips if already closed in morning)
+7 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/nifty50_strategies_weekly_close_$(date +\%F).log 2>&1
+
+# Tuesday Deferred Close (Fallback for Monday exchange holidays; runs at 03:37 UTC = 09:07 IST)
+37 3 * * 2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/nifty50_strategies_weekly_close_$(date +\%F).log 2>&1
 
 # Monday Afternoon Gamma Sniper (Expiry Afternoon Scalp: runs every 10 min, 12:30–15:20 IST = 07:00–09:50 UTC)
-*/10 7-9 * * 1 cd ~/nifty50_strategies && .venv/bin/python strategies/monday_gamma_sniper.py >> /home/ubuntu/logs/gamma_sniper_$(date +\%F).log 2>&1
+*/10 7-9 * * 1 cd ~/nifty50_strategies && .venv/bin/python strategies/monday_gamma_sniper.py >> /home/ubuntu/logs/nifty50_strategies_gamma_sniper_$(date +\%F).log 2>&1
 
-# Master Weekly Close Orchestrator (Runs Mondays at 10:07 UTC = 15:37 IST; skips if already closed)
-# Steps: 1. send_weekly_report.py -> 2. compare_ai_vs_static_benchmark.py -> 3. run_weekly_merge.sh -> 4. skill_generator.py + Mongo sync
-7 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
+# Standalone Peak-Profit Monitor (Runs at :16 and :46 for 15-min cadence)
+# 09:16 to 15:16 IST = 03:46 to 09:46 UTC
+46 3 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/nifty50_strategies_peak_monitor_$(date +\%F).log 2>&1
+16,46 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/nifty50_strategies_peak_monitor_$(date +\%F).log 2>&1
 
-# Tuesday Deferred Close for Master Track (Runs Tuesday 09:07 IST = 03:37 UTC if Monday was an exchange holiday)
-37 3 * * 2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_weekly_close.py >> /home/ubuntu/logs/weekly_close_$(date +\%F).log 2>&1
+# capturing ltp of option prices for protal view
+*/5 3-10 * * 1-5 /home/ubuntu/nifty50_strategies/scripts/run_5min_options_monitor.sh >> /home/ubuntu/logs/options_5min_monitor_$(date +\%F).log 2>&1
 
-# ============================================================================
-# PARALLEL 3-DAY THURSDAY STRATEGY TRACK (Thursday - Monday)
-# ============================================================================
-# Thursday Collector: Runs :02 and :32 past every hour (09:32 to 15:32 IST = 04:02 to 10:02 UTC on Mon, Thu, Fri)
-# Stagger: +1 min after weekly collector (:01/:31) for clean lock and API separation.
-2,32 4-10 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/thursday_option_collector.py >> /home/ubuntu/logs/thursday_strategy_$(date +\%F).log 2>&1
+# NIFTY50 OPENING STRADDLE STRATEGY (09:14 - 10:00 AM IST)
+# Runs daily at 09:14 AM IST = 03:44 AM UTC (Mon-Fri) as an analytical tracking engine
+44 3 * * 1-5 cd /home/ubuntu/nifty50_strategies && /usr/bin/flock -n /tmp/opening_straddle.lock .venv/bin/python -m strategies.opening_straddle_selector >> /home/ubuntu/logs/opening_straddle_$(date +\%F).log 2>&1
 
-# Thursday Peak-Profit Monitor: Runs :17 and :47 (09:17 to 15:17 IST = 03:47 to 09:47 UTC on Mon, Thu, Fri)
-47 3 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/thursday_peak_monitor_$(date +\%F).log 2>&1
-17,47 4-9 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/thursday_peak_monitor_$(date +\%F).log 2>&1
+# ==============================================================================
+# 3-DAY THURSDAY PARALLEL STRATEGY (Thursday -> Monday Expiry)
+# ==============================================================================
+# 1. Thu, Fri, Mon 09:32-15:32 IST (04:02-10:02 UTC) - 30-min Collector (:02 & :32 IST)
+# (Automatically locks fresh cycle on Thursday 09:32 IST and collects ongoing ticks)
+2,32 4-10 * * 1,4,5 cd /home/ubuntu/nifty50_strategies && .venv/bin/python strategies/thursday_option_collector.py >> /home/ubuntu/logs/nifty50_strategies_thursday_collector_$(date +\%F).log 2>&1
 
-# Thursday Strategy Close Orchestrator (Runs Mondays at 10:08 UTC = 15:38 IST; +1m after master close)
-# Steps: 1. Closes current_thursday_buy.json -> 2. send_weekly_report.py --track thursday -> 3. sync_to_mongodb.py --track thursday
-8 10 * * 1 cd ~/nifty50_strategies && .venv/bin/python scripts/run_thursday_close.py >> /home/ubuntu/logs/thursday_close_$(date +\%F).log 2>&1
+# 2. Thu, Fri, Mon 09:47-15:17 IST (04:17-09:47 UTC) - 15-min Peak Monitor (:17 & :47 IST)
+17,47 4-9 * * 1,4,5 cd /home/ubuntu/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/nifty50_strategies_thursday_peak_monitor_$(date +\%F).log 2>&1
 
-# Tuesday Deferred Close for Thursday Track (Runs Tuesday 09:08 IST = 03:38 UTC if Monday was an exchange holiday)
-38 3 * * 2 cd ~/nifty50_strategies && .venv/bin/python scripts/run_thursday_close.py --morning-holiday-check >> /home/ubuntu/logs/thursday_close_$(date +\%F).log 2>&1
+# 4. Monday 15:38 IST (10:08 UTC) - Thursday Strategy Close & MongoDB Atlas Sync
+8 10 * * 1 cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/run_thursday_close.py >> /home/ubuntu/logs/nifty50_strategies_thursday_close_$(date +\%F).log 2>&1
+
+# 5. Tuesday 09:08 IST (03:38 UTC) - Deferred Close Guard (Only runs if Monday was an NSE Holiday)
+38 3 * * 2 cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/run_thursday_close.py --morning-holiday-check >> /home/ubuntu/logs/nifty50_strategies_thursday_close_$(date +\%F).log 2>&1
 
 # ============================================================================
 # BROKER-SEGREGATED LIVE F&O TRAILING STOP-LOSS EXIT MANAGERS (Every 1 Minute, UTC)
@@ -1018,12 +1021,11 @@ DISCORD_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_URL_HERE
 
 ```bash
 # Master Weekly Peak Monitor (Runs at :16 and :46; 09:16 to 15:16 IST = 03:46 to 09:46 UTC on Mon-Fri)
-46 3 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
-16,46 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/peak_monitor_$(date +\%F).log 2>&1
+46 3 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/nifty50_strategies_peak_monitor_$(date +\%F).log 2>&1
+16,46 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/nifty50_strategies_peak_monitor_$(date +\%F).log 2>&1
 
-# Thursday 3-Day Peak Monitor (Runs at :17 and :47; 09:17 to 15:17 IST = 03:47 to 09:47 UTC on Mon, Thu, Fri)
-47 3 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/thursday_peak_monitor_$(date +\%F).log 2>&1
-17,47 4-9 * * 1,4,5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/thursday_peak_monitor_$(date +\%F).log 2>&1
+# Thursday 3-Day Peak Monitor (Runs at :17 and :47; 09:47 to 15:17 IST = 04:17 to 09:47 UTC on Mon, Thu, Fri)
+17,47 4-9 * * 1,4,5 cd /home/ubuntu/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py --track thursday >> /home/ubuntu/logs/nifty50_strategies_thursday_peak_monitor_$(date +\%F).log 2>&1
 ```
 
 Smoke check peak monitor state:

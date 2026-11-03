@@ -966,11 +966,11 @@ def test_market_close_blocks_broker_order_mutations():
 
 
 def test_unsupported_broker_rejection():
-    """Verify Thursday manager rejects non-AngelOne brokers fail-closed."""
-    with pytest.raises(RuntimeError, match="strictly support 'angelone'"):
-        thu_module.get_access_token(broker="upstox")
+    """Verify Thursday manager rejects unsupported brokers fail-closed."""
+    with pytest.raises((RuntimeError, ValueError), match="Unsupported broker"):
+        thu_module.get_access_token(broker="zerodha")
 
-    with patch("sys.argv", ["Thursday-Fno-Exit-Orders-V1.py", "--broker", "upstox", "--mock"]):
+    with patch("sys.argv", ["Thursday-Fno-Exit-Orders-V1.py", "--broker", "zerodha", "--mock"]):
         code = thu_module.main()
         assert code == 1
 

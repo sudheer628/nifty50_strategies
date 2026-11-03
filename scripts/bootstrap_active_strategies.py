@@ -72,7 +72,13 @@ def bootstrap_from_snapshots(poll_now: bool = False, reset_mongo: bool = False) 
 
             logger.info("Found Tuesday snapshot: %s | CE %s (₹%s) | PE %s (₹%s)", c_id, c_strike, c_buy, p_strike, p_buy)
 
-            init_or_rotate_cycle("5day_strategy", {
+            snap_broker = tue_snap.get("broker")
+            snap_entry_status = tue_snap.get("entry_status")
+            if not snap_entry_status and str(tue_snap.get("status") or "").upper() in ("FILLED", "PAPER_ENTRY"):
+                # Compatibility for older snapshots that stored entry state in status.
+                snap_entry_status = str(tue_snap["status"]).upper()
+
+            tue_cycle_info = {
                 "cycle_id": c_id,
                 "start_date": start_date,
                 "expiry_date": expiry_date,
@@ -80,10 +86,24 @@ def bootstrap_from_snapshots(poll_now: bool = False, reset_mongo: bool = False) 
                 "put_strike": p_strike,
                 "moneyness": moneyness,
                 "entry_spot": spot,
-            })
+            }
+            if snap_broker:
+                tue_cycle_info["broker"] = snap_broker
+            init_or_rotate_cycle("5day_strategy", tue_cycle_info)
 
             if c_buy is not None and p_buy is not None:
-                update_locked_prices("5day_strategy", call_buy=c_buy, put_buy=p_buy, spot=spot)
+                update_locked_prices(
+                    "5day_strategy",
+                    call_buy=c_buy,
+                    put_buy=p_buy,
+                    spot=spot,
+                    broker=snap_broker,
+                    entry_status=snap_entry_status,
+                    call_order_id=tue_snap.get("call_order_id"),
+                    put_order_id=tue_snap.get("put_order_id"),
+                    call_ref_ltp=tue_snap.get("call_ref_ltp"),
+                    put_ref_ltp=tue_snap.get("put_ref_ltp"),
+                )
 
             # Check if peak or fsm state was already active in snapshot
             if tue_snap.get("peak_profit", {}).get("alert_sent"):
@@ -146,7 +166,13 @@ def bootstrap_from_snapshots(poll_now: bool = False, reset_mongo: bool = False) 
                     c_id, exp_date_obj, today_ist
                 )
             else:
-                init_or_rotate_cycle("3day_strategy", {
+                snap_broker = thu_snap.get("broker")
+                snap_entry_status = thu_snap.get("entry_status")
+                if not snap_entry_status and str(thu_snap.get("status") or "").upper() in ("FILLED", "PAPER_ENTRY"):
+                    # Compatibility for older snapshots that stored entry state in status.
+                    snap_entry_status = str(thu_snap["status"]).upper()
+
+                thu_cycle_info = {
                     "cycle_id": c_id,
                     "start_date": start_date,
                     "expiry_date": expiry_date,
@@ -154,10 +180,24 @@ def bootstrap_from_snapshots(poll_now: bool = False, reset_mongo: bool = False) 
                     "put_strike": p_strike,
                     "moneyness": "ATM",
                     "entry_spot": spot,
-                })
+                }
+                if snap_broker:
+                    thu_cycle_info["broker"] = snap_broker
+                init_or_rotate_cycle("3day_strategy", thu_cycle_info)
 
                 if c_buy is not None and p_buy is not None:
-                    update_locked_prices("3day_strategy", call_buy=c_buy, put_buy=p_buy, spot=spot)
+                    update_locked_prices(
+                        "3day_strategy",
+                        call_buy=c_buy,
+                        put_buy=p_buy,
+                        spot=spot,
+                        broker=snap_broker,
+                        entry_status=snap_entry_status,
+                        call_order_id=thu_snap.get("call_order_id"),
+                        put_order_id=thu_snap.get("put_order_id"),
+                        call_ref_ltp=thu_snap.get("call_ref_ltp"),
+                        put_ref_ltp=thu_snap.get("put_ref_ltp"),
+                    )
 
         except Exception as e:
             logger.error("Failed to read Thursday snapshot (%s): %s", THURSDAY_SNAPSHOT_FILE, e)
