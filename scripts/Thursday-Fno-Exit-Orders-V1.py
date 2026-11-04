@@ -69,7 +69,9 @@ except ImportError:
         sys.path.insert(0, project_root)
 
 from common.fno_keys import (
+    EXITED_QTY_TTL_SEC,
     build_detailed_enabled_key,
+    build_exited_qty_key,
     build_leg_enabled_key,
     get_orders_live_key,
     normalize_cycle,
@@ -1063,6 +1065,9 @@ def reconcile_cycle_legs(
                     active_expiry=eff_expiry,
                 )
                 own_filled_qty = int(_redis_float(r, own_keys["exit_filled_qty"]))
+                if leg_strike and leg_opt:
+                    own_filled_qty = max(own_filled_qty, int(_redis_float(
+                        r, build_exited_qty_key("thu", leg_expiry or eff_expiry, leg_strike, leg_opt, broker))))
                 own_exit_complete = bool(auth_qty and own_filled_qty >= int(auth_qty))
             except Exception as exc:
                 logger.warning("Own-exit check failed for %s: %s", enabled_key, exc)
@@ -1466,6 +1471,15 @@ def manage_thursday_exit_orders(
                 or str(o.get("order_id") or o.get("orderid") or "") in other_cycle_order_ids_in_redis
             )
         ]
+        other_cycle_sells_all = [
+            o for o in orders
+            if order_matches_position(o, pos)
+            and str(o.get("transaction_type") or o.get("transactiontype") or "").upper() == "SELL"
+            and (
+                order_tag(o).upper() in OTHER_CYCLE_TAGS
+                or str(o.get("order_id") or o.get("orderid") or "") in other_cycle_order_ids_in_redis
+            )
+        ]
         manual_sells = [
             o for o in matching_sells
             if o not in managed_sells and o not in other_cycle_sells
@@ -1539,12 +1553,25 @@ def manage_thursday_exit_orders(
             else:
                 own_filled_today += int(max(0.0, _to_float(o.get("filled_quantity") or o.get("filledshares"))))
         persisted_filled = int(_redis_float(r, keys["exit_filled_qty"])) if r else 0
-        own_filled = max(own_filled_today, persisted_filled)
+        contract = keys.get("details") or {}
+        exited_key = None
+        try:
+            if contract.get("strike") and contract.get("option_type"):
+                exited_key = build_exited_qty_key("thu", keys.get("expiry_iso"), contract["strike"], contract["option_type"], broker)
+        except (TypeError, ValueError):
+            exited_key = None
+        canonical_exited = int(_redis_float(r, exited_key)) if (r and exited_key) else 0
+        own_filled = max(own_filled_today, persisted_filled, canonical_exited)
         if r and execute and own_filled_today > persisted_filled:
             try:
                 r.set(keys["exit_filled_qty"], str(own_filled_today), ex=604800)
             except Exception as exc:
                 logger.warning("[%s] Failed to persist Thursday filled exit qty: %s", symbol, exc)
+        if r and execute and exited_key and own_filled_today > canonical_exited:
+            try:
+                r.set(exited_key, str(own_filled_today), ex=EXITED_QTY_TTL_SEC)
+            except Exception as exc:
+                logger.warning("[%s] Failed to persist Thursday exited qty: %s", symbol, exc)
         if existing is None and own_filled > 0:
             remaining_own = max(0, leg_target_qty - own_filled)
             if remaining_own <= 0:
@@ -1566,6 +1593,66 @@ def manage_thursday_exit_orders(
                 logger.info("[%s] %s exit qty reduced %d -> %d (own filled %d/%d)",
                             symbol, "Thursday", managed_qty, remaining_own, own_filled, leg_target_qty)
                 managed_qty = remaining_own
+
+        # Shared broker contract: reserve the quantity the Tuesday track still owns (not only
+        # its pending SELL orders). If the net position is smaller than both tracks' remaining
+        # holdings, part of it was sold outside the managers (typically a manual square-off) and
+        # the owner cannot be determined from the broker's net position -> fail closed and alert.
+        other_remaining = 0
+        try:
+            if contract.get("strike") and contract.get("option_type"):
+                other_filled_today = 0
+                for o in other_cycle_sells_all:
+                    o_status = normalize_order_status(o.get("status") or o.get("orderstatus"))
+                    if o_status in TERMINAL_FILLED_STATUSES:
+                        other_filled_today += order_filled_quantity(o)
+                    else:
+                        other_filled_today += int(max(0.0, _to_float(o.get("filled_quantity") or o.get("filledshares"))))
+                from common.unified_strategy_store import get_track_remaining_owned_qty
+                other_remaining = get_track_remaining_owned_qty(
+                    "5day_strategy", int(float(contract["strike"])), str(contract["option_type"]),
+                    keys.get("expiry_iso"), broker, redis_client=r, filled_today=other_filled_today,
+                )
+        except Exception as exc:
+            logger.warning("[%s] Could not compute Tuesday track owned qty: %s", symbol, exc)
+            other_remaining = 0
+        if other_remaining > 0:
+            own_remaining = max(0, leg_target_qty - own_filled)
+            if total_broker_qty < own_remaining + other_remaining:
+                reason = (
+                    f"Shared contract {symbol}: broker net qty {total_broker_qty} is below Thursday remaining "
+                    f"{own_remaining} + Tuesday remaining {other_remaining}. Part of the position was sold "
+                    "outside the exit managers (manual square-off?) and its owner is unknown. No order placed. "
+                    "Record the manual exit with scripts/mark_manual_exit.py for the track you sold."
+                )
+                logger.critical("[%s] %s", symbol, reason)
+                dispatch_order_failure_discord(
+                    broker=broker,
+                    action="SHARED_CONTRACT_SHORTFALL",
+                    track=CYCLE_TRACK,
+                    symbol=symbol,
+                    quantity=own_remaining,
+                    error_reason=reason,
+                    details={"broker_net_qty": total_broker_qty, "own_remaining": own_remaining,
+                             "other_track_remaining": other_remaining},
+                    redis_client=r,
+                    cooldown_seconds=3600,
+                )
+                item = {
+                    "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                    "instrument_token": token_key, "tag": tag, "quantity": 0,
+                    "total_broker_qty": total_broker_qty, "status": "shared_contract_shortfall",
+                    "own_remaining": own_remaining, "other_track_remaining": other_remaining,
+                    "reason": reason, "success": False,
+                }
+                actions.append(item)
+                alerts.append({"severity": "CRITICAL", **item})
+                continue
+            cap_for_this_track = total_broker_qty - other_remaining
+            if cap_for_this_track < managed_qty:
+                logger.info("[%s] %s exit qty capped %d -> %d (reserving %d for Tuesday)",
+                            symbol, "Thursday", managed_qty, cap_for_this_track, other_remaining)
+                managed_qty = cap_for_this_track
 
         entry_details = {}
         symbol_details = parse_tradingsymbol(symbol)

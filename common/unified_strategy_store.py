@@ -422,6 +422,91 @@ def get_active_leg_entry_details(
     return details
 
 
+def resolve_cycle_entry_qty(track: str, strategy_data: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None) -> int:
+    """
+    Quantity (contracts) a cycle bought per leg.
+
+    Order: recorded entry_qty (unified record / locked entry) -> same-cycle entry snapshot
+    entry_qty -> LOTS_TUESDAY / LOTS_THURSDAY x NIFTY_LOT_SIZE (legacy cycles).
+    """
+    norm = normalize_track(track)
+    locked = (strategy_data or {}).get("day1_locked_price") or {}
+    raw = (strategy_data or {}).get("entry_qty") or locked.get("entry_qty")
+    if not raw and snapshot and snapshot.get("cycle_id") and snapshot.get("cycle_id") == (strategy_data or {}).get("cycle_id"):
+        raw = snapshot.get("entry_qty")
+    try:
+        qty = int(raw or 0)
+    except (TypeError, ValueError):
+        qty = 0
+    if qty > 0:
+        return qty
+    lot_size = int(os.getenv("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
+    lots_env = "LOTS_TUESDAY" if norm == "5day_strategy" else "LOTS_THURSDAY"
+    default_lots = 2 if norm == "5day_strategy" else 1
+    lots = int((strategy_data or {}).get("lots") or os.getenv(lots_env, str(default_lots)))
+    return lots * lot_size
+
+
+def get_track_remaining_owned_qty(
+    track: str,
+    strike: int,
+    option_type: str,
+    expiry: Optional[str],
+    broker: str,
+    redis_client: Optional[Any] = None,
+    filepath: Optional[str] = None,
+    filled_today: int = 0,
+) -> int:
+    """
+    Quantity of one contract that `track` still owns on `broker`
+    (entry qty minus quantity already exited by its manager or marked as a manual exit).
+
+    Returns 0 when the track holds no live FILLED position in this exact contract on this broker.
+    Used by the exit managers to reserve the other track's lot on a shared broker contract.
+    """
+    norm = normalize_track(track)
+    opt = str(option_type or "").upper().strip()
+    if opt not in ("CE", "PE"):
+        return 0
+    strat = load_active_strategies(filepath=filepath).get(norm) or {}
+    locked = strat.get("day1_locked_price") or {}
+    entry_status = str(strat.get("entry_status") or locked.get("entry_status") or "").upper().strip()
+    if entry_status != "FILLED":
+        return 0
+    if str(strat.get("status") or "").lower().strip() in ("closed", "aborted", "skipped", "pending_entry"):
+        return 0
+    strat_broker = str(strat.get("broker") or locked.get("broker") or "").lower().strip()
+    if not strat_broker or strat_broker != str(broker or "").lower().strip():
+        return 0
+    held_strike = strat.get("call_strike" if opt == "CE" else "put_strike")
+    if held_strike is None or int(held_strike) != int(strike):
+        return 0
+    held_expiry = normalize_expiry(strat.get("expiry_date") or strat.get("expiry"))
+    if held_expiry != normalize_expiry(expiry):
+        return 0
+
+    snapshot = None
+    try:
+        snap_file = ACTIVE_SNAPSHOT_FILE if norm == "5day_strategy" else THURSDAY_SNAPSHOT_FILE
+        with open(snap_file, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+    except Exception:
+        snapshot = None
+    owned = resolve_cycle_entry_qty(norm, strat, snapshot)
+
+    exited = 0
+    if redis_client is not None:
+        from common.fno_keys import build_exited_qty_key
+        cycle = "tue" if norm == "5day_strategy" else "thu"
+        try:
+            exited = int(float(redis_client.get(build_exited_qty_key(cycle, held_expiry, strike, opt, broker)) or 0))
+        except Exception as exc:
+            logger.warning("Could not read exited qty for %s %s%s: %s", norm, strike, opt, exc)
+    # filled_today: the track's filled SELLs visible in today's broker order book, which its own
+    # manager may not have recorded yet (e.g. filled seconds ago).
+    return max(0, owned - max(exited, int(filled_today or 0)))
+
+
 def save_active_strategies(data: Dict[str, Any], filepath: Optional[str] = None) -> None:
     """
     Save the unified active strategies JSON file under an exclusive file lock.
@@ -952,13 +1037,7 @@ def publish_exit_authorization_to_redis(
     # Authorize exactly the quantity this cycle actually bought (recorded at entry), so a
     # track can never exit more than its own lot on a contract shared with the other track.
     # LOTS_* above remains the fallback for cycles entered before entry_qty was recorded.
-    entry_qty_raw = strategy_data.get("entry_qty") or locked_entry.get("entry_qty")
-    if not entry_qty_raw and snap and snap.get("cycle_id") and snap.get("cycle_id") == strategy_data.get("cycle_id"):
-        entry_qty_raw = snap.get("entry_qty")
-    try:
-        entry_qty = int(entry_qty_raw or 0)
-    except (TypeError, ValueError):
-        entry_qty = 0
+    entry_qty = resolve_cycle_entry_qty(track, strategy_data, snap)
     if entry_qty > 0:
         if entry_qty != target_qty:
             logger.info(

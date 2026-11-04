@@ -140,6 +140,35 @@ def normalize_expiry(
     return exp_str
 
 
+EXITED_QTY_TTL_SEC = 8 * 24 * 3600
+
+
+def build_exited_qty_key(
+    cycle: str,
+    expiry: Union[str, date, datetime, None],
+    strike: Union[int, float, str],
+    option_type: str,
+    broker: str = "upstox",
+) -> str:
+    """
+    Redis key holding the cumulative quantity a cycle has already exited for one contract
+    (filled managed SELLs, or a user's manual square-off recorded via mark_manual_exit).
+
+    Deliberately outside the fno:{broker}:enabled:* and fno:{broker}:trail:* namespaces so
+    leg retirement never purges it: the other track on a shared broker contract relies on it
+    to know how much of the net position this cycle still owns.
+
+    Format:
+        fno:{broker}:exited:{cycle}:{expiry_iso}:{strike}:{option_type}
+    """
+    b = str(broker or "upstox").lower().strip()
+    c = normalize_cycle(cycle)
+    exp_iso = normalize_expiry(expiry)
+    st = int(float(strike))
+    opt = str(option_type or "").upper().strip()
+    return f"fno:{b}:exited:{c}:{exp_iso}:{st}:{opt}"
+
+
 def build_leg_enabled_key(
     cycle: str,
     expiry: Union[str, date, datetime],
