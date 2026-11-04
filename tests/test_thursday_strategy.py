@@ -30,6 +30,23 @@ from common.entry_gate import EntryGateResult
 
 class ThursdayStrategyTests(unittest.TestCase):
 
+    def setUp(self):
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp_dir.cleanup)
+        patches = (
+            patch(
+                "common.unified_strategy_store.ACTIVE_STRATEGIES_JSON",
+                os.path.join(self._tmp_dir.name, "active_strategies.json"),
+            ),
+            patch("common.unified_strategy_store.sync_active_cycles_to_mongodb"),
+            patch("common.unified_strategy_store.append_telemetry_log_to_mongodb"),
+            patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"),
+            patch("strategies.thursday_option_collector.update_active_fsm_state"),
+        )
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
     def test_thursday_calendar_roles_and_active_days(self):
         """Test Thursday strategy cycle recognition across weekdays."""
         # 2026-10-08 is a regular non-holiday Thursday
@@ -244,7 +261,7 @@ class ThursdayStrategyTests(unittest.TestCase):
             "put": {"ltp": 95.0},
         }
 
-        ok = collect_once(force_static=False, force_entry=False, dry_run=True)
+        ok = collect_once(force_static=False, force_entry=False, dry_run=True, execute_buy=False)
         self.assertTrue(ok)
 
         # 1. Gate evaluated with reference LTP
@@ -307,7 +324,7 @@ class ThursdayStrategyTests(unittest.TestCase):
             "put": {"ltp": 90.0},
         }
 
-        ok = collect_once(force_static=False, force_entry=False, dry_run=True)
+        ok = collect_once(force_static=False, force_entry=False, dry_run=True, execute_buy=False)
         self.assertTrue(ok)
 
         # Counterfactual shadow must be recorded
@@ -353,7 +370,7 @@ class ThursdayStrategyTests(unittest.TestCase):
             "put": {"ltp": 80.0},
         }
 
-        ok = collect_once(dry_run=True)
+        ok = collect_once(dry_run=True, execute_buy=False)
         self.assertTrue(ok)
 
         # Verified options called with locked strikes
@@ -371,7 +388,7 @@ class ThursdayStrategyTests(unittest.TestCase):
     @patch("strategies.thursday_option_collector._today_ist", return_value=date(2026, 10, 7))
     def test_thursday_collect_once_off_cycle_day_no_op(self, mock_today, mock_holiday, mock_spot):
         """Test that Wednesday cleanly no-ops without fetching spot or executing strategy."""
-        ok = collect_once()
+        ok = collect_once(execute_buy=False)
         self.assertTrue(ok)
         mock_spot.assert_not_called()
 

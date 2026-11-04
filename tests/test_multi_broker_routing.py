@@ -109,6 +109,100 @@ class TestConfigBrokerRouting:
             get_broker_for_track("scalping_strategy")
 
 
+class TestCompactUpstoxOptionSymbols:
+    def test_compact_symbol_parser_uses_active_expiry_for_canonical_key(self):
+        compact_ce = "NIFTY26N0923500CE"
+        compact_pe = "NIFTY26N0923700PE"
+
+        tue_ce = tue_module.parse_tradingsymbol(compact_ce)
+        thu_pe = thu_module.parse_tradingsymbol(compact_pe)
+        assert tue_ce["underlying"] == "NIFTY"
+        assert tue_ce["strike"] == "23500"
+        assert tue_ce["option_type"] == "CE"
+        assert thu_pe["underlying"] == "NIFTY"
+        assert thu_pe["strike"] == "23700"
+        assert thu_pe["option_type"] == "PE"
+
+        keys = tue_module.build_trail_redis_keys(
+            "upstox", compact_ce, "NSE_FO|39939", active_expiry="2026-11-09"
+        )
+        assert keys["enabled_canonical"] == "fno:upstox:enabled:tue:2026-11-09:23500:CE"
+        assert keys["expiry_iso"] == "2026-11-09"
+
+    def test_compact_symbol_parser_handles_all_months(self):
+        """Test compact symbols across both single-digit months (Jan-Sep) and letter months (Oct-Dec)."""
+        test_cases = [
+            ("NIFTY2610822000CE", "26108", "2026-01-08", "22000", "CE"),
+            ("NIFTY2681424000PE", "26814", "2026-08-14", "24000", "PE"),
+            ("NIFTY26O1523000PE", "26O15", "2026-10-15", "23000", "PE"),
+            ("NIFTY26N0923500CE", "26N09", "2026-11-09", "23500", "CE"),
+            ("NIFTY26D2423500CE", "26D24", "2026-12-24", "23500", "CE"),
+        ]
+        from common.fno_keys import normalize_expiry
+        for sym, exp_code, exp_iso, strike, opt in test_cases:
+            parsed = tue_module.parse_tradingsymbol(sym)
+            assert parsed["underlying"] == "NIFTY"
+            assert parsed["expiry"] == exp_code
+            assert parsed["strike"] == strike
+            assert parsed["option_type"] == opt
+            # Direct normalization without active_expiry
+            assert normalize_expiry(exp_code) == exp_iso
+            # Keys generated with and without active_expiry
+            keys = tue_module.build_trail_redis_keys("upstox", sym, "TOK123")
+            assert keys["enabled_canonical"] == f"fno:upstox:enabled:tue:{exp_iso}:{strike}:{opt}"
+            assert keys["expiry_iso"] == exp_iso
+
+    def test_get_active_strategy_expiry_snapshot_fallback(self, tmp_path):
+        """Verify get_active_strategy_expiry falls back to snapshot file if active_strategies.json is empty."""
+        tue_snap = tmp_path / "tue_snap.json"
+        thu_snap = tmp_path / "thu_snap.json"
+        tue_snap.write_text(json.dumps({"expiry_date": "20261109", "broker": "upstox"}))
+        thu_snap.write_text(json.dumps({"expiry_date": "20261105", "broker": "angelone"}))
+
+        empty_active = tmp_path / "active_strategies.json"
+        empty_active.write_text(json.dumps({}))
+
+        with patch("common.unified_strategy_store.ACTIVE_STRATEGIES_JSON", str(empty_active)), \
+             patch("config.ACTIVE_SNAPSHOT_FILE", str(tue_snap)), \
+             patch("config.THURSDAY_SNAPSHOT_FILE", str(thu_snap)):
+            exp_tue = tue_module.get_active_strategy_expiry("5day_strategy")
+            exp_thu = thu_module.get_active_strategy_expiry("3day_strategy")
+            assert exp_tue == "2026-11-09"
+            assert exp_thu == "2026-11-05"
+
+    def test_tuesday_accepts_canonical_exit_authorization_for_compact_symbol(self):
+        mock_redis = MagicMock()
+        authorization_key = "fno:upstox:enabled:tue:2026-11-09:23500:CE"
+        mock_redis.get.side_effect = lambda key: (
+            json.dumps({"enabled": True, "qty": 65}) if key == authorization_key else None
+        )
+        mock_redis.scan_iter.return_value = []
+        mock_redis.smembers.return_value = set()
+
+        position = {
+            "tradingsymbol": "NIFTY26N0923500CE",
+            "instrument_token": "NSE_FO|39939",
+            "exchange": "NFO",
+            "quantity": 65,
+            "product": "D",
+            "average_price": 255.55,
+        }
+        with patch.object(tue_module, "fetch_ltp", return_value=446.60):
+            summary = tue_module.manage_tuesday_exit_orders(
+                token="MOCK_TOKEN",
+                positions=[position],
+                orders=[],
+                broker="upstox",
+                target_lots=1,
+                execute=False,
+                redis_client=mock_redis,
+                active_expiry="2026-11-09",
+            )
+
+        assert summary["authorized_positions"] == 1
+        assert not any(action.get("status") == "authorization_skipped" for action in summary["actions"])
+
+
 class TestBrokerAdapterPolymorphism:
     """Test unified broker adapter factory and mock-isolated responses."""
 
@@ -1303,6 +1397,7 @@ class TestBootstrapPreservesBrokerMetadata:
              patch("common.unified_strategy_store.ACTIVE_STRATEGIES_JSON", active_json_file), \
              patch("scripts.bootstrap_active_strategies.sync_active_cycles_to_mongodb"), \
              patch("common.unified_strategy_store.sync_active_cycles_to_mongodb"), \
+             patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"), \
              patch("common.unified_strategy_store.append_telemetry_log_to_mongodb"):
 
             bootstrap.bootstrap_from_snapshots(poll_now=False)

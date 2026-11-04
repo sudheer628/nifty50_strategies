@@ -399,6 +399,7 @@ def parse_tradingsymbol(tradingsymbol: str) -> Dict[str, str]:
     Robust parser for NSE / Upstox option tradingsymbols:
       - Weekly with 2-digit year at end: NIFTY03NOV2622650CE -> NIFTY, 03NOV26, 22650, CE
       - Monthly/Weekly with 2-digit year first: NIFTY26NOV22650CE -> NIFTY, 26NOV, 22650, CE
+      - Compact Upstox format: NIFTY26N0923500CE -> NIFTY, active expiry, 23500, CE
       - Legacy format: NIFTY4AUG24000CE -> NIFTY, 4AUG, 24000, CE
     """
     raw = str(tradingsymbol or "").upper().strip()
@@ -411,6 +412,10 @@ def parse_tradingsymbol(tradingsymbol: str) -> Dict[str, str]:
     m3 = re.match(r"^([A-Z]+)(\d{1,2}[A-Z]{3})(\d{4,5})(CE|PE)$", raw)
     if m3:
         return {"underlying": m3.group(1), "expiry": m3.group(2), "strike": m3.group(3), "option_type": m3.group(4), "raw": raw}
+    # Compact Upstox / NSE weekly format: two-digit year + single-char month (1-9, O, N, D) + day.
+    m_compact = re.match(r"^([A-Z]+)(\d{2}[1-9OND]\d{2})(\d{4,5})(CE|PE)$", raw)
+    if m_compact:
+        return {"underlying": m_compact.group(1), "expiry": m_compact.group(2), "strike": m_compact.group(3), "option_type": m_compact.group(4), "raw": raw}
     m4 = re.match(r"^(.*?)(\d+)(CE|PE)$", raw)
     if m4:
         return {"underlying": m4.group(1), "expiry": "UNKNOWN", "strike": m4.group(2), "option_type": m4.group(3), "raw": raw}
@@ -418,7 +423,7 @@ def parse_tradingsymbol(tradingsymbol: str) -> Dict[str, str]:
 
 
 def get_active_strategy_expiry(track: str = "3day_strategy") -> Optional[str]:
-    """Retrieve active cycle expiry_date (YYYY-MM-DD) from environment or active_strategies.json."""
+    """Retrieve active cycle expiry_date (YYYY-MM-DD) from environment, active_strategies.json, or snapshot file."""
     env_exp = os.getenv("ACTIVE_EXPIRY_DATE") or os.getenv("EXPIRY_DATE")
     if env_exp:
         return normalize_expiry(env_exp)
@@ -426,9 +431,20 @@ def get_active_strategy_expiry(track: str = "3day_strategy") -> Optional[str]:
         from common.unified_strategy_store import load_active_strategies
         active = load_active_strategies()
         strat = active.get(track, {})
-        exp = strat.get("expiry_date")
+        exp = strat.get("expiry_date") or (strat.get("day1_locked_price") or {}).get("expiry_date")
         if exp:
             return normalize_expiry(exp)
+    except Exception:
+        pass
+    try:
+        from config import ACTIVE_SNAPSHOT_FILE, THURSDAY_SNAPSHOT_FILE
+        target_file = THURSDAY_SNAPSHOT_FILE if str(track).startswith("3") or "thu" in str(track).lower() else ACTIVE_SNAPSHOT_FILE
+        if os.path.exists(target_file):
+            with open(target_file, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+                exp = snap.get("expiry_date") or snap.get("expiry")
+                if exp:
+                    return normalize_expiry(exp)
     except Exception:
         pass
     return None
@@ -470,6 +486,8 @@ def build_trail_redis_keys(
     """
     broker = (broker or "angelone").lower().strip()
     details = parse_tradingsymbol(tradingsymbol)
+    if str(details.get("expiry") or "").upper() in ("UNKNOWN", "NONE", "N/A") and active_expiry:
+        details["expiry"] = normalize_expiry(None, active_expiry=active_expiry)
     safe_token = str(instrument_token or "NOTOKEN").replace("|", "_").replace(":", "_").upper()
     safe_symbol = str(tradingsymbol or "NOSYMBOL").upper().replace(":", "_").replace("|", "_")
     contract_suffix = (

@@ -41,7 +41,7 @@ def normalize_expiry(
         (uses active_expiry or ref_year/current year)
       - Monthly format with year first: '26NOV' -> matches active_expiry if same year/month
     """
-    if not expiry:
+    if not expiry or str(expiry).strip().upper() in {"UNKNOWN", "NONE", "N/A"}:
         if active_expiry:
             return normalize_expiry(active_expiry)
         return "UNKNOWN"
@@ -109,6 +109,32 @@ def normalize_expiry(
                 if act_dt.strftime("%y") == yr_2d and act_dt.strftime("%b").upper() == month_str:
                     return act_norm
             except Exception:
+                pass
+
+    # 7. Compact NSE weekly format: '26N09' or '26814' (2-digit Year + 1-char Month [1-9OND] + 2-digit Day)
+    m_compact_exp = re.match(r"^(\d{2})([1-9OND])(\d{2})$", exp_str)
+    if m_compact_exp:
+        yr_2d = m_compact_exp.group(1)
+        m_char = m_compact_exp.group(2)
+        day_str = m_compact_exp.group(3)
+        month_map = {
+            "1": "01", "2": "02", "3": "03", "4": "04", "5": "05", "6": "06",
+            "7": "07", "8": "08", "9": "09", "O": "10", "N": "11", "D": "12",
+        }
+        mm = month_map.get(m_char)
+        if mm:
+            yr = f"20{yr_2d}"
+            try:
+                cand = datetime.strptime(f"{yr}-{mm}-{day_str}", "%Y-%m-%d").strftime("%Y-%m-%d")
+                if active_expiry:
+                    try:
+                        act_norm = normalize_expiry(active_expiry)
+                        if act_norm == cand:
+                            return act_norm
+                    except Exception:
+                        pass
+                return cand
+            except ValueError:
                 pass
 
     return exp_str

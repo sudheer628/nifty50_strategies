@@ -1,4 +1,6 @@
 import sys
+import os
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -44,6 +46,23 @@ CLOSED_PRIOR_SNAPSHOT = {
 
 
 class CycleSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp_dir.cleanup)
+        patches = (
+            patch(
+                "common.unified_strategy_store.ACTIVE_STRATEGIES_JSON",
+                os.path.join(self._tmp_dir.name, "active_strategies.json"),
+            ),
+            patch("common.unified_strategy_store.sync_active_cycles_to_mongodb"),
+            patch("common.unified_strategy_store.append_telemetry_log_to_mongodb"),
+            patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"),
+            patch("strategies.weekly_option_collector.update_active_fsm_state"),
+        )
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
     def test_strikes_are_symmetric_around_first_trigger_ltp_anchor(self):
         # ITM mode (default per 6-year backtesting data: Put=25100, Call=24900)
         self.assertEqual(strike_selector(25000.0, mode="ITM"), (25100, 24900))
@@ -101,7 +120,7 @@ class CycleSnapshotTests(unittest.TestCase):
             "put": {"ltp": 75.0},
         }
 
-        self.assertTrue(collect_once())
+        self.assertTrue(collect_once(execute_buy=False))
 
         get_options.assert_called_once_with("11AUG2026", 24700, 24500)
         record = insert_record.call_args.args[1]
@@ -150,7 +169,7 @@ class CycleSnapshotTests(unittest.TestCase):
             "put": {"ltp": 83.0},
         }
 
-        self.assertTrue(collect_once())
+        self.assertTrue(collect_once(execute_buy=False))
 
         # In ITM mode, delta-calibrated selection chooses Call=24800, Put=25250 (7 DTE)
         get_options.assert_called_once_with("18AUG2026", 24800, 25250)
@@ -213,7 +232,7 @@ class CycleSnapshotTests(unittest.TestCase):
             "put": {"ltp": 125.0},
         }
 
-        self.assertTrue(collect_once())
+        self.assertTrue(collect_once(execute_buy=False))
 
         # Assert insert_timing_shadow_entry was called for V1, V2, V3, V4
         self.assertEqual(insert_shadow.call_count, 4)
@@ -289,7 +308,7 @@ class CycleSnapshotTests(unittest.TestCase):
         get_spot.return_value = {"ltp": 25000.0, "open": 24950.0, "close": 24900.0}
         get_options.return_value = {"call": {"ltp": 95.0}, "put": {"ltp": 88.0}}
 
-        self.assertTrue(collect_once())
+        self.assertTrue(collect_once(execute_buy=False))
 
         # Entry gate is evaluated because Wednesday is the deferred start day.
         gate.assert_called_once()

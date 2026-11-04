@@ -27,6 +27,7 @@ import json
 import os
 import sqlite3
 import tempfile
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -489,22 +490,29 @@ def test_tuesday_collector_live_buy_insufficient_funds_skips(sample_contracts):
     """
     from strategies.weekly_option_collector import collect_once
 
-    with patch("strategies.weekly_option_collector.load_active_snapshot", return_value=None), \
-         patch("strategies.weekly_option_collector.save_active_snapshot") as mock_save, \
-         patch("strategies.weekly_option_collector.insert_buy_snapshot"), \
-         patch("strategies.weekly_option_collector._today_ist") as mock_today, \
-         patch("strategies.weekly_option_collector.check_nse_holiday", return_value=False), \
-         patch("strategies.weekly_option_collector.is_strategy_start_day", return_value=True), \
-         patch("strategies.weekly_option_collector.get_nifty_spot", return_value={"ltp": 24500.0, "open": 24450.0, "close": 24400.0}), \
-         patch("strategies.weekly_option_collector.select_strikes", return_value=(24400, 24600, 24400, 24600, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.68, -0.68)), \
-         patch("strategies.weekly_option_collector.get_nifty_option_chain", return_value={
-             "call": {"ltp": 150.0, "instrument_key": "NSE_FO|53750"},
-             "put": {"ltp": 140.0, "instrument_key": "NSE_FO|53795"},
-         }), \
-         patch("common.entry_order_manager.resolve_upstox_option_key", side_effect=lambda exp, st, opt: f"NSE_FO|{st}"), \
-         patch("common.entry_order_manager.get_available_funds", return_value=1000.0), \
-         patch("common.entry_order_manager.place_market_order") as mock_place, \
-         patch.dict(os.environ, {"LIVE_BUY_TRIGGER_TUESDAY": "true", "MOCK_BROKER": "true"}):
+    with tempfile.TemporaryDirectory() as tmp_dir, ExitStack() as stack:
+        stack.enter_context(patch("common.unified_strategy_store.ACTIVE_STRATEGIES_JSON", os.path.join(tmp_dir, "active_strategies.json")))
+        stack.enter_context(patch("common.unified_strategy_store.sync_active_cycles_to_mongodb"))
+        stack.enter_context(patch("common.unified_strategy_store.append_telemetry_log_to_mongodb"))
+        stack.enter_context(patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"))
+        stack.enter_context(patch("strategies.weekly_option_collector._ensure_db", return_value=os.path.join(tmp_dir, "weekly.db")))
+        stack.enter_context(patch("strategies.weekly_option_collector.dispatch_order_failure_with_retry"))
+        stack.enter_context(patch("strategies.weekly_option_collector.load_active_snapshot", return_value=None))
+        mock_save = stack.enter_context(patch("strategies.weekly_option_collector.save_active_snapshot"))
+        stack.enter_context(patch("strategies.weekly_option_collector.insert_buy_snapshot"))
+        mock_today = stack.enter_context(patch("strategies.weekly_option_collector._today_ist"))
+        stack.enter_context(patch("strategies.weekly_option_collector.check_nse_holiday", return_value=False))
+        stack.enter_context(patch("strategies.weekly_option_collector.is_strategy_start_day", return_value=True))
+        stack.enter_context(patch("strategies.weekly_option_collector.get_nifty_spot", return_value={"ltp": 24500.0, "open": 24450.0, "close": 24400.0}))
+        stack.enter_context(patch("strategies.weekly_option_collector.select_strikes", return_value=(24400, 24600, 24400, 24600, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.68, -0.68)))
+        stack.enter_context(patch("strategies.weekly_option_collector.get_nifty_option_chain", return_value={
+            "call": {"ltp": 150.0, "instrument_key": "NSE_FO|53750"},
+            "put": {"ltp": 140.0, "instrument_key": "NSE_FO|53795"},
+        }))
+        stack.enter_context(patch("common.entry_order_manager.resolve_upstox_option_key", side_effect=lambda exp, st, opt: f"NSE_FO|{st}"))
+        stack.enter_context(patch("common.entry_order_manager.get_available_funds", return_value=1000.0))
+        mock_place = stack.enter_context(patch("common.entry_order_manager.place_market_order"))
+        stack.enter_context(patch.dict(os.environ, {"LIVE_BUY_TRIGGER_TUESDAY": "true", "MOCK_BROKER": "true"}))
 
         from datetime import date
         mock_today.return_value = date(2026, 11, 3)
@@ -558,41 +566,47 @@ def test_thursday_collector_live_buy_insufficient_funds_skips(sample_contracts):
     """
     from strategies.thursday_option_collector import collect_once
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
+    with tempfile.TemporaryDirectory() as tmp_dir, ExitStack() as stack:
         snap_file = os.path.join(tmp_dir, "active_cycle_thursday.json")
-        with patch("strategies.thursday_option_collector.THURSDAY_SNAPSHOT_FILE", snap_file), \
-             patch("strategies.thursday_option_collector.load_active_snapshot", return_value=None), \
-             patch("strategies.thursday_option_collector.save_active_snapshot") as mock_save, \
-             patch("strategies.thursday_option_collector.insert_buy_snapshot"), \
-             patch("strategies.thursday_option_collector._today_ist") as mock_today, \
-             patch("strategies.thursday_option_collector.check_nse_holiday", return_value=False), \
-             patch("strategies.thursday_option_collector.is_thursday_strategy_active_day", return_value=True), \
-             patch("strategies.thursday_option_collector.is_thursday_strategy_start_day", return_value=True), \
-             patch("strategies.thursday_option_collector.get_nifty_spot", return_value={"ltp": 24500.0, "open": 24450.0, "close": 24400.0}), \
-             patch("strategies.thursday_option_collector.select_strikes", return_value=(24500, 24500, 24500, 24500, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.50, -0.50)), \
-             patch("strategies.thursday_option_collector.get_nifty_option_chain", return_value={
-                 "call": {"ltp": 120.0, "token": "53750", "trading_symbol": "NIFTY03NOV2624500CE"},
-                 "put": {"ltp": 110.0, "token": "53795", "trading_symbol": "NIFTY03NOV2624500PE"},
-             }), \
-             patch("common.angelone_client.resolve_option_token", side_effect=lambda exp, st, opt: {"token": str(st), "symboltoken": str(st), "trading_symbol": f"NIFTY{exp}{st}{opt}", "strike": st, "option_type": opt}), \
-             patch("common.entry_order_manager.get_available_funds", return_value=1000.0), \
-             patch("common.entry_order_manager.place_market_order") as mock_place, \
-             patch.dict(os.environ, {"LIVE_BUY_TRIGGER_THURSDAY": "true", "MOCK_BROKER": "true"}):
+        stack.enter_context(patch("common.unified_strategy_store.ACTIVE_STRATEGIES_JSON", os.path.join(tmp_dir, "active_strategies.json")))
+        stack.enter_context(patch("common.unified_strategy_store.sync_active_cycles_to_mongodb"))
+        stack.enter_context(patch("common.unified_strategy_store.append_telemetry_log_to_mongodb"))
+        stack.enter_context(patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"))
+        stack.enter_context(patch("strategies.thursday_option_collector._ensure_thursday_db", return_value=os.path.join(tmp_dir, "thursday.db")))
+        stack.enter_context(patch("strategies.thursday_option_collector.dispatch_order_failure_with_retry"))
+        stack.enter_context(patch("strategies.thursday_option_collector.THURSDAY_SNAPSHOT_FILE", snap_file))
+        stack.enter_context(patch("strategies.thursday_option_collector.load_active_snapshot", return_value=None))
+        mock_save = stack.enter_context(patch("strategies.thursday_option_collector.save_active_snapshot"))
+        stack.enter_context(patch("strategies.thursday_option_collector.insert_buy_snapshot"))
+        mock_today = stack.enter_context(patch("strategies.thursday_option_collector._today_ist"))
+        stack.enter_context(patch("strategies.thursday_option_collector.check_nse_holiday", return_value=False))
+        stack.enter_context(patch("strategies.thursday_option_collector.is_thursday_strategy_active_day", return_value=True))
+        stack.enter_context(patch("strategies.thursday_option_collector.is_thursday_strategy_start_day", return_value=True))
+        stack.enter_context(patch("strategies.thursday_option_collector.get_nifty_spot", return_value={"ltp": 24500.0, "open": 24450.0, "close": 24400.0}))
+        stack.enter_context(patch("strategies.thursday_option_collector.select_strikes", return_value=(24500, 24500, 24500, 24500, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.50, -0.50)))
+        stack.enter_context(patch("strategies.thursday_option_collector.get_nifty_option_chain", return_value={
+            "call": {"ltp": 120.0, "token": "53750", "trading_symbol": "NIFTY03NOV2624500CE"},
+            "put": {"ltp": 110.0, "token": "53795", "trading_symbol": "NIFTY03NOV2624500PE"},
+        }))
+        stack.enter_context(patch("common.angelone_client.resolve_option_token", side_effect=lambda exp, st, opt: {"token": str(st), "symboltoken": str(st), "trading_symbol": f"NIFTY{exp}{st}{opt}", "strike": st, "option_type": opt}))
+        stack.enter_context(patch("common.entry_order_manager.get_available_funds", return_value=1000.0))
+        mock_place = stack.enter_context(patch("common.entry_order_manager.place_market_order"))
+        stack.enter_context(patch.dict(os.environ, {"LIVE_BUY_TRIGGER_THURSDAY": "true", "MOCK_BROKER": "true"}))
 
-            from datetime import date
-            mock_today.return_value = date(2026, 11, 5)
+        from datetime import date
+        mock_today.return_value = date(2026, 11, 5)
 
-            ok = collect_once()
-            assert ok is True
-            mock_place.assert_not_called()
-            assert mock_save.called
-            saved_snap = mock_save.call_args[0][0]
-            assert saved_snap["entry_status"] == "SKIPPED_INSUFFICIENT_FUNDS"
-            assert saved_snap["call_buy_price"] is None
-            assert saved_snap["put_buy_price"] is None
-            assert saved_snap["call_ref_ltp"] == 120.0
-            assert saved_snap["put_ref_ltp"] == 110.0
-            assert saved_snap["alpha_fsm"] is None
+        ok = collect_once()
+        assert ok is True
+        mock_place.assert_not_called()
+        assert mock_save.called
+        saved_snap = mock_save.call_args[0][0]
+        assert saved_snap["entry_status"] == "SKIPPED_INSUFFICIENT_FUNDS"
+        assert saved_snap["call_buy_price"] is None
+        assert saved_snap["put_buy_price"] is None
+        assert saved_snap["call_ref_ltp"] == 120.0
+        assert saved_snap["put_ref_ltp"] == 110.0
+        assert saved_snap["alpha_fsm"] is None
 
 
 def test_thursday_collector_idempotent_on_repeat_run():
@@ -797,7 +811,14 @@ def test_collector_cli_argument_precedence_and_env():
         return saved_snaps[-1] if saved_snaps else None
 
     # Tuesday: execute_buy=False overrides LIVE_BUY_TRIGGER_TUESDAY=true
-    with patch("strategies.weekly_option_collector.load_active_snapshot", side_effect=fake_load), \
+    with tempfile.TemporaryDirectory() as tmp_dir, \
+         patch("common.unified_strategy_store.ACTIVE_STRATEGIES_JSON", os.path.join(tmp_dir, "active_strategies.json")), \
+         patch("common.unified_strategy_store.sync_active_cycles_to_mongodb"), \
+         patch("common.unified_strategy_store.append_telemetry_log_to_mongodb"), \
+         patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"), \
+         patch("strategies.weekly_option_collector._ensure_db", return_value=os.path.join(tmp_dir, "weekly.db")), \
+         patch("strategies.weekly_option_collector.update_active_fsm_state"), \
+         patch("strategies.weekly_option_collector.load_active_snapshot", side_effect=fake_load), \
          patch("strategies.weekly_option_collector.save_active_snapshot", side_effect=fake_save), \
          patch("strategies.weekly_option_collector.insert_buy_snapshot"), \
          patch("strategies.weekly_option_collector._today_ist", return_value=date(2026, 11, 3)), \
@@ -835,7 +856,14 @@ def test_collector_dry_run_does_not_suppress_live_buy(sample_contracts):
     def fake_load(**kw):
         return saved_snaps[-1] if saved_snaps else None
 
-    with patch("strategies.weekly_option_collector.load_active_snapshot", side_effect=fake_load), \
+    with tempfile.TemporaryDirectory() as tmp_dir, \
+         patch("common.unified_strategy_store.ACTIVE_STRATEGIES_JSON", os.path.join(tmp_dir, "active_strategies.json")), \
+         patch("common.unified_strategy_store.sync_active_cycles_to_mongodb"), \
+         patch("common.unified_strategy_store.append_telemetry_log_to_mongodb"), \
+         patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"), \
+         patch("strategies.weekly_option_collector._ensure_db", return_value=os.path.join(tmp_dir, "weekly.db")), \
+         patch("strategies.weekly_option_collector.update_active_fsm_state"), \
+         patch("strategies.weekly_option_collector.load_active_snapshot", side_effect=fake_load), \
          patch("strategies.weekly_option_collector.save_active_snapshot", side_effect=fake_save), \
          patch("strategies.weekly_option_collector.insert_buy_snapshot"), \
          patch("strategies.weekly_option_collector._today_ist", return_value=date(2026, 11, 3)), \
@@ -884,9 +912,12 @@ def test_unified_strategy_store_and_mongo_synced_on_failed_entry():
     with tempfile.TemporaryDirectory() as tmp_dir:
         unified_json = os.path.join(tmp_dir, "active_strategies.json")
         with patch("common.unified_strategy_store.ACTIVE_STRATEGIES_JSON", unified_json), \
+             patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"), \
              patch("strategies.weekly_option_collector.load_active_snapshot", return_value=None), \
              patch("strategies.weekly_option_collector.save_active_snapshot"), \
              patch("strategies.weekly_option_collector.insert_buy_snapshot"), \
+             patch("strategies.weekly_option_collector._ensure_db", return_value=os.path.join(tmp_dir, "weekly.db")), \
+             patch("strategies.weekly_option_collector.dispatch_order_failure_with_retry"), \
              patch("strategies.weekly_option_collector._today_ist", return_value=date(2026, 11, 3)), \
              patch("strategies.weekly_option_collector.check_nse_holiday", return_value=False), \
              patch("strategies.weekly_option_collector.is_tuesday", return_value=True), \
@@ -896,8 +927,10 @@ def test_unified_strategy_store_and_mongo_synced_on_failed_entry():
                  "call": {"ltp": 150.0, "token": "53750", "trading_symbol": "NIFTY03NOV2624600CE"},
                  "put": {"ltp": 140.0, "token": "53795", "trading_symbol": "NIFTY03NOV2624400PE"},
              }), \
-             patch("common.entry_order_manager.get_available_funds", return_value=1000.0), \
-             patch("common.unified_strategy_store.sync_active_cycles_to_mongodb") as mock_mongo_sync, \
+              patch("common.entry_order_manager.get_available_funds", return_value=1000.0), \
+              patch("strategies.weekly_option_collector.dispatch_order_failure_with_retry"), \
+              patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"), \
+              patch("common.unified_strategy_store.sync_active_cycles_to_mongodb") as mock_mongo_sync, \
              patch.dict(os.environ, {"LIVE_BUY_TRIGGER_TUESDAY": "true", "MOCK_BROKER": "true"}):
 
             ok = collect_once()
@@ -1343,8 +1376,3 @@ def test_update_locked_prices_aborted_status_does_not_lock_zero_price():
     finally:
         if os.path.exists(json_path):
             os.unlink(json_path)
-
-
-
-
-
