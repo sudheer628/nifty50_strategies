@@ -573,22 +573,10 @@ def sync_active_cycles_to_mongodb(active_data: Dict[str, Any]) -> bool:
 
 def append_telemetry_log_to_mongodb(log_record: Dict[str, Any]) -> bool:
     """
-    Insert a single-row telemetry or discrete event record into `derivative_cycle_live_logs`.
+    Deprecated: Telemetry logging to MongoDB derivative_cycle_live_logs has been removed.
+    Preserved as no-op for backward compatibility.
     """
-    try:
-        db = get_mongodb_db()
-        if db is None:
-            return False
-
-        col = db[MONGODB_COLLECTION_DERIVATIVE_CYCLE_LIVE_LOGS]
-        record = dict(log_record)
-        if "inserted_ts" not in record:
-            record["inserted_ts"] = _now_utc_ts()
-        col.insert_one(record)
-        return True
-    except Exception as exc:
-        logger.warning("MongoDB telemetry log insertion failed: %s", exc)
-        return False
+    return True
 
 
 def reset_cycle_live_logs_in_mongodb(track: str) -> bool:
@@ -900,32 +888,6 @@ def update_latest_ltp(
         exit_signal_label = exits["alpha_fsm"].get("display_symbol")
     elif exits.get("ai_inference", {}).get("triggered"):
         exit_signal_label = exits["ai_inference"].get("display_symbol")
-
-    # Append 5MIN_TICK row to MongoDB
-    append_telemetry_log_to_mongodb({
-        "strategy_track": norm,
-        "cycle_id": strat.get("cycle_id"),
-        "timestamp": ts,
-        "time_ist": time_ist,
-        "event_type": "5MIN_TICK",
-        "nifty_spot": s_val,
-        "call_strike": strat.get("call_strike"),
-        "call_ltp": c_ltp,
-        "call_buy_price": c_buy,
-        "call_diff_pts": c_diff,
-        "put_strike": strat.get("put_strike"),
-        "put_ltp": p_ltp,
-        "put_buy_price": p_buy,
-        "put_diff_pts": p_diff,
-        "combined_ltp": comb_ltp,
-        "combined_buy_price": comb_buy,
-        "combined_pnl_pts": pnl_pts,
-        "combined_pnl_pct": pnl_pct,
-        "combined_pnl_inr": pnl_inr,
-        "exit_signal": exit_signal_label,
-        "exit_details": None,
-        "source": "unified_strategy_store:update_latest_ltp",
-    })
 
     return active
 

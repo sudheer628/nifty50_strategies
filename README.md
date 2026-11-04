@@ -76,8 +76,6 @@ nifty50_strategies/
 │   ├── send_weekly_report.py            # Monday HTML email + chart generator (supports --track)
 │   ├── compare_ai_vs_static_benchmark.py # Retrospective side-by-side P&L comparison
 │   ├── compare_entry_timing_counterfactuals.py # Counterfactual entry timing evaluation
-│   ├── monitor_live_options_5min.py     # High-frequency 5-min live options monitor
-│   ├── run_5min_options_monitor.sh      # Cron wrapper script for 5-min options monitor
 │   └── sync_to_mongodb.py               # MongoDB Atlas derivatives synchronization CLI (supports --track)
 ├── tests/                               # 260 automated pytest unit tests
 │   ├── test_ai_strike_selector.py
@@ -87,7 +85,6 @@ nifty50_strategies/
 │   ├── test_fno_keys.py                 # Expiry normalization, key formatting, parsing & year-boundary tests
 │   ├── test_fsm_strategy.py
 │   ├── test_gamma_sniper.py
-│   ├── test_monitor_live_options_5min.py
 │   ├── test_nifty_spot_feed.py
 │   ├── test_opening_straddle_alerts.py
 │   ├── test_opening_straddle_backtest.py
@@ -906,8 +903,6 @@ All production crontab schedules execute in **UTC** on AWS EC2:
 46 3 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/nifty50_strategies_peak_monitor_$(date +\%F).log 2>&1
 16,46 4-9 * * 1-5 cd ~/nifty50_strategies && .venv/bin/python strategies/peak_profit_monitor.py >> /home/ubuntu/logs/nifty50_strategies_peak_monitor_$(date +\%F).log 2>&1
 
-# capturing ltp of option prices for protal view
-*/5 3-10 * * 1-5 /home/ubuntu/nifty50_strategies/scripts/run_5min_options_monitor.sh >> /home/ubuntu/logs/options_5min_monitor_$(date +\%F).log 2>&1
 
 # NIFTY50 OPENING STRADDLE STRATEGY (09:14 - 10:00 AM IST)
 # Runs daily at 09:14 AM IST = 03:44 AM UTC (Mon-Fri) as an analytical tracking engine

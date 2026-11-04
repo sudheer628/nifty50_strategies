@@ -209,23 +209,16 @@ def bootstrap_from_snapshots(poll_now: bool = False, reset_mongo: bool = False) 
     sync_active_cycles_to_mongodb(final_active)
     logger.info("Bootstrap completed successfully. File saved to: %s", ACTIVE_STRATEGIES_JSON)
 
-    if poll_now:
-        logger.info("Executing immediate 5-min poller check...")
-        from scripts.monitor_live_options_5min import main as poller_main
-        sys.argv = ["monitor_live_options_5min.py", "--force", "--verbose"]
-        poller_main()
-
     return True
 
 
 def main():
     parser = argparse.ArgumentParser(description="Mid-Week Bootstrap for Active Options Strategies")
-    parser.add_argument("--poll", action="store_true", help="Run immediate 5-minute telemetry poll after bootstrap")
     parser.add_argument("--reset-mongo", action="store_true", help="Purge prior cycle live telemetry logs in MongoDB")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [bootstrap] %(message)s")
-    bootstrap_from_snapshots(poll_now=args.poll, reset_mongo=args.reset_mongo)
+    bootstrap_from_snapshots(reset_mongo=args.reset_mongo)
 
 
 if __name__ == "__main__":
