@@ -50,6 +50,31 @@ THURSDAY_BROKER = os.getenv("THURSDAY_BROKER", "angelone").lower().strip()
 SUPPORTED_BROKERS = ("upstox", "angelone")
 
 
+def get_entry_qty_for_track(track: str) -> int:
+    """
+    Paired BUY quantity (contracts) for a strategy track.
+
+    Uses the track's own lot allocation (LOTS_TUESDAY / LOTS_THURSDAY x NIFTY_LOT_SIZE)
+    so entry size always equals the exit size authorized for that track. Falls back to
+    STRATEGY_BUY_QTY / NIFTY_LOT_SIZE only when the track's LOTS_* is not configured.
+    """
+    t = str(track or "").lower().strip()
+    if t in ("5day_strategy", "5day", "weekly", "tuesday", "tue"):
+        lots_env = "LOTS_TUESDAY"
+    elif t in ("3day_strategy", "3day", "thursday", "thu"):
+        lots_env = "LOTS_THURSDAY"
+    else:
+        raise ValueError(f"Unknown strategy track '{track}'")
+    lot_size = int(os.getenv("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
+    raw_lots = (os.getenv(lots_env) or "").strip()
+    if raw_lots:
+        lots = int(raw_lots)
+        if lots <= 0:
+            raise ValueError(f"{lots_env} must be a positive integer (got {raw_lots!r})")
+        return lots * lot_size
+    return int(os.getenv("STRATEGY_BUY_QTY") or lot_size)
+
+
 def get_broker_for_track(track: str) -> str:
     """
     Resolve and validate the configured broker for a strategy track.

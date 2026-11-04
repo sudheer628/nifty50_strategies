@@ -513,6 +513,7 @@ def build_trail_redis_keys(
         "entry_order_id": f"{base}:entry_order_id",
         "mode": f"{base}:mode",
         "market_order_id": f"{base}:market_order_id",
+        "exit_filled_qty": f"{base}:exit_filled_qty",
         "max_short": f"{short_base}:max",
         "sl_short": f"{short_base}:sl",
         "avg_short": f"{short_base}:avg",
@@ -901,6 +902,8 @@ def _cleanup_thursday_leg_state(r, keys: Dict[str, str], broker: str = "angelone
             pipe.delete(keys["mode"])
         if keys.get("market_order_id"):
             pipe.delete(keys["market_order_id"])
+        if keys.get("exit_filled_qty"):
+            pipe.delete(keys["exit_filled_qty"])
         if keys.get("max_short"):
             pipe.delete(keys["max_short"])
         if keys.get("sl_short"):
@@ -1043,16 +1046,42 @@ def reconcile_cycle_legs(
                or (leg_symbol and leg_symbol == p_sym):
                 if _position_quantity(p) > 0:
                     has_active_pos = True
+                    matched_pos = p
                     break
 
+        own_exit_complete = False
+        own_keys = None
         if has_active_pos:
-            continue
+            # Shared contract: if this track already filled its full authorized exit quantity,
+            # the remaining broker quantity belongs to the other track -> retire this leg.
+            try:
+                _auth_ok, auth_qty = _get_redis_leg_authorization(r, enabled_key)
+                own_keys = build_trail_redis_keys(
+                    broker,
+                    matched_pos.get("tradingsymbol") or matched_pos.get("instrument_token") or "UNKNOWN",
+                    str(matched_pos.get("instrument_token") or ""),
+                    active_expiry=eff_expiry,
+                )
+                own_filled_qty = int(_redis_float(r, own_keys["exit_filled_qty"]))
+                own_exit_complete = bool(auth_qty and own_filled_qty >= int(auth_qty))
+            except Exception as exc:
+                logger.warning("Own-exit check failed for %s: %s", enabled_key, exc)
+                own_exit_complete = False
+            if not own_exit_complete:
+                continue
+            logger.info(
+                "Thursday exit for %s fully filled (%d/%d); remaining broker qty belongs to another track. Retiring leg.",
+                enabled_key, own_filled_qty, int(auth_qty),
+            )
 
         # Check 2: Does an open managed SELL order exist in broker order book for this contract?
         has_open_order = False
         eff_symbol = leg_symbol or f"NIFTY{leg_strike}{leg_opt}"
         eff_token = leg_token or "NOTOKEN"
         leg_keys = build_trail_redis_keys(broker, eff_symbol, eff_token, active_expiry=eff_expiry)
+        if own_exit_complete and own_keys:
+            leg_keys = own_keys
+            eff_symbol = own_keys.get("symbol") or eff_symbol
         stored_order_ids = {
             _redis_text(r, leg_keys.get(key))
             for key in ("order_id", "market_order_id")
@@ -1089,7 +1118,7 @@ def reconcile_cycle_legs(
 
         # Check 3: Was this authorization actually executed by the manager (filled managed SELL)?
         # If not, the Alpha exit never reached the broker (e.g. strike/symbol mismatch or manual close).
-        exit_executed = False
+        exit_executed = own_exit_complete
         for o in orders:
             order_id = str(o.get("order_id") or o.get("orderid") or "").strip()
             is_managed = (
@@ -1489,6 +1518,54 @@ def manage_thursday_exit_orders(
 
         existing = managed_sells[0] if managed_sells else None
         existing_order_id = str((existing or {}).get("order_id") or (existing or {}).get("orderid") or "")
+
+        # Own-exit accounting for shared broker contracts: the net position may also hold the
+        # other strategy track's lot. Count this track's filled managed SELLs (today's order book)
+        # and the quantity persisted from earlier days (broker order books reset overnight), and
+        # never exit beyond this track's authorized quantity.
+        own_filled_today = 0
+        for o in orders:
+            if not order_matches_position(o, pos):
+                continue
+            if str(o.get("transaction_type") or o.get("transactiontype") or "").upper() != "SELL":
+                continue
+            o_id = str(o.get("order_id") or o.get("orderid") or "")
+            if not (order_tag(o).upper() == tag.upper() or o_id in managed_order_ids_in_redis
+                    or (stored_order_id and o_id == stored_order_id)):
+                continue
+            o_status = normalize_order_status(o.get("status") or o.get("orderstatus"))
+            if o_status in TERMINAL_FILLED_STATUSES:
+                own_filled_today += order_filled_quantity(o)
+            else:
+                own_filled_today += int(max(0.0, _to_float(o.get("filled_quantity") or o.get("filledshares"))))
+        persisted_filled = int(_redis_float(r, keys["exit_filled_qty"])) if r else 0
+        own_filled = max(own_filled_today, persisted_filled)
+        if r and execute and own_filled_today > persisted_filled:
+            try:
+                r.set(keys["exit_filled_qty"], str(own_filled_today), ex=604800)
+            except Exception as exc:
+                logger.warning("[%s] Failed to persist Thursday filled exit qty: %s", symbol, exc)
+        if existing is None and own_filled > 0:
+            remaining_own = max(0, leg_target_qty - own_filled)
+            if remaining_own <= 0:
+                item = {
+                    "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                    "instrument_token": token_key, "tag": tag, "quantity": 0,
+                    "total_broker_qty": total_broker_qty,
+                    "status": "market_order_already_filled" if is_immediate else "own_exit_already_filled",
+                    "own_filled_qty": own_filled, "mode": "immediate" if is_immediate else "trailing",
+                    "success": True,
+                    "reason": f"Thursday exit already filled its authorized quantity ({own_filled}/{leg_target_qty}); "
+                              f"remaining broker qty {total_broker_qty} is not owned by this track",
+                }
+                actions.append(item)
+                logger.info("[%s] %s exit already filled (%d/%d); not exiting remaining broker qty %d",
+                            symbol, "Thursday", own_filled, leg_target_qty, total_broker_qty)
+                continue
+            if remaining_own < managed_qty:
+                logger.info("[%s] %s exit qty reduced %d -> %d (own filled %d/%d)",
+                            symbol, "Thursday", managed_qty, remaining_own, own_filled, leg_target_qty)
+                managed_qty = remaining_own
 
         entry_details = {}
         symbol_details = parse_tradingsymbol(symbol)

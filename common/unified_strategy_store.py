@@ -949,6 +949,24 @@ def publish_exit_authorization_to_redis(
             put_strike_raw = snap.get("put_strike", put_strike_raw)
             expiry_raw = snap_expiry or expiry_raw
 
+    # Authorize exactly the quantity this cycle actually bought (recorded at entry), so a
+    # track can never exit more than its own lot on a contract shared with the other track.
+    # LOTS_* above remains the fallback for cycles entered before entry_qty was recorded.
+    entry_qty_raw = strategy_data.get("entry_qty") or locked_entry.get("entry_qty")
+    if not entry_qty_raw and snap and snap.get("cycle_id") and snap.get("cycle_id") == strategy_data.get("cycle_id"):
+        entry_qty_raw = snap.get("entry_qty")
+    try:
+        entry_qty = int(entry_qty_raw or 0)
+    except (TypeError, ValueError):
+        entry_qty = 0
+    if entry_qty > 0:
+        if entry_qty != target_qty:
+            logger.info(
+                "Exit authorization qty for %s cycle %s uses recorded entry_qty=%d (LOTS-derived qty=%d).",
+                track, strategy_data.get("cycle_id"), entry_qty, target_qty,
+            )
+        target_qty = entry_qty
+
     expiry_iso = normalize_expiry(expiry_raw)
 
     try:

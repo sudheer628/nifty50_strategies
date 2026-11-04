@@ -495,7 +495,8 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             from config import get_broker_for_track
             track_broker = get_broker_for_track("3day_strategy")
             from common.entry_order_manager import execute_paired_market_buy, NIFTY_LOT_SIZE
-            qty = int(os.getenv("STRATEGY_BUY_QTY") or os.getenv("NIFTY_LOT_SIZE") or NIFTY_LOT_SIZE)
+            from config import get_entry_qty_for_track
+            qty = get_entry_qty_for_track("3day_strategy")
             if track_broker == "angelone":
                 from common.angelone_client import resolve_option_token
                 call_contract = resolve_option_token(expiry_angelone, call_strike, "CE")
@@ -525,6 +526,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 call_ltp=call_ltp,
                 put_ltp=put_ltp,
                 tag="THU-BUY",
+                snapshot_baseline=True,
             )
 
             if not buy_res.get("success"):
@@ -622,6 +624,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             "put_ref_ltp": put_ref_ltp,
             "call_order_id": call_order_id,
             "put_order_id": put_order_id,
+            "entry_qty": qty if entry_status == "FILLED" else None,
             "entry_status": entry_status,
             "broker": broker_name,
             "captured_at": _now_utc_ts(),
@@ -677,6 +680,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 "put_strike": put_strike,
                 "moneyness": "ATM",
                 "entry_spot": nifty_ltp,
+                "entry_qty": qty if entry_status == "FILLED" else None,
             })
             update_locked_prices(
                 "3day_strategy",

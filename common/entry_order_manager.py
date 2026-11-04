@@ -1441,6 +1441,7 @@ def execute_paired_market_buy(
     position_provider: Optional[Any] = None,
     baseline_call_qty: int = 0,
     baseline_put_qty: int = 0,
+    snapshot_baseline: bool = False,
 ) -> Dict[str, Any]:
     """
     Orchestrate full paired MARKET BUY execution:
@@ -1492,6 +1493,31 @@ def execute_paired_market_buy(
             "error": reason,
             "message": f"Preflight rejected: {reason}",
         }
+
+    # 2b. Pre-entry position baseline: when both strategy tracks share a broker account,
+    # the same contract may already be held by the other track. Rollback flatness must be
+    # verified relative to that pre-existing quantity, not against zero.
+    if snapshot_baseline:
+        try:
+            if position_provider:
+                pre_positions = position_provider() if callable(position_provider) else position_provider
+            else:
+                pre_positions = fetch_broker_positions(broker, active_token)
+            _, pre_details = verify_positions_flat(
+                broker=broker,
+                positions=pre_positions,
+                call_contract=call_contract,
+                put_contract=put_contract,
+            )
+            baseline_call_qty = int(pre_details.get("call_net", 0))
+            baseline_put_qty = int(pre_details.get("put_net", 0))
+            if baseline_call_qty or baseline_put_qty:
+                logger.info(
+                    "[%s] Pre-entry baseline: CALL net=%d, PUT net=%d already held in account (other strategy track)",
+                    broker, baseline_call_qty, baseline_put_qty,
+                )
+        except Exception as exc:
+            logger.warning("[%s] Could not snapshot pre-entry positions for rollback baseline: %s", broker, exc)
 
     # 3. Submit Paired Orders Back-to-Back
     logger.info(
