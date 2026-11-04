@@ -11,3 +11,8 @@ sqlite/
 *.egg-info/
 dist/
 build/
+
+# Runtime strategy state (lives in /home/ubuntu/sqlite/strategies, never in the repo)
+current_week_buy*.json
+current_thursday_buy*.json
+active_strategies.json*
