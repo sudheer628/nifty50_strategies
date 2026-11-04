@@ -1268,18 +1268,36 @@ def test_select_single_leg_decision_matrix():
     assert action == OrderAction.BUY
     assert strike == 25000
 
-    # 6. Neutral Chop (+0.05) -> SKIP
-    leg, action, strike, reason = select_single_leg_decision(0.05, 25000)
+    # 6. Mild Bullish (+0.055, as observed on Nov 3) -> SELL PUT 1-step OTM 24950
+    leg, action, strike, reason = select_single_leg_decision(0.055, 25000)
+    assert leg == TradeLeg.PUT
+    assert action == OrderAction.SELL
+    assert strike == 24950
+    assert "MODERATE_BULLISH" in reason
+
+    # 7. Mild Bearish (-0.05) -> SELL CALL 1-step OTM 25050 (User Tip Priority)
+    leg, action, strike, reason = select_single_leg_decision(-0.05, 25000)
+    assert leg == TradeLeg.CALL
+    assert action == OrderAction.SELL
+    assert strike == 25050
+    assert "MODERATE_BEARISH" in reason
+
+    # 8. Dead Flat / Neutral Chop (+0.01) -> SKIP (< 0.02)
+    leg, action, strike, reason = select_single_leg_decision(0.01, 25000)
     assert leg == TradeLeg.NONE
     assert action is None
     assert strike is None
     assert "SKIP" in reason
 
-    # 7. Neutral Chop (-0.05) -> SKIP
-    leg, action, strike, reason = select_single_leg_decision(-0.05, 25000)
+    # 9. Dead Flat / Neutral Chop (-0.01) -> SKIP (> -0.02)
+    leg, action, strike, reason = select_single_leg_decision(-0.01, 25000)
     assert leg == TradeLeg.NONE
     assert action is None
     assert strike is None
+
+    # 10. Explicit chop_threshold parameter override (e.g. 0.10)
+    leg, action, strike, reason = select_single_leg_decision(0.05, 25000, chop_threshold=0.10)
+    assert leg == TradeLeg.NONE
 
 
 def test_run_opening_straddle_neutral_chop_skip(temp_db):
@@ -1290,7 +1308,7 @@ def test_run_opening_straddle_neutral_chop_skip(temp_db):
     from strategies.opening_straddle_selector import run_opening_straddle
 
     neutral_intel = PreMarketIntelligence(
-        cds=0.02,
+        cds=0.00,
         coverage=0.80,
         confidence=ConfidenceLevel.HIGH,
         bias=BiasClassification.NEUTRAL,
@@ -1300,7 +1318,7 @@ def test_run_opening_straddle_neutral_chop_skip(temp_db):
         timestamp_utc="2026-10-31T03:44:00Z",
         nifty_prev_close=25000.0,
         nifty_spot=25000.0,
-        composite_morning_score=0.02,
+        composite_morning_score=0.00,
     )
 
     with patch("strategies.opening_straddle_selector.PreMarketIntelligenceLoader") as mock_loader_cls, \

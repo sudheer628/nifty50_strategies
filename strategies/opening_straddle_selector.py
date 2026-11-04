@@ -111,40 +111,58 @@ def compute_final_composite_morning_score(
     return max(-1.0, min(1.0, raw_cms))
 
 
+DEFAULT_OPENING_CHOP_THRESHOLD = 0.02
+DEFAULT_OPENING_STRONG_THRESHOLD = 0.25
+
+
 def select_single_leg_decision(
     cms: float,
     atm_strike: int,
     prefer_sell_call_on_strong_bearish: bool = True,
+    chop_threshold: Optional[float] = None,
+    strong_threshold: Optional[float] = None,
 ) -> Tuple[TradeLeg, Optional[OrderAction], Optional[int], str]:
     """
-    Evaluates Composite Morning Score (CMS) against Decision Matrix (Plan Section 5.1):
-      - Strong Bullish (CMS >= +0.30):
+    Evaluates Composite Morning Score (CMS) against Calibrated Decision Matrix:
+      - Strong Bullish (CMS >= +strong_threshold, default 0.25):
           BUY CALL ATM (K_atm)
-      - Moderate Bullish / Support (+0.10 <= CMS < +0.30):
-          SELL PUT 1-step OTM (K_atm - 50)
-      - Moderate Bearish / Resistance (-0.30 < CMS <= -0.10):
-          SELL CALL 1-step OTM (K_atm + 50) [User Priority Tip]
-      - Strong Bearish (CMS <= -0.30):
+      - Moderate / Mild Bullish (+chop_threshold <= CMS < +strong_threshold, default 0.02 to 0.25):
+          SELL PUT 1-step OTM (K_atm - 50) [Premium decay harvest with upward cushion]
+      - Moderate / Mild Bearish (-strong_threshold < CMS <= -chop_threshold, default -0.25 to -0.02):
+          SELL CALL 1-step OTM (K_atm + 50) [User Priority Tip: Theta decay + downward cushion]
+      - Strong Bearish (CMS <= -strong_threshold):
           SELL CALL 1-step OTM (Primary) or BUY PUT ATM (Secondary)
-      - Neutral / Chop (-0.10 < CMS < +0.10):
+      - Dead Flat / Neutral Chop (-chop_threshold < CMS < +chop_threshold):
           SKIP TRADE (NEUTRAL_CHOP)
     """
-    if cms >= 0.30:
+    if chop_threshold is None:
+        try:
+            chop_threshold = float(os.getenv("OPENING_CHOP_THRESHOLD", str(DEFAULT_OPENING_CHOP_THRESHOLD)))
+        except (ValueError, TypeError):
+            chop_threshold = DEFAULT_OPENING_CHOP_THRESHOLD
+
+    if strong_threshold is None:
+        try:
+            strong_threshold = float(os.getenv("OPENING_STRONG_THRESHOLD", str(DEFAULT_OPENING_STRONG_THRESHOLD)))
+        except (ValueError, TypeError):
+            strong_threshold = DEFAULT_OPENING_STRONG_THRESHOLD
+
+    if cms >= strong_threshold:
         return (TradeLeg.CALL, OrderAction.BUY, atm_strike, f"STRONG_BULLISH (CMS={cms:+.3f}): BUY CALL ATM {atm_strike}")
-    elif 0.10 <= cms < 0.30:
+    elif chop_threshold <= cms < strong_threshold:
         target_strike = atm_strike - 50
         return (TradeLeg.PUT, OrderAction.SELL, target_strike, f"MODERATE_BULLISH (CMS={cms:+.3f}): SELL PUT 1-step OTM {target_strike}")
-    elif -0.30 < cms <= -0.10:
+    elif -strong_threshold < cms <= -chop_threshold:
         target_strike = atm_strike + 50
         return (TradeLeg.CALL, OrderAction.SELL, target_strike, f"MODERATE_BEARISH (CMS={cms:+.3f}): SELL CALL 1-step OTM {target_strike} (User Tip Priority)")
-    elif cms <= -0.30:
+    elif cms <= -strong_threshold:
         if prefer_sell_call_on_strong_bearish:
             target_strike = atm_strike + 50
             return (TradeLeg.CALL, OrderAction.SELL, target_strike, f"STRONG_BEARISH (CMS={cms:+.3f}): SELL CALL 1-step OTM {target_strike} (Primary)")
         else:
             return (TradeLeg.PUT, OrderAction.BUY, atm_strike, f"STRONG_BEARISH (CMS={cms:+.3f}): BUY PUT ATM {atm_strike} (Secondary)")
     else:
-        return (TradeLeg.NONE, None, None, f"NEUTRAL_CHOP (CMS={cms:+.3f} in (-0.10, +0.10)): SKIP TRADE")
+        return (TradeLeg.NONE, None, None, f"NEUTRAL_CHOP (CMS={cms:+.3f} in (-{chop_threshold:.3f}, +{chop_threshold:.3f})): SKIP TRADE")
 
 
 def sample_opening_candle(
@@ -306,6 +324,8 @@ def run_opening_straddle(
     runner_trailing_drop_pct: float = 8.0,
     prefer_sell_call_on_strong_bearish: bool = True,
     short_margin_per_lot: Optional[float] = None,
+    chop_threshold: Optional[float] = None,
+    strong_threshold: Optional[float] = None,
 ) -> int:
     """
     Main orchestrator running the daily directional single-leg scalp cycle (09:14 to 10:00 AM).
@@ -420,6 +440,8 @@ def run_opening_straddle(
         cms=final_cms,
         atm_strike=atm_strike,
         prefer_sell_call_on_strong_bearish=prefer_sell_call_on_strong_bearish,
+        chop_threshold=chop_threshold,
+        strong_threshold=strong_threshold,
     )
     logger.info("Leg Selection Matrix Result: %s", decision_reason)
 

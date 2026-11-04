@@ -50,15 +50,30 @@ $$\text{Final CMS} = 0.80 \times \text{CDS}_{\text{premarket}} + 0.20 \times S_{
 
 ## 4. Leg Selection Decision Matrix & Execution
 
-At **09:16:05 AM IST**, the selector rounds the live NIFTY spot to determine ATM strike $K_{\text{ATM}}$ and evaluates the decision matrix:
+At **09:16:05 AM IST**, the selector rounds the live NIFTY spot to determine ATM strike $K_{\text{ATM}}$ and evaluates the calibrated decision matrix:
 
 | Final CMS Range | Market Bias | Action | Leg | Target Strike | Rationale |
 |---|---|---|---|---|---|
-| **$CMS \ge +0.30$** | Strong Bullish | **BUY** | **CALL** | $K_{\text{ATM}}$ | Aggressive upward delta capture on strong breakout momentum |
-| **$+0.10 \le CMS < +0.30$** | Moderate Bullish | **SELL** | **PUT** | $K_{\text{ATM}} - 50$ (1-step OTM) | Bullish credit scalp; captures fast opening theta decay with safety margin |
-| **$-0.30 < CMS \le -0.10$** | Moderate Bearish | **SELL** | **CALL** | $K_{\text{ATM}} + 50$ (1-step OTM) | **User Tip Priority**: Bearish credit scalp; captures opening call decay |
-| **$CMS \le -0.30$** | Strong Bearish | **SELL** (default)<br>*or BUY* | **CALL** (default)<br>*or PUT* | $K_{\text{ATM}} + 50$ (1-step OTM)<br>*or $K_{\text{ATM}}$ (ATM)* | Default: SELL CALL OTM (decay priority). Pass `--prefer-buy-put-on-strong-bearish` to select BUY PUT ATM. |
-| **$-0.10 < CMS < +0.10$** | Neutral / Chop | **SKIP** | **NONE** | None | `SKIPPED_NEUTRAL_CHOP` — zero orders placed, zero transaction friction |
+| **$CMS \ge +0.25$** | Strong Bullish | **BUY** | **CALL** | $K_{\text{ATM}}$ | Aggressive upward delta capture on strong breakout momentum |
+| **$+0.02 \le CMS < +0.25$** | Moderate Bullish | **SELL** | **PUT** | $K_{\text{ATM}} - 50$ (1-step OTM) | Bullish credit scalp; captures fast opening theta decay with 50-pt downside cushion |
+| **$-0.25 < CMS \le -0.02$** | Moderate Bearish | **SELL** | **CALL** | $K_{\text{ATM}} + 50$ (1-step OTM) | **User Tip Priority**: Bearish credit scalp; captures opening call decay with 50-pt upside cushion |
+| **$CMS \le -0.25$** | Strong Bearish | **SELL** (default)<br>*or BUY* | **CALL** (default)<br>*or PUT* | $K_{\text{ATM}} + 50$ (1-step OTM)<br>*or $K_{\text{ATM}}$ (ATM)* | Default: SELL CALL OTM (decay priority). Pass `--prefer-buy-put-on-strong-bearish` to select BUY PUT ATM. |
+| **$-0.02 < CMS < +0.02$** | Neutral / Chop | **SKIP** | **NONE** | None | `SKIPPED_NEUTRAL_CHOP` — zero orders placed, zero transaction friction (dead flat only) |
+
+### 4.1 Calibration Decisions & Historical Context
+
+* **Chop Deadband Calibration (November 2026)**:
+  * **Initial Implementation**: The decision matrix initially defined neutral chop as $CMS \in (-0.10, +0.10)$.
+  * **The Problem**: Pre-market sentiment composite scores on normal trading sessions typically average between $+0.04$ and $+0.08$. Consequently, sessions with distinct, actionable directional bias (e.g., Nov 3 at $CMS = +0.055$ and Nov 4 at $CMS = +0.073$) were classified as `NEUTRAL_CHOP_SKIP`, placing zero orders and foregoing profitable morning setups.
+  * **The Solution**: The deadband threshold was calibrated from $\pm 0.10$ down to $\pm 0.02$ (`OPENING_CHOP_THRESHOLD=0.02`). The strong breakout boundary was calibrated from $\pm 0.30$ to $\pm 0.25$ (`OPENING_STRONG_THRESHOLD=0.25`).
+* **Short Option Preference (Decay Priority)**:
+  * Instead of attempting to buy options on mild directional signals (which suffer from early morning implied volatility crush), the strategy enters **short option credit positions** (SELL PUT 1-step OTM for mild bullish, SELL CALL 1-step OTM for mild bearish).
+  * This structure provides dual benefits:
+    1. Rapid early morning theta decay (premium compression).
+    2. A 50-point directional cushion against adverse minor whipsaws.
+* **Full Tunability via Environment Variables**:
+  * `OPENING_CHOP_THRESHOLD` (default: `0.02`): Configures the chop cutoff. Any $|CMS| < \text{threshold}$ skips the day.
+  * `OPENING_STRONG_THRESHOLD` (default: `0.25`): Configures the transition between credit selling (OTM) and momentum buying (ATM).
 
 ---
 
@@ -145,6 +160,9 @@ Add your dedicated webhook URL to `/home/ubuntu/nifty50_strategies/.env`:
 
 ```bash
 DISCORD_OPENING_STRADDLE=https://discord.com/api/webhooks/your_dedicated_webhook_url
+OPENING_CHOP_THRESHOLD=0.02
+OPENING_STRONG_THRESHOLD=0.25
+SHORT_MARGIN_PER_LOT=120000.0
 ```
 
 * **Entry Notification**: Dispatched immediately at 09:16:05 AM IST detailing Action, Leg, Strike, Executable Price, Margin/Capital, VIX, and CMS score.
@@ -164,7 +182,7 @@ On the production VM (09:14 AM IST = 03:44 AM UTC):
 
 ### Optional CLI Arguments:
 * `--dry-run`: Runs full premarket intelligence, 1-minute candle observation, and leg selection without entering the live tracking loop.
-* `--prefer-buy-put-on-strong-bearish`: Switches strong bearish ($CMS \le -0.30$) action from SELL CALL OTM to BUY PUT ATM.
+* `--prefer-buy-put-on-strong-bearish`: Switches strong bearish ($CMS \le -0.25$) action from SELL CALL OTM to BUY PUT ATM.
 * `--short-margin <amount>`: Overrides short margin requirement per lot (default ₹120,000).
 * `--report`: Queries SQLite and outputs the formatted historical performance table.
 

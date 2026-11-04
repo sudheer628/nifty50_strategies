@@ -15,17 +15,38 @@ class BiasClassification(str, Enum):
     STRONG_BEARISH = "STRONG_BEARISH"
 
 
-def derive_bias_from_cms(cms: Optional[float]) -> BiasClassification:
+DEFAULT_OPENING_CHOP_THRESHOLD = 0.02
+DEFAULT_OPENING_STRONG_THRESHOLD = 0.25
+
+
+def derive_bias_from_cms(
+    cms: Optional[float],
+    chop_threshold: Optional[float] = None,
+    strong_threshold: Optional[float] = None,
+) -> BiasClassification:
     """Derives directional bias from the Composite Morning Score (CMS)."""
     if cms is None:
         return BiasClassification.NEUTRAL
-    if cms >= 0.30:
+    import os
+    if chop_threshold is None:
+        try:
+            chop_threshold = float(os.getenv("OPENING_CHOP_THRESHOLD", str(DEFAULT_OPENING_CHOP_THRESHOLD)))
+        except (ValueError, TypeError):
+            chop_threshold = DEFAULT_OPENING_CHOP_THRESHOLD
+
+    if strong_threshold is None:
+        try:
+            strong_threshold = float(os.getenv("OPENING_STRONG_THRESHOLD", str(DEFAULT_OPENING_STRONG_THRESHOLD)))
+        except (ValueError, TypeError):
+            strong_threshold = DEFAULT_OPENING_STRONG_THRESHOLD
+
+    if cms >= strong_threshold:
         return BiasClassification.STRONG_BULLISH
-    elif cms >= 0.10:
+    elif cms >= chop_threshold:
         return BiasClassification.MODERATE_BULLISH
-    elif cms <= -0.30:
+    elif cms <= -strong_threshold:
         return BiasClassification.STRONG_BEARISH
-    elif cms <= -0.10:
+    elif cms <= -chop_threshold:
         return BiasClassification.MODERATE_BEARISH
     else:
         return BiasClassification.NEUTRAL

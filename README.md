@@ -25,6 +25,7 @@ This strategy:
 - Smart Entry Gate timing (volatility, momentum, and technical filters with counterfactual shadow logging)
 - Decoupled FSM Strategy Engine (trailing stop ladders, profit harvest, salvage stops)
 - Monday Gamma Sniper (intraday simulated scalping with targets, SL, and time-stops)
+- Directional Single-Leg Opening Scalper (09:14–10:00 AM IST quick theta/momentum scalper with calibrated ±0.02 CMS chop deadband and short call bias; see [OPENING_STRADDLE_GUIDE.md](OPENING_STRADDLE_GUIDE.md))
 - Common data source via Angel One SmartAPI with Redis JWT auth
 - Persistent storage in SQLite (per-cycle DBs) and MongoDB Atlas synchronization
 - Automated post-market weekly close orchestration and HTML/chart reporting
@@ -67,7 +68,12 @@ nifty50_strategies/
 │   ├── weekly_option_collector.py       # Master weekly strategy entry point (runs :01 & :31)
 │   ├── thursday_option_collector.py     # Standalone Thursday-to-Monday collector (runs :02 & :32)
 │   ├── monday_gamma_sniper.py           # Monday afternoon gamma scalper (runs every 10m)
-│   └── peak_profit_monitor.py           # Standalone 15-min peak monitor (runs :16/:46 & :17/:47)
+│   ├── peak_profit_monitor.py           # Standalone 15-min peak monitor (runs :16/:46 & :17/:47)
+│   ├── opening_straddle_selector.py     # Directional Single-Leg Scalper orchestrator (09:14-10:00 AM)
+│   ├── opening_straddle_engine.py       # Scalper state machine, bid/ask quote tracker & P&L
+│   ├── opening_straddle_models.py       # Scalper domain models, bias derivation & enums
+│   ├── opening_straddle_alerts.py       # Discord webhook alerts for entries, exits & skips
+│   └── opening_straddle_backtest.py     # Single-leg scalper scenario backtesting engine
 ├── scripts/
 │   ├── Tuesday-Fno-Exit-Orders-V1.py    # Dedicated Tuesday 5-day cycle Upstox trailing SL manager (tag: TUE-SL)
 │   ├── Thursday-Fno-Exit-Orders-V1.py   # Dedicated Thursday 3-day cycle AngelOne SmartAPI trailing SL manager (Redis order_id tracking)

@@ -600,12 +600,12 @@ def build_single_leg_scenarios() -> List[SingleLegScalpScenario]:
         ticks=[],
     ))
 
-    # 7. Neutral Chop: CMS = +0.02 -> Skipped Day
+    # 7. Neutral Chop: CMS = 0.00 -> Skipped Day
     scenarios.append(SingleLegScalpScenario(
-        name="Day 07: Neutral Chop Skip (-0.10 < CMS < +0.10)",
+        name="Day 07: Neutral Chop Skip (-0.02 < CMS < +0.02)",
         scenario_type="CHOP_SKIP",
         initial_spot=25000.0,
-        pre_market=make_scalp_intel(0.02),
+        pre_market=make_scalp_intel(0.00),
         trade_leg=TradeLeg.NONE,
         order_action=OrderAction.BUY,
         strike=25000,
@@ -655,7 +655,7 @@ def run_single_leg_simulation(scenario: SingleLegScalpScenario) -> Dict[str, Any
         }
 
     if scenario.scenario_type == "CHOP_SKIP":
-        engine.record_skipped_session("NEUTRAL_CHOP: CMS in (-0.10, +0.10)", ExitReason.NEUTRAL_CHOP_SKIP)
+        engine.record_skipped_session("NEUTRAL_CHOP: CMS in (-0.02, +0.02)", ExitReason.NEUTRAL_CHOP_SKIP)
         return {
             "scenario": scenario.name,
             "status": engine.status,
