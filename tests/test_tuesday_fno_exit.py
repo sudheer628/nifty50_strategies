@@ -1607,3 +1607,47 @@ def test_tuesday_exit_immediately_partial_fill_retry_with_updated_position_snaps
 
 
 
+
+
+def test_reconcile_alerts_when_authorization_retired_without_filled_sell():
+    """Authorization for a contract with no broker position and no filled TUE-SL SELL must raise a Discord alert."""
+    mock_redis = MagicMock()
+    stale_key = "fno:upstox:enabled:tue:2026-11-09:24600:PE"
+    mock_redis.scan_iter.side_effect = lambda pattern, count=30: [stale_key] if pattern == "fno:upstox:enabled:tue:*" else []
+    mock_redis.get.return_value = json.dumps({"enabled": True, "qty": 65})
+    mock_redis.smembers.return_value = set()
+
+    positions = [{"tradingsymbol": "NIFTY26N0923700PE", "exchange": "NFO", "instrument_token": "NSE_FO|39948", "quantity": 65}]
+
+    with patch.object(tue_module, "_cleanup_tuesday_leg_state"), \
+         patch.object(tue_module, "dispatch_order_failure_discord") as mock_alert:
+        cleaned = tue_module.reconcile_cycle_legs(
+            mock_redis, positions, [], broker="upstox", cycle="tue", tag="TUE-SL", active_expiry="2026-11-09"
+        )
+
+    assert len(cleaned) == 1 and cleaned[0]["exit_executed"] is False
+    mock_alert.assert_called_once()
+    assert mock_alert.call_args.kwargs["action"] == "SELL_AUTH_UNMATCHED"
+
+
+def test_reconcile_no_alert_when_managed_sell_filled():
+    """Normal path: leg closed by a filled TUE-SL MARKET SELL is retired silently."""
+    mock_redis = MagicMock()
+    key = "fno:upstox:enabled:tue:2026-11-09:23700:PE"
+    mock_redis.scan_iter.side_effect = lambda pattern, count=30: [key] if pattern == "fno:upstox:enabled:tue:*" else []
+    mock_redis.get.return_value = json.dumps({"enabled": True, "qty": 65})
+    mock_redis.smembers.return_value = set()
+
+    orders = [{
+        "order_id": "SELL_1", "tag": "TUE-SL", "transaction_type": "SELL", "status": "complete",
+        "trading_symbol": "NIFTY26N0923700PE", "instrument_token": "NSE_FO|39948", "filled_quantity": 65,
+    }]
+
+    with patch.object(tue_module, "_cleanup_tuesday_leg_state"), \
+         patch.object(tue_module, "dispatch_order_failure_discord") as mock_alert:
+        cleaned = tue_module.reconcile_cycle_legs(
+            mock_redis, [], orders, broker="upstox", cycle="tue", tag="TUE-SL", active_expiry="2026-11-09"
+        )
+
+    assert len(cleaned) == 1 and cleaned[0]["exit_executed"] is True
+    mock_alert.assert_not_called()

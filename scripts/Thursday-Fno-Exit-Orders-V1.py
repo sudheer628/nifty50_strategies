@@ -1087,6 +1087,47 @@ def reconcile_cycle_legs(
         if has_open_order:
             continue
 
+        # Check 3: Was this authorization actually executed by the manager (filled managed SELL)?
+        # If not, the Alpha exit never reached the broker (e.g. strike/symbol mismatch or manual close).
+        exit_executed = False
+        for o in orders:
+            order_id = str(o.get("order_id") or o.get("orderid") or "").strip()
+            is_managed = (
+                order_tag(o).upper() == tag.upper()
+                or order_id in stored_order_ids
+                or order_id in cycle_managed_order_ids
+            )
+            if not is_managed or str(o.get("transaction_type") or o.get("transactiontype") or "").upper() != "SELL":
+                continue
+            if normalize_order_status(o.get("status") or o.get("orderstatus")) not in TERMINAL_FILLED_STATUSES:
+                continue
+            o_details = parse_tradingsymbol(o.get("trading_symbol") or o.get("tradingsymbol") or "")
+            o_strike = int(o_details.get("strike") or 0) if o_details.get("strike") else 0
+            o_exp = normalize_expiry(o_details.get("expiry"), active_expiry=eff_expiry) if o_details.get("expiry") else None
+            if (leg_strike and o_strike == int(leg_strike) and o_details.get("option_type") == leg_opt
+                    and ((not leg_expiry) or o_exp == leg_expiry)) or order_id in stored_order_ids:
+                exit_executed = True
+                break
+
+        if not exit_executed:
+            reason = (
+                f"Alpha exit authorization {enabled_key} is being retired WITHOUT any filled managed SELL: "
+                f"no open broker position matched {leg_strike} {leg_opt} (expiry {leg_expiry}). "
+                "Check for strike/symbol mismatch or a manual close."
+            )
+            logger.critical(reason)
+            dispatch_order_failure_discord(
+                broker=broker,
+                action="SELL_AUTH_UNMATCHED",
+                track=CYCLE_TRACK,
+                symbol=f"{leg_strike}{leg_opt}",
+                quantity=0,
+                error_reason=reason,
+                details={"enabled_key": enabled_key, "open_positions": [p.get("tradingsymbol") for p in positions]},
+                redis_client=r,
+                cooldown_seconds=3600,
+            )
+
         # All checks passed: No short position, long position is 0, AND open order is absent/terminal.
         _cleanup_thursday_leg_state(r, leg_keys, broker=broker, symbol=eff_symbol)
 
@@ -1131,7 +1172,7 @@ def reconcile_cycle_legs(
             "Leg %s confirmed closed (no position, no open %s orders). Retired Redis state.",
             enabled_key, tag
         )
-        cleaned.append({"key": enabled_key, "symbol": leg_symbol, "strike": leg_strike, "option_type": leg_opt, "expiry": leg_expiry})
+        cleaned.append({"key": enabled_key, "symbol": leg_symbol, "strike": leg_strike, "option_type": leg_opt, "expiry": leg_expiry, "exit_executed": exit_executed})
 
     return cleaned
 

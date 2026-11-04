@@ -475,3 +475,46 @@ class UnifiedStrategyStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_publish_exit_authorization_uses_snapshot_strike_on_mismatch(tmp_path):
+    """Unified store strikes polluted for the same cycle: authorize the snapshot contract the FSM evaluated."""
+    import json as _json
+    from unittest.mock import MagicMock, patch
+    from common.unified_strategy_store import publish_exit_authorization_to_redis
+
+    snap_file = tmp_path / "current_week_buy.json"
+    snap_file.write_text(_json.dumps({
+        "cycle_id": "CYCLE-TUE-20261103", "call_strike": 23500, "put_strike": 23700, "expiry_date": "20261109",
+    }))
+    strategy = {
+        "cycle_id": "CYCLE-TUE-20261103", "call_strike": 24400, "put_strike": 24600,
+        "expiry_date": "2026-11-09", "broker": "upstox", "entry_status": "FILLED",
+    }
+    mock_redis = MagicMock()
+    with patch("common.unified_strategy_store.ACTIVE_SNAPSHOT_FILE", str(snap_file)), \
+         patch.dict("os.environ", {"LOTS_TUESDAY": "1"}):
+        keys = publish_exit_authorization_to_redis("5day_strategy", False, True, strategy, redis_client=mock_redis)
+
+    assert keys == ["fno:upstox:enabled:tue:2026-11-09:23700:PE"]
+    mock_redis.set.assert_any_call("ORDERS_LIVE_TUE", "1")
+
+
+def test_publish_exit_authorization_ignores_snapshot_of_other_cycle(tmp_path):
+    """Snapshot belonging to a different cycle must not override the unified store strikes."""
+    import json as _json
+    from unittest.mock import MagicMock, patch
+    from common.unified_strategy_store import publish_exit_authorization_to_redis
+
+    snap_file = tmp_path / "current_week_buy.json"
+    snap_file.write_text(_json.dumps({
+        "cycle_id": "CYCLE-TUE-20261027", "call_strike": 23000, "put_strike": 23200, "expiry_date": "20261103",
+    }))
+    strategy = {
+        "cycle_id": "CYCLE-TUE-20261103", "call_strike": 23500, "put_strike": 23700,
+        "expiry_date": "2026-11-09", "broker": "upstox", "entry_status": "FILLED",
+    }
+    with patch("common.unified_strategy_store.ACTIVE_SNAPSHOT_FILE", str(snap_file)):
+        keys = publish_exit_authorization_to_redis("5day_strategy", True, False, strategy, redis_client=MagicMock())
+
+    assert keys == ["fno:upstox:enabled:tue:2026-11-09:23500:CE"]

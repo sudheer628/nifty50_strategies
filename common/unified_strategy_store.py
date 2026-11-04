@@ -919,19 +919,49 @@ def publish_exit_authorization_to_redis(
     target_qty = lots * lot_size
 
     expiry_raw = strategy_data.get("expiry_date") or strategy_data.get("expiry")
+    call_strike_raw = strategy_data.get("call_strike")
+    put_strike_raw = strategy_data.get("put_strike")
+
+    # The Alpha FSM signal is computed on the strikes in the cycle entry snapshot
+    # (current_week_buy.json / current_thursday_buy.json). If the unified store
+    # disagrees for the same cycle, authorize the snapshot contract that was evaluated.
+    snapshot_file = ACTIVE_SNAPSHOT_FILE if cycle == "tue" else THURSDAY_SNAPSHOT_FILE
+    try:
+        with open(snapshot_file, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+    except Exception:
+        snap = {}
+    if snap and snap.get("cycle_id") and snap.get("cycle_id") == strategy_data.get("cycle_id"):
+        mismatches = []
+        for field, current in (("call_strike", call_strike_raw), ("put_strike", put_strike_raw)):
+            snap_val = snap.get(field)
+            if snap_val is not None and (current is None or int(current) != int(snap_val)):
+                mismatches.append(f"{field}: unified={current} snapshot={snap_val}")
+        snap_expiry = snap.get("expiry_date")
+        if snap_expiry and normalize_expiry(snap_expiry) != normalize_expiry(expiry_raw):
+            mismatches.append(f"expiry: unified={expiry_raw} snapshot={snap_expiry}")
+        if mismatches:
+            logger.critical(
+                "Exit authorization contract mismatch for %s cycle %s (%s). Using entry snapshot %s.",
+                track, strategy_data.get("cycle_id"), "; ".join(mismatches), snapshot_file,
+            )
+            call_strike_raw = snap.get("call_strike", call_strike_raw)
+            put_strike_raw = snap.get("put_strike", put_strike_raw)
+            expiry_raw = snap_expiry or expiry_raw
+
     expiry_iso = normalize_expiry(expiry_raw)
 
     try:
-        if call_exit and strategy_data.get("call_strike"):
-            c_strike = int(strategy_data.get("call_strike"))
+        if call_exit and call_strike_raw:
+            c_strike = int(call_strike_raw)
             c_key = build_leg_enabled_key(cycle, expiry_iso, c_strike, "CE", broker=broker)
             c_val = json.dumps({"enabled": True, "qty": target_qty})
             r.set(c_key, c_val, ex=604800)
             published_keys.append(c_key)
             logger.info("Published Redis authorization key: %s (qty=%d)", c_key, target_qty)
 
-        if put_exit and strategy_data.get("put_strike"):
-            p_strike = int(strategy_data.get("put_strike"))
+        if put_exit and put_strike_raw:
+            p_strike = int(put_strike_raw)
             p_key = build_leg_enabled_key(cycle, expiry_iso, p_strike, "PE", broker=broker)
             p_val = json.dumps({"enabled": True, "qty": target_qty})
             r.set(p_key, p_val, ex=604800)
