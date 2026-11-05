@@ -50,11 +50,11 @@ THURSDAY_BROKER = os.getenv("THURSDAY_BROKER", "angelone").lower().strip()
 SUPPORTED_BROKERS = ("upstox", "angelone")
 
 
-def get_entry_qty_for_track(track: str) -> int:
+def get_entry_qty_for_track(track: str, redis_client=None) -> int:
     """
     Paired BUY quantity (contracts) for a strategy track.
 
-    Uses the track's own lot allocation (LOTS_TUESDAY / LOTS_THURSDAY x NIFTY_LOT_SIZE)
+    Uses the track's own lot allocation (LOTS_TUESDAY / LOTS_THURSDAY x NIFTY_LOT_SIZE, Redis first, then .env)
     so entry size always equals the exit size authorized for that track. Falls back to
     STRATEGY_BUY_QTY / NIFTY_LOT_SIZE only when the track's LOTS_* is not configured.
     """
@@ -65,14 +65,13 @@ def get_entry_qty_for_track(track: str) -> int:
         lots_env = "LOTS_THURSDAY"
     else:
         raise ValueError(f"Unknown strategy track '{track}'")
-    lot_size = int(os.getenv("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
-    raw_lots = (os.getenv(lots_env) or "").strip()
-    if raw_lots:
-        lots = int(raw_lots)
+    lot_size = get_config_int("NIFTY_LOT_SIZE", NIFTY_LOT_SIZE, redis_client=redis_client)
+    if get_config_flag(lots_env, None, redis_client=redis_client) is not None:
+        lots = get_config_int(lots_env, 0, redis_client=redis_client)
         if lots <= 0:
-            raise ValueError(f"{lots_env} must be a positive integer (got {raw_lots!r})")
+            raise ValueError(f"{lots_env} must be a positive integer in Redis or .env")
         return lots * lot_size
-    return int(os.getenv("STRATEGY_BUY_QTY") or lot_size)
+    return get_config_int("STRATEGY_BUY_QTY", lot_size, redis_client=redis_client)
 
 
 def get_broker_for_track(track: str) -> str:
@@ -208,6 +207,102 @@ def get_redis_client():
     except Exception as e:
         logger.warning(f"Failed to create Redis client: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Redis-first runtime configuration (Redis -> .env -> default)
+# ---------------------------------------------------------------------------
+# Execution gates and sizing can be changed remotely by setting a Redis key with the
+# same name as the .env variable (e.g. `SET LOTS_THURSDAY 2`); `DEL` the key to revert
+# to .env. If Redis is unreachable, or the key is missing/empty/invalid, the .env value
+# is used, then the hardcoded default.
+REDIS_CONFIG_KEYS = (
+    "LIVE_EXIT_TRIGGER_TUESDAY", "EXIT_IMMEDIATELY_TUESDAY", "LIVE_BUY_TRIGGER_TUESDAY",
+    "LIVE_EXIT_TRIGGER_THURSDAY", "EXIT_IMMEDIATELY_THURSDAY", "LIVE_BUY_TRIGGER_THURSDAY",
+    "LOTS_TUESDAY", "LOTS_THURSDAY", "NIFTY_LOT_SIZE", "STRATEGY_BUY_QTY",
+)
+_TRUE_VALUES = ("true", "1", "yes", "on")
+_FALSE_VALUES = ("false", "0", "no", "off")
+_config_redis_state = {"client": None, "unavailable": False, "failed_clients": set()}
+
+
+def _config_redis(redis_client=None):
+    """Return the caller's Redis client, or a lazily created process-wide one (None if unreachable)."""
+    if redis_client is not None:
+        return None if id(redis_client) in _config_redis_state["failed_clients"] else redis_client
+    if _config_redis_state["unavailable"]:
+        return None
+    if _config_redis_state["client"] is None:
+        _config_redis_state["client"] = get_redis_client()
+        if _config_redis_state["client"] is None:
+            _config_redis_state["unavailable"] = True
+    return _config_redis_state["client"]
+
+
+def _config_candidates(key: str, redis_client=None):
+    """Yield (raw_value, source) in precedence order: Redis, then .env."""
+    r = _config_redis(redis_client)
+    if r is not None:
+        try:
+            val = r.get(key)
+            if isinstance(val, bytes):
+                val = val.decode("utf-8")
+            if val is not None and str(val).strip() != "":
+                yield str(val).strip(), "redis"
+        except Exception as exc:
+            logger.warning("Redis config lookup failed for %s (%s); falling back to .env", key, exc)
+            # Avoid paying the connection timeout again for every remaining flag this run
+            if redis_client is None:
+                _config_redis_state["unavailable"] = True
+            else:
+                _config_redis_state["failed_clients"].add(id(redis_client))
+    env_val = os.getenv(key)
+    if env_val is not None and env_val.strip() != "":
+        yield env_val.strip(), "env"
+
+
+def _log_config(key: str, value, source: str) -> None:
+    if source == "redis":
+        logger.info("Config %s=%s (source: Redis override)", key, value)
+    else:
+        logger.debug("Config %s=%s (source: %s)", key, value, source)
+
+
+def get_config_flag(key: str, default=None, redis_client=None):
+    """Raw string value for key: Redis first, then .env, then default."""
+    for raw, source in _config_candidates(key, redis_client):
+        _log_config(key, raw, source)
+        return raw
+    return default
+
+
+def get_config_bool(key: str, default: bool = False, redis_client=None) -> bool:
+    """Boolean flag (true/1/yes/on or false/0/no/off): Redis first, then .env, then default.
+    An unrecognized value in one tier is logged and the next tier is used."""
+    for raw, source in _config_candidates(key, redis_client):
+        low = raw.lower()
+        if low in _TRUE_VALUES or low in _FALSE_VALUES:
+            _log_config(key, low, source)
+            return low in _TRUE_VALUES
+        logger.warning("Ignoring invalid boolean %s=%r from %s; trying next source", key, raw, source)
+    return bool(default)
+
+
+def get_config_int(key: str, default: int, redis_client=None, min_value: int = 1) -> int:
+    """Integer setting (lots / quantities): Redis first, then .env, then default.
+    Non-integer or values below min_value in one tier are logged and the next tier is used."""
+    for raw, source in _config_candidates(key, redis_client):
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid integer %s=%r from %s; trying next source", key, raw, source)
+            continue
+        if val < min_value:
+            logger.warning("Ignoring %s=%r from %s (must be >= %d); trying next source", key, raw, source, min_value)
+            continue
+        _log_config(key, val, source)
+        return val
+    return int(default)
 
 
 # ---------------------------------------------------------------------------

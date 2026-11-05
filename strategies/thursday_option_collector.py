@@ -481,7 +481,8 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         cycle_id = f"CYCLE-THU-{start_str}"
 
         # Check if live MARKET BUY entry is enabled (Thursday is strictly AngelOne)
-        env_live_buy = os.getenv("LIVE_BUY_TRIGGER_THURSDAY", "false").strip().lower() in ("true", "1", "yes")
+        from config import get_config_bool
+        env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_THURSDAY", default=False)
         is_live_buy = env_live_buy if execute_buy is None else bool(execute_buy)
 
         call_ref_ltp = call_ltp

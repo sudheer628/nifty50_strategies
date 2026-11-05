@@ -277,7 +277,8 @@ def preflight_entry(
     Returns: (passed, reason, metrics_dict)
     """
     broker = (broker or "").lower().strip()
-    lot_size = NIFTY_LOT_SIZE
+    from config import get_config_int
+    lot_size = get_config_int("NIFTY_LOT_SIZE", NIFTY_LOT_SIZE)
     if quantity <= 0 or (quantity % lot_size != 0):
         return False, f"Order quantity {quantity} must be a positive whole-number multiple of NIFTY lot size ({lot_size})", {}
 
@@ -307,7 +308,8 @@ def preflight_entry(
         return False, f"Unsupported broker '{broker}'", {}
 
     # Estimate required funds scaled by lot quantity
-    lot_size = NIFTY_LOT_SIZE
+    from config import get_config_int
+    lot_size = get_config_int("NIFTY_LOT_SIZE", NIFTY_LOT_SIZE)
     num_lots = max(1, (quantity + lot_size - 1) // lot_size)
     total_charges = estimated_charges * num_lots
 

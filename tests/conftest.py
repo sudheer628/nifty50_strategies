@@ -33,6 +33,9 @@ _ISOLATED_ENV = {
     "OPENROUTER_API_KEY": "",
     "UPSTOX_ACCESS_TOKEN": "",
     "EMAIL_APP_PASSWORD": "",
+    # Pin broker routing to the code defaults so tests never depend on the live .env
+    "TUESDAY_BROKER": "upstox",
+    "THURSDAY_BROKER": "angelone",
     "LIVE_EXIT_TRIGGER_TUESDAY": "false",
     "LIVE_EXIT_TRIGGER_THURSDAY": "false",
     "LIVE_BUY_TRIGGER_TUESDAY": "false",

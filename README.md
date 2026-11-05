@@ -883,6 +883,29 @@ python scripts/Thursday-Fno-Exit-Orders-V1.py --execute --lots 1
 python scripts/Thursday-Fno-Exit-Orders-V1.py --mock --force
 ```
 
+### Runtime Configuration Overrides (Redis-first)
+
+Execution gates and sizing are resolved **Redis first, then `.env`, then a safe hardcoded default** (`config.get_config_bool` / `get_config_int` / `get_config_flag`). Redis keys use the exact `.env` variable names:
+
+| Key | Used by | Default |
+|---|---|---|
+| `LIVE_EXIT_TRIGGER_TUESDAY` / `LIVE_EXIT_TRIGGER_THURSDAY` | Exit managers (live vs forced dry-run) | `false` |
+| `EXIT_IMMEDIATELY_TUESDAY` / `EXIT_IMMEDIATELY_THURSDAY` | Exit managers (MARKET exit vs trailing SL-M); the `--exit-immediately` CLI flag still forces immediate mode | `false` |
+| `LIVE_BUY_TRIGGER_TUESDAY` / `LIVE_BUY_TRIGGER_THURSDAY` | Collectors (live paired BUY vs paper entry); `--execute-buy` / `--no-execute-buy` still take precedence | `false` |
+| `LOTS_TUESDAY` / `LOTS_THURSDAY` | New-cycle BUY size and legacy exit sizing | Tue `2`, Thu `1` |
+| `NIFTY_LOT_SIZE`, `STRATEGY_BUY_QTY` | Lot size / BUY-size fallback when `LOTS_*` is unset | `65` |
+
+```bash
+redis-cli SET EXIT_IMMEDIATELY_THURSDAY true   # switch Thursday exits to immediate MARKET orders
+redis-cli SET LOTS_THURSDAY 2                  # next Thursday cycle buys 2 lots (130 qty)
+redis-cli DEL LOTS_THURSDAY                    # revert to the .env value
+```
+
+- If Redis is unreachable, or a key is missing, empty or invalid (e.g. `ture`, `two`, `0` lots), the `.env` value is used and a warning is logged; Redis overrides are logged as `Config KEY=value (source: Redis override)`.
+- Sizing changes apply to **new cycle entries only**: an open cycle always exits the quantity it actually bought (`entry_qty` recorded at entry).
+- A leg whose immediate exit has already started stays in immediate mode even if `EXIT_IMMEDIATELY_*` is later turned off.
+- Anyone with write access to Redis Cloud can enable live trading; keep the Redis credentials as protected as the broker tokens.
+
 ### Production Crontab Entries
 
 All production crontab schedules execute in **UTC** on AWS EC2:

@@ -2453,8 +2453,8 @@ def main() -> int:
     parser.add_argument("--mock", action="store_true", help="Use built-in offline mock data")
     parser.add_argument("--force", action="store_true", help="Bypass Redis authorization / ORDERS_LIVE checks (testing only)")
     parser.add_argument("--broker", default=None, help=f"Broker adapter (default: track configured broker from TUESDAY_BROKER or '{DEFAULT_BROKER}')")
-    parser.add_argument("--lots", type=int, default=int(os.getenv("LOTS_TUESDAY", "2")), help="Allocated lots for Tuesday strategy (default from LOTS_TUESDAY or 2)")
-    parser.add_argument("--lot-size", type=int, default=DEFAULT_LOT_SIZE, help=f"Nifty contract lot size (default {DEFAULT_LOT_SIZE})")
+    parser.add_argument("--lots", type=int, default=None, help="Allocated lots for Tuesday strategy (default: LOTS_TUESDAY from Redis, then .env, then 2)")
+    parser.add_argument("--lot-size", type=int, default=None, help="Nifty contract lot size (default: NIFTY_LOT_SIZE from Redis, then .env, then 65)")
     parser.add_argument("--trail-pct", type=float, default=DEFAULT_TRAIL_PCT, help=f"Trail %% below high-water mark (default {DEFAULT_TRAIL_PCT})")
     parser.add_argument("--initial-stop-pct", type=float, default=DEFAULT_INITIAL_STOP_PCT, help=f"Initial stop %% below average before activation (default {DEFAULT_INITIAL_STOP_PCT})")
     parser.add_argument("--activation-pct", type=float, default=DEFAULT_ACTIVATION_PCT, help="Start trailing after LTP reaches average*(1+activation/100); 0=from start")
@@ -2479,18 +2479,24 @@ def main() -> int:
     except Exception:
         pass
 
-    # 1. Master Environment Gate: Check LIVE_EXIT_TRIGGER_TUESDAY in .env
-    live_env_enabled = os.getenv("LIVE_EXIT_TRIGGER_TUESDAY", "false").strip().lower() in ("true", "1", "yes")
-    exit_immediately = args.exit_immediately or (os.getenv("EXIT_IMMEDIATELY_TUESDAY", "false").strip().lower() in ("true", "1", "yes"))
+    # Redis client first: execution gates and sizing are read Redis-first (fallback: .env, then default)
+    r = None if args.mock else get_redis_client()
+    from config import get_config_bool, get_config_int
+    # 1. Master Gate: LIVE_EXIT_TRIGGER_TUESDAY (Redis -> .env -> false)
+    live_env_enabled = get_config_bool("LIVE_EXIT_TRIGGER_TUESDAY", default=False, redis_client=r)
+    exit_immediately = args.exit_immediately or get_config_bool("EXIT_IMMEDIATELY_TUESDAY", default=False, redis_client=r)
+    if args.lots is None:
+        args.lots = get_config_int("LOTS_TUESDAY", 2, redis_client=r)
+    if args.lot_size is None:
+        args.lot_size = get_config_int("NIFTY_LOT_SIZE", DEFAULT_LOT_SIZE, redis_client=r)
     actual_execute = args.execute and live_env_enabled and not args.dry_run
 
     if args.execute and not live_env_enabled:
         logger.warning(
-            "LIVE_EXIT_TRIGGER_TUESDAY is disabled/false in .env. Enforcing safe DRY-RUN mode (manual square-off mode active)."
+            "LIVE_EXIT_TRIGGER_TUESDAY is disabled/false (Redis/.env). Enforcing safe DRY-RUN mode (manual square-off mode active)."
         )
 
     # 2. Fast 1-Millisecond Redis Gate: Check ORDERS_LIVE_TUE
-    r = None if args.mock else get_redis_client()
     if not args.mock and not args.force:
         if r is None:
             logger.error("Redis is offline and --force was not specified. Aborting.")

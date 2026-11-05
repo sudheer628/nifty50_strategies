@@ -45,7 +45,7 @@ def test_entry_qty_rejects_non_positive_lots():
             get_entry_qty_for_track("3day_strategy")
 
 
-def _tuesday_collector_live_buy(env):
+def _tuesday_collector_live_buy(env, fill_qty=None):
     """Run the real Tuesday collector entry path with broker calls mocked; return (place mock, snapshot, unified record)."""
     from strategies.weekly_option_collector import collect_once
     saved = []
@@ -75,7 +75,7 @@ def _tuesday_collector_live_buy(env):
         st.enter_context(patch.dict(os.environ, {"LIVE_BUY_TRIGGER_TUESDAY": "true", "MOCK_BROKER": "true",
                                                  "TUESDAY_BROKER": "upstox", **env}))
         mock_place.side_effect = [{"success": True, "order_id": "TUE_C"}, {"success": True, "order_id": "TUE_P"}]
-        qty = int(env["LOTS_TUESDAY"]) * 65
+        qty = fill_qty or int(env["LOTS_TUESDAY"]) * 65
         mock_poll.return_value = (True, {
             "TUE_C": {"status": "complete", "average_price": 250.5, "filled_quantity": qty},
             "TUE_P": {"status": "complete", "average_price": 230.5, "filled_quantity": qty},

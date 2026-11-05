@@ -422,7 +422,12 @@ def get_active_leg_entry_details(
     return details
 
 
-def resolve_cycle_entry_qty(track: str, strategy_data: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None) -> int:
+def resolve_cycle_entry_qty(
+    track: str,
+    strategy_data: Dict[str, Any],
+    snapshot: Optional[Dict[str, Any]] = None,
+    redis_client: Optional[Any] = None,
+) -> int:
     """
     Quantity (contracts) a cycle bought per leg.
 
@@ -440,10 +445,11 @@ def resolve_cycle_entry_qty(track: str, strategy_data: Dict[str, Any], snapshot:
         qty = 0
     if qty > 0:
         return qty
-    lot_size = int(os.getenv("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
+    from config import get_config_int
+    lot_size = get_config_int("NIFTY_LOT_SIZE", NIFTY_LOT_SIZE, redis_client=redis_client)
     lots_env = "LOTS_TUESDAY" if norm == "5day_strategy" else "LOTS_THURSDAY"
     default_lots = 2 if norm == "5day_strategy" else 1
-    lots = int((strategy_data or {}).get("lots") or os.getenv(lots_env, str(default_lots)))
+    lots = int((strategy_data or {}).get("lots") or get_config_int(lots_env, default_lots, redis_client=redis_client))
     return lots * lot_size
 
 
@@ -959,10 +965,11 @@ def publish_exit_authorization_to_redis(
             broker, SUPPORTED_BROKERS
         )
         return []
-    lot_size = int(os.getenv("NIFTY_LOT_SIZE", str(NIFTY_LOT_SIZE)))
+    from config import get_config_int
+    lot_size = get_config_int("NIFTY_LOT_SIZE", NIFTY_LOT_SIZE, redis_client=r)
     lots_env = "LOTS_TUESDAY" if cycle == "tue" else "LOTS_THURSDAY"
     default_lots = 2 if cycle == "tue" else 1
-    lots = int(strategy_data.get("lots") or os.getenv(lots_env, str(default_lots)))
+    lots = int(strategy_data.get("lots") or get_config_int(lots_env, default_lots, redis_client=r))
     target_qty = lots * lot_size
 
     expiry_raw = strategy_data.get("expiry_date") or strategy_data.get("expiry")
@@ -999,7 +1006,7 @@ def publish_exit_authorization_to_redis(
     # Authorize exactly the quantity this cycle actually bought (recorded at entry), so a
     # track can never exit more than its own lot on a contract shared with the other track.
     # LOTS_* above remains the fallback for cycles entered before entry_qty was recorded.
-    entry_qty = resolve_cycle_entry_qty(track, strategy_data, snap)
+    entry_qty = resolve_cycle_entry_qty(track, strategy_data, snap, redis_client=r)
     if entry_qty > 0:
         if entry_qty != target_qty:
             logger.info(
