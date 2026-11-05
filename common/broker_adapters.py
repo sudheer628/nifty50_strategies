@@ -395,14 +395,23 @@ class UpstoxAdapter(BrokerAdapter):
         data = (resp.json() or {}).get("data")
         if not isinstance(data, dict):
             return None
-        for key in (instrument_token, instrument_token.replace(":", "|"), instrument_token.replace("|", ":")):
+        # Upstox keys the response by "<segment>:<trading symbol>" (e.g. "NSE_FO:NIFTY26N0924200CE"),
+        # not by the requested instrument key ("NSE_FO|39971"). Match on the entry's own
+        # instrument_token field first, then fall back to key-based lookups.
+        wanted = {instrument_token, instrument_token.replace(":", "|"), instrument_token.replace("|", ":")}
+        candidates = [e for e in data.values() if isinstance(e, dict) and str(e.get("instrument_token") or "") in wanted]
+        for key in list(wanted) + ([f"{instrument_token.split('|')[0].split(':')[0]}:{trading_symbol.upper()}"] if trading_symbol else []):
             entry = data.get(key)
-            if isinstance(entry, dict):
-                for candidate in ("last_price", "ltp"):
-                    if candidate in entry:
-                        val = _to_float(entry.get(candidate))
-                        if val > 0:
-                            return val
+            if isinstance(entry, dict) and entry not in candidates:
+                candidates.append(entry)
+        for entry in candidates:
+            for candidate in ("last_price", "ltp"):
+                if candidate in entry:
+                    val = _to_float(entry.get(candidate))
+                    if val > 0:
+                        return val
+        if data:
+            logger.warning("Upstox quote for %s returned keys %s with no matching instrument_token", instrument_token, list(data.keys())[:5])
         return None
 
     def cancel_order(
