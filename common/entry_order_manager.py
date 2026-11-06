@@ -515,7 +515,8 @@ def place_market_order(
         return {
             "success": False,
             "order_id": None,
-            "status": "rejected",
+            # 'unknown' = request may have reached the broker; caller must reconcile, not assume rejection
+            "status": "unknown" if res.get("unknown_state") else "rejected",
             "broker": "kotak",
             "error": res.get("error", "Unknown Kotak order error"),
             "http_status": res.get("http_status"),

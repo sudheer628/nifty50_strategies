@@ -273,7 +273,8 @@ class TestKotakMarketOrderPlacement:
         }
         mock_post.return_value = mock_resp
 
-        contract = resolve_kotak_option_contract("06NOV2026", 24500, "CE", token="live_token")
+        with patch("common.kotak_neo_adapter.lookup_kotak_fno_token", return_value="54231"):
+            contract = resolve_kotak_option_contract("06NOV2026", 24500, "CE", token="live_token")
         res = place_market_order(
             broker="kotak",
             token="live_token",
@@ -288,11 +289,12 @@ class TestKotakMarketOrderPlacement:
 
         # Verify request body parameters
         called_args, called_kwargs = mock_post.call_args
-        data = called_kwargs.get("data", {})
-        assert data["tt"] == "B"  # BUY
+        data = json.loads(called_kwargs.get("data", {})["jData"])
+        assert data["tg"] == "BUY"  # BUY
         assert data["pt"] == "MKT"  # MARKET
         assert data["pc"] == "NRML"
-        assert data["es"] == "nse_fo"
+        assert data["ex"] == "NFO"
+        assert data["tk"] == contract["instrument_token"]
         assert data["ts"] == "NIFTY26N0624500CE"
         assert data["qt"] == "65"
 

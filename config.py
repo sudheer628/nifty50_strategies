@@ -7,6 +7,7 @@ and helper factories used across all strategy modules.
 
 import os
 import logging
+from typing import Optional
 try:
     import redis
 except ImportError:

@@ -12,10 +12,13 @@ Provides a polymorphic broker interface for Kotak Neo Trade API v2:
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import os
 import re
+import tempfile
 import time
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -174,7 +177,14 @@ def resolve_kotak_option_contract(
         or os.getenv("TEST_MODE") == "true"
         or os.getenv("MOCK_BROKER") == "true"
     )
-    tok = f"MOCK_KOTAK_{strike}_{option_type.upper()}" if is_mock else str(token or "")
+    if is_mock:
+        tok = f"MOCK_KOTAK_{strike}_{option_type.upper()}"
+    else:
+        # Live: the order payload needs the numeric instrument key (tk) from the daily F&O master.
+        # Fail closed: an unresolved contract must never reach order placement.
+        if not token:
+            raise RuntimeError(f"Kotak contract {trading_symbol}: session token required to resolve instrument key")
+        tok = lookup_kotak_fno_token(trading_symbol, token)
 
     contract = {
         "token": tok,
@@ -190,6 +200,129 @@ def resolve_kotak_option_contract(
     }
     _KOTAK_CONTRACT_CACHE[cache_key] = contract
     return contract.copy()
+
+
+KOTAK_MASTER_PATH = "/script-details/1.0/masterscrip/file-paths"
+_KOTAK_TOKEN_COLUMNS = ("pSymbol", "tok", "token", "instrument_token", "symboltoken")
+_KOTAK_SYMBOL_COLUMNS = ("pTrdSymbol", "trdSym", "tradingsymbol", "trading_symbol")
+_KOTAK_MASTER_MEM: Dict[str, str] = {}
+
+
+def _find_fno_csv_url(payload: Any) -> Optional[str]:
+    """Locate the F&O CSV URL inside the masterscrip/file-paths response (shape-tolerant)."""
+    if isinstance(payload, str):
+        return payload if payload.lower().endswith(".csv") and "fno" in payload.lower() else None
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            if "fno" in str(k).lower():
+                found = _find_fno_csv_url(v)
+                if found:
+                    return found
+        for v in payload.values():
+            found = _find_fno_csv_url(v)
+            if found:
+                return found
+    if isinstance(payload, list):
+        for v in payload:
+            found = _find_fno_csv_url(v)
+            if found:
+                return found
+    return None
+
+
+def _parse_master_csv(text: str) -> Dict[str, str]:
+    """Map trading symbol -> instrument key from the F&O master CSV. Raises if columns are missing."""
+    reader = csv.DictReader(io.StringIO(text))
+    fields = reader.fieldnames or []
+    tok_col = next((c for c in _KOTAK_TOKEN_COLUMNS if c in fields), None)
+    sym_col = next((c for c in _KOTAK_SYMBOL_COLUMNS if c in fields), None)
+    if not tok_col or not sym_col:
+        raise RuntimeError(f"Kotak F&O master: expected token/symbol columns, found {fields[:12]}")
+    mapping: Dict[str, str] = {}
+    for row in reader:
+        sym = str(row.get(sym_col) or "").strip().upper()
+        tok = str(row.get(tok_col) or "").strip()
+        if sym and tok:
+            mapping[sym] = tok
+    return mapping
+
+
+def lookup_kotak_fno_token(trading_symbol: str, token: str) -> str:
+    """
+    Resolve the Kotak instrument key (tk) for an F&O trading symbol.
+    Source: masterscrip/file-paths -> fno CSV, cached per day in CACHE_DIR/temp.
+    """
+    sym = str(trading_symbol or "").strip().upper()
+    if sym in _KOTAK_MASTER_MEM:
+        return _KOTAK_MASTER_MEM[sym]
+
+    adapter = KotakNeoAdapter()
+    cache_dir = os.environ.get("CACHE_DIR") or tempfile.gettempdir()
+    cache_path = os.path.join(cache_dir, f"kotak_fno_master_{date.today():%Y%m%d}.json")
+
+    mapping: Optional[Dict[str, str]] = None
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                mapping = json.load(f)
+        except Exception as exc:
+            logger.warning("Ignoring unreadable Kotak master cache %s: %s", cache_path, exc)
+
+    if not mapping or sym not in mapping:
+        mapping = adapter.fetch_fno_master(token)
+        try:
+            tmp_path = cache_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(mapping, f)
+            os.replace(tmp_path, cache_path)
+        except Exception as exc:
+            logger.warning("Could not cache Kotak F&O master: %s", exc)
+
+    if sym not in mapping:
+        raise RuntimeError(f"Kotak F&O master has no instrument key for {sym}")
+    _KOTAK_MASTER_MEM[sym] = mapping[sym]
+    return mapping[sym]
+
+
+def build_jdata_payload(
+    *,
+    transaction_type: str,
+    instrument_key: str,
+    trading_symbol: str,
+    quantity: int,
+    product: str,
+    price_type: str = "MKT",
+    trigger_price: float = 0.0,
+) -> Dict[str, str]:
+    """
+    Build the F&O order jData object per Kotak Neo Trade API docs
+    (sent form-encoded as a single 'jData' field to /quick/order/rule/ms/place).
+    """
+    side = "BUY" if str(transaction_type).upper() in ("B", "BUY") else "SELL"
+    return {
+        "am": "NO",
+        "as": "N",
+        "co": "N",
+        "ig": "N",
+        "mp": "0",
+        "os": "N",
+        "pf": "N",
+        "pm": "N",
+        "pr": "0.0",
+        "pt": price_type,
+        "qt": str(int(quantity)),
+        "rt": "DAY",
+        "sb": "N",
+        "sp": f"{float(trigger_price):.2f}" if trigger_price else "0.0",
+        "st": "N",
+        "tg": side,
+        "tk": str(instrument_key),
+        "ts": str(trading_symbol),
+        "tt": "N",
+        "ex": "NFO",
+        "pc": str(product or "NRML"),
+        "fi": "N",
+    }
 
 
 class KotakNeoAdapter(BrokerAdapter):
@@ -241,6 +374,26 @@ class KotakNeoAdapter(BrokerAdapter):
             headers["Authorization"] = f"Bearer {token}"
 
         return headers
+
+    def _post_order_request(self, url: str, token: str, payload: Dict[str, Any], action: str, jdata: bool = False) -> Dict[str, Any]:
+        """
+        POST an order-affecting request. A network failure after submission leaves the order
+        state unknown, so it is flagged with unknown_state=True for the caller to reconcile.
+        """
+        try:
+            body = {"jData": json.dumps(payload)} if jdata else payload
+            resp = requests.post(url, headers=self._headers(token), data=body, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as exc:
+            logger.error("Kotak %s network error; order state UNKNOWN: %s", action, exc)
+            return {
+                "action": action,
+                "request": payload,
+                "success": False,
+                "order_id": None,
+                "unknown_state": True,
+                "error": f"network error (order state unknown): {exc}",
+            }
+        return self._order_response(action, resp, payload)
 
     def get_access_token(self, redis_client: Optional[Any] = None) -> str:
         """
@@ -366,11 +519,15 @@ class KotakNeoAdapter(BrokerAdapter):
             sym = str(pos.get("trdSym") or pos.get("tradingsymbol") or pos.get("trading_symbol") or "").strip().upper()
             prod = str(pos.get("prod") or pos.get("pc") or pos.get("product") or "NRML").strip().upper()
 
-            # Derive net quantity
+            # Derive net quantity: carry-forward (cf*) + day-flow (fl*) buy/sell quantities.
+            # Carried-forward NRML positions have zero day flow, so day flow alone reads them as flat.
+            cf_buy = _to_float(pos.get("cfBuyQty") or 0)
+            cf_sell = _to_float(pos.get("cfSellQty") or 0)
             fl_buy = _to_float(pos.get("flBuyQty") or pos.get("buyqty") or pos.get("buyQty") or 0)
             fl_sell = _to_float(pos.get("flSellQty") or pos.get("sellqty") or pos.get("sellQty") or 0)
-            if fl_buy != 0 or fl_sell != 0:
-                qty = fl_buy - fl_sell
+            has_flow_fields = any(k in pos for k in ("cfBuyQty", "cfSellQty", "flBuyQty", "flSellQty"))
+            if has_flow_fields:
+                qty = (cf_buy + fl_buy) - (cf_sell + fl_sell)
             else:
                 qty = _to_float(pos.get("qty") or pos.get("quantity") or pos.get("net_quantity") or 0)
 
@@ -573,6 +730,29 @@ class KotakNeoAdapter(BrokerAdapter):
             logger.error("Kotak get_available_funds failed: %s", exc)
             raise
 
+    def fetch_fno_master(self, token: str) -> Dict[str, str]:
+        """Download the daily F&O instrument master and return {trading_symbol: instrument_key}."""
+        url = f"{self.base_url}{KOTAK_MASTER_PATH}"
+        try:
+            resp = requests.get(url, headers=self._headers(token, content_type="application/json"), timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Kotak master file-paths network error: {exc}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"Kotak master file-paths HTTP {resp.status_code}: {resp.text[:200]}")
+        csv_url = _find_fno_csv_url(resp.json())
+        if not csv_url:
+            raise RuntimeError("Kotak master file-paths: no F&O CSV URL in response")
+        try:
+            csv_resp = requests.get(csv_url, timeout=max(REQUEST_TIMEOUT, 30))
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Kotak F&O master download error: {exc}")
+        if csv_resp.status_code != 200:
+            raise RuntimeError(f"Kotak F&O master download HTTP {csv_resp.status_code}")
+        mapping = _parse_master_csv(csv_resp.text)
+        if not mapping:
+            raise RuntimeError("Kotak F&O master parsed to zero instruments")
+        return mapping
+
     def place_market_order(
         self,
         token: str,
@@ -590,22 +770,14 @@ class KotakNeoAdapter(BrokerAdapter):
         prod = contract.get("product") or contract.get("producttype") or "NRML"
         ttype = "B" if transaction_type.upper() in ("B", "BUY") else "S"
 
-        payload = {
-            "am": "NO",
-            "dq": "0",
-            "es": "nse_fo",
-            "mp": "0",
-            "pc": prod,
-            "pr": "0",
-            "pt": "MKT",
-            "qt": str(int(quantity)),
-            "rt": "DAY",
-            "tp": "0",
-            "ts": str(sym),
-            "tt": ttype,
-            "ig": str(tag),
-            "os": NEO_FIN_KEY,
-        }
+        instrument_key = str(contract.get("instrument_token") or contract.get("token") or contract.get("symboltoken") or "")
+        if token != MOCK_TOKEN and not instrument_key:
+            return {"action": action_name, "success": False, "order_id": None,
+                    "error": f"Kotak order blocked: no instrument key for {sym}"}
+        payload = build_jdata_payload(
+            transaction_type=ttype, instrument_key=instrument_key, trading_symbol=str(sym),
+            quantity=quantity, product=prod, price_type="MKT",
+        )
 
         action_name = "place_market_buy" if ttype == "B" else "place_market_sell"
         if token == MOCK_TOKEN:
@@ -619,8 +791,7 @@ class KotakNeoAdapter(BrokerAdapter):
             }
 
         url = f"{self.base_url}/quick/order/rule/ms/place"
-        resp = requests.post(url, headers=self._headers(token), data=payload, timeout=REQUEST_TIMEOUT)
-        return self._order_response(action_name, resp, payload)
+        return self._post_order_request(url, token, payload, action_name, jdata=True)
 
     def fetch_ltp(
         self,
@@ -682,22 +853,14 @@ class KotakNeoAdapter(BrokerAdapter):
         )
         prod = product or self.get_exit_product(position) or "NRML"
 
-        payload = {
-            "am": "NO",
-            "dq": "0",
-            "es": "nse_fo",
-            "mp": "0",
-            "pc": prod,
-            "pr": "0",
-            "pt": "SL-M",
-            "qt": str(int(target_qty)),
-            "rt": "DAY",
-            "tp": f"{trigger_price:.2f}",
-            "ts": str(sym),
-            "tt": "S",
-            "ig": str(tag),
-            "os": NEO_FIN_KEY,
-        }
+        instrument_key = str(position.get("instrument_token") or position.get("symboltoken") or position.get("tok") or "")
+        if token != MOCK_TOKEN and not instrument_key:
+            return {"action": "place", "success": False, "order_id": None,
+                    "error": f"Kotak SL-M blocked: no instrument key for {sym}"}
+        payload = build_jdata_payload(
+            transaction_type="S", instrument_key=instrument_key, trading_symbol=str(sym),
+            quantity=target_qty, product=prod, price_type="SL-M", trigger_price=trigger_price,
+        )
 
         if token == MOCK_TOKEN:
             mock_oid = f"mock_kotak_{int(time.time() * 1000)}"
@@ -710,8 +873,7 @@ class KotakNeoAdapter(BrokerAdapter):
             }
 
         url = f"{self.base_url}/quick/order/rule/ms/place"
-        resp = requests.post(url, headers=self._headers(token), data=payload, timeout=REQUEST_TIMEOUT)
-        return self._order_response("place", resp, payload)
+        return self._post_order_request(url, token, payload, "place", jdata=True)
 
     def place_exit_order_market(
         self,
@@ -729,22 +891,14 @@ class KotakNeoAdapter(BrokerAdapter):
         )
         prod = product or self.get_exit_product(position) or "NRML"
 
-        payload = {
-            "am": "NO",
-            "dq": "0",
-            "es": "nse_fo",
-            "mp": "0",
-            "pc": prod,
-            "pr": "0",
-            "pt": "MKT",
-            "qt": str(int(target_qty)),
-            "rt": "DAY",
-            "tp": "0",
-            "ts": str(sym),
-            "tt": "S",
-            "ig": str(tag),
-            "os": NEO_FIN_KEY,
-        }
+        instrument_key = str(position.get("instrument_token") or position.get("symboltoken") or position.get("tok") or "")
+        if token != MOCK_TOKEN and not instrument_key:
+            return {"action": "place_market", "success": False, "order_id": None,
+                    "error": f"Kotak market exit blocked: no instrument key for {sym}"}
+        payload = build_jdata_payload(
+            transaction_type="S", instrument_key=instrument_key, trading_symbol=str(sym),
+            quantity=target_qty, product=prod, price_type="MKT",
+        )
 
         if token == MOCK_TOKEN:
             mock_oid = f"mock_kotak_{int(time.time() * 1000)}"
@@ -757,8 +911,7 @@ class KotakNeoAdapter(BrokerAdapter):
             }
 
         url = f"{self.base_url}/quick/order/rule/ms/place"
-        resp = requests.post(url, headers=self._headers(token), data=payload, timeout=REQUEST_TIMEOUT)
-        return self._order_response("place_market", resp, payload)
+        return self._post_order_request(url, token, payload, "place_market", jdata=True)
 
     def modify_exit_order_slm(
         self,
@@ -802,8 +955,7 @@ class KotakNeoAdapter(BrokerAdapter):
             }
 
         url = f"{self.base_url}/quick/order/vr/modify"
-        resp = requests.post(url, headers=self._headers(token), data=payload, timeout=REQUEST_TIMEOUT)
-        return self._order_response("modify", resp, payload)
+        return self._post_order_request(url, token, payload, "modify")
 
     def cancel_order(
         self,
@@ -827,8 +979,14 @@ class KotakNeoAdapter(BrokerAdapter):
             }
 
         url = f"{self.base_url}/quick/order/cancel"
-        resp = requests.post(url, headers=self._headers(token), data=payload, timeout=REQUEST_TIMEOUT)
         result: Dict[str, Any] = {"action": "cancel", "order_id": str(order_id)}
+        try:
+            resp = requests.post(url, headers=self._headers(token), data=payload, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as exc:
+            logger.error("Kotak cancel network error for %s; state UNKNOWN: %s", order_id, exc)
+            result.update({"success": False, "order_id": str(order_id), "unknown_state": True,
+                           "error": f"network error (cancel state unknown): {exc}"})
+            return result
         try:
             body = resp.json()
             result["response"] = body

@@ -321,11 +321,12 @@ class TestKotakNeoOrderMutations:
 
         assert result["success"] is True
         assert result["order_id"] == "241106999901"
-        assert result["request"]["tp"] == "120.05"
+        assert result["request"]["sp"] == "120.05"
         assert result["request"]["pt"] == "SL-M"
-        assert result["request"]["tt"] == "S"
-        assert result["request"]["es"] == "nse_fo"
-        assert result["request"]["ig"] == "TUE-SL"
+        assert result["request"]["tg"] == "SELL"
+        assert result["request"]["ex"] == "NFO"
+        assert result["request"]["tk"] == "53750"
+        assert result["request"]["qt"] == "65"
 
     @patch("requests.post")
     def test_place_exit_order_market(self, mock_post, adapter):
@@ -353,7 +354,8 @@ class TestKotakNeoOrderMutations:
         assert result["success"] is True
         assert result["order_id"] == "241106999902"
         assert result["request"]["pt"] == "MKT"
-        assert result["request"]["tp"] == "0"
+        assert result["request"]["sp"] == "0.0"
+        assert result["request"]["tg"] == "SELL"
 
     @patch("requests.post")
     def test_modify_exit_order_slm(self, mock_post, adapter):
@@ -438,3 +440,95 @@ class TestKotakNeoProductAndFactory:
 
         res_cnc = adapter.cancel_order(MOCK_TOKEN, "123")
         assert res_cnc["success"] is True
+
+
+class TestKotakNeoReliability:
+    """Carry-forward quantity and fail-safe handling of network errors on order requests."""
+
+    @patch("requests.get")
+    def test_carry_forward_position_is_not_read_as_flat(self, mock_get, adapter):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "stat": "Ok", "stCode": 200,
+            "data": [{
+                "tok": "53751", "trdSym": "NIFTY26N0924500PE", "prod": "NRML",
+                "cfBuyQty": "65", "cfSellQty": "0", "flBuyQty": "0", "flSellQty": "0",
+                "buyAvgPrc": "218.00", "exSeg": "nse_fo",
+            }],
+        }
+        mock_get.return_value = mock_resp
+        long_pos, _ = parse_positions(adapter.fetch_positions("valid_token"))
+        assert len(long_pos) == 1
+        assert long_pos[0]["quantity"] == 65.0
+
+    @patch("requests.post")
+    def test_order_network_error_is_flagged_unknown_state(self, mock_post, adapter):
+        import requests as _requests
+        mock_post.side_effect = _requests.exceptions.ConnectionError("timeout")
+        res = adapter.place_exit_order_slm("valid_token", {"tradingsymbol": "NIFTY26N0924500PE", "instrument_token": "40004"}, 65, 174.4)
+        assert res["success"] is False
+        assert res["unknown_state"] is True
+        assert res["order_id"] is None
+
+    @patch("requests.post")
+    def test_cancel_network_error_is_flagged_unknown_state(self, mock_post, adapter):
+        import requests as _requests
+        mock_post.side_effect = _requests.exceptions.Timeout("timeout")
+        res = adapter.cancel_order("valid_token", "123")
+        assert res["success"] is False
+        assert res["unknown_state"] is True
+
+
+class TestKotakNeoInstrumentMasterAndPayload:
+    """Instrument key resolution (fail-closed) and the documented jData order format."""
+
+    def test_master_csv_maps_symbol_to_token(self):
+        from common.kotak_neo_adapter import _parse_master_csv
+        csv_text = "pSymbol,pTrdSymbol,pExchSeg\n40004,NIFTY26N0924500PE,nse_fo\n40003,NIFTY26N0924500CE,nse_fo\n"
+        assert _parse_master_csv(csv_text) == {"NIFTY26N0924500PE": "40004", "NIFTY26N0924500CE": "40003"}
+
+    def test_master_csv_missing_columns_fails_closed(self):
+        from common.kotak_neo_adapter import _parse_master_csv
+        with pytest.raises(RuntimeError):
+            _parse_master_csv("foo,bar\n1,2\n")
+
+    def test_find_fno_csv_url_in_nested_response(self):
+        from common.kotak_neo_adapter import _find_fno_csv_url
+        payload = {"data": {"fno": "https://x.example/fno_master.csv", "cash": "https://x.example/cash.csv"}}
+        assert _find_fno_csv_url(payload) == "https://x.example/fno_master.csv"
+
+    def test_live_resolve_without_master_entry_raises(self, monkeypatch):
+        from common import kotak_neo_adapter as mod
+        monkeypatch.delenv("TEST_MODE", raising=False)
+        monkeypatch.delenv("MOCK_BROKER", raising=False)
+        monkeypatch.setattr(mod, "_KOTAK_MASTER_MEM", {})
+        with patch.object(mod.KotakNeoAdapter, "fetch_fno_master", return_value={"OTHER": "1"}):
+            with patch.object(mod.os.path, "exists", return_value=False):
+                with pytest.raises(RuntimeError):
+                    mod.lookup_kotak_fno_token("NIFTY26N0924500PE", "live_token")
+
+    def test_jdata_payload_matches_documented_keys(self):
+        from common.kotak_neo_adapter import build_jdata_payload
+        p = build_jdata_payload(transaction_type="BUY", instrument_key="54231", trading_symbol="NIFTY26NOV26000CE",
+                                quantity=15, product="NRML", price_type="MKT")
+        assert p["tg"] == "BUY" and p["tk"] == "54231" and p["ts"] == "NIFTY26NOV26000CE"
+        assert p["ex"] == "NFO" and p["pc"] == "NRML" and p["qt"] == "15" and p["pt"] == "MKT"
+        assert set(p) == {"am","as","co","ig","mp","os","pf","pm","pr","pt","qt","rt","sb","sp","st","tg","tk","ts","tt","ex","pc","fi"}
+
+    @patch("requests.post")
+    def test_exit_blocked_without_instrument_key(self, mock_post, adapter):
+        res = adapter.place_exit_order_slm("valid_token", {"tradingsymbol": "NIFTY26N0924500PE"}, 65, 174.4)
+        assert res["success"] is False
+        mock_post.assert_not_called()
+
+    @patch("requests.post")
+    def test_order_sent_as_single_jdata_field(self, mock_post, adapter):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"stat": "Ok", "stCode": 200, "result": {"nOrdNo": "1"}}
+        mock_post.return_value = mock_resp
+        adapter.place_exit_order_market("valid_token", {"tradingsymbol": "NIFTY26N0924500PE", "instrument_token": "40004"}, 65)
+        data = mock_post.call_args.kwargs["data"]
+        assert list(data.keys()) == ["jData"]
+        assert json.loads(data["jData"])["tk"] == "40004"

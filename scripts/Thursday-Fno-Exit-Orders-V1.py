@@ -951,6 +951,142 @@ def _check_and_reset_orders_live_thu(r, broker: str = "angelone", has_short_posi
     return False
 
 
+def _unmanaged_thu_long_positions(
+    r,
+    positions: List[Dict[str, Any]],
+    broker: str = "angelone",
+    active_expiry: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return open LONG broker positions for the active Thursday expiry that have NO
+    enabled authorization key in Redis. The exit loop never manages these legs, so
+    ORDERS_LIVE_THU must stay active while any of them is open.
+    Fail-closed: any lookup error counts the position as unmanaged.
+    """
+    target_expiry = normalize_expiry(active_expiry, active_expiry=active_expiry) if active_expiry else None
+    unmanaged: List[Dict[str, Any]] = []
+    for pos in positions or []:
+        if _position_quantity(pos) <= 0:
+            continue
+        symbol = pos.get("tradingsymbol") or pos.get("instrument_token") or "UNKNOWN"
+        try:
+            if target_expiry:
+                raw_expiry = parse_tradingsymbol(symbol).get("expiry")
+                if str(raw_expiry or "").upper() in ("", "UNKNOWN", "NONE", "N/A"):
+                    pos_expiry = target_expiry
+                else:
+                    pos_expiry = normalize_expiry(raw_expiry, active_expiry=active_expiry)
+                if pos_expiry != target_expiry:
+                    continue  # other track / other expiry: not this cycle's concern
+            token_key = pos.get("instrument_token") or "NOTOKEN"
+            keys = build_trail_redis_keys(broker, symbol, token_key, active_expiry=active_expiry)
+            canonical_key = keys.get("enabled_canonical")
+            if canonical_key and r.get(canonical_key) is not None:
+                enabled, _ = _get_redis_leg_authorization(r, canonical_key)
+            else:
+                enabled, _ = _get_redis_leg_authorization(r, keys["enabled"])
+        except Exception as exc:
+            logger.warning("Could not verify authorization for %s; treating as unmanaged: %s", symbol, exc)
+            enabled = False
+        if not enabled:
+            unmanaged.append(pos)
+    return unmanaged
+
+
+THU_FSM_LEG_BY_OPTION_TYPE = {"CE": "call_leg", "PE": "put_leg"}
+
+
+def _load_thursday_fsm_snapshot() -> Optional[Dict[str, Any]]:
+    """Load the ongoing Thursday cycle snapshot (Alpha FSM state). None if absent/unreadable/closed."""
+    try:
+        from config import THURSDAY_SNAPSHOT_FILE
+        if not os.path.exists(THURSDAY_SNAPSHOT_FILE):
+            return None
+        with open(THURSDAY_SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+        if not isinstance(snap, dict) or str(snap.get("status") or "").lower() != "ongoing":
+            return None
+        return snap
+    except Exception as exc:
+        logger.warning("Could not read Thursday FSM snapshot: %s", exc)
+        return None
+
+
+def _fsm_leg_for_symbol(
+    snap: Optional[Dict[str, Any]],
+    symbol: str,
+    active_expiry: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Map an option tradingsymbol to its Alpha FSM leg ('call_leg'/'put_leg') in the ongoing
+    Thursday snapshot by strike, option type and expiry. Returns (None, None) if no match.
+    """
+    if not snap:
+        return None, None
+    details = parse_tradingsymbol(symbol)
+    leg_name = THU_FSM_LEG_BY_OPTION_TYPE.get(details.get("option_type"))
+    if not leg_name:
+        return None, None
+    leg = (snap.get("alpha_fsm") or {}).get(leg_name)
+    if not isinstance(leg, dict):
+        return None, None
+    try:
+        if int(_to_float(leg.get("strike"))) != int(_to_float(details.get("strike"))):
+            return None, None
+        snap_expiry = snap.get("expiry_date")
+        if snap_expiry and active_expiry:
+            raw_expiry = details.get("expiry")
+            if str(raw_expiry or "").upper() in ("", "UNKNOWN", "NONE", "N/A"):
+                pos_expiry = normalize_expiry(active_expiry, active_expiry=active_expiry)
+            else:
+                pos_expiry = normalize_expiry(raw_expiry, active_expiry=active_expiry)
+            if pos_expiry != normalize_expiry(snap_expiry, active_expiry=active_expiry):
+                return None, None
+    except Exception as exc:
+        logger.warning("FSM leg match failed for %s: %s", symbol, exc)
+        return None, None
+    return leg_name, leg
+
+
+def _fsm_peak_for_symbol(snap: Optional[Dict[str, Any]], symbol: str, active_expiry: Optional[str] = None) -> float:
+    """Highest premium the Alpha FSM has observed for this leg (0.0 if unknown)."""
+    _, leg = _fsm_leg_for_symbol(snap, symbol, active_expiry=active_expiry)
+    return _to_float(leg.get("peak_ltp")) if leg else 0.0
+
+
+def _fsm_closed_legs_with_open_positions(
+    snap: Optional[Dict[str, Any]],
+    positions: List[Dict[str, Any]],
+    active_expiry: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Reconciliation check: legs the Alpha FSM has already closed (non-ACTIVE) that the broker
+    still holds as an open long. Such legs are unprotected and need manual review.
+    """
+    mismatches: List[Dict[str, Any]] = []
+    if not snap:
+        return mismatches
+    for pos in positions or []:
+        if _position_quantity(pos) <= 0:
+            continue
+        symbol = pos.get("tradingsymbol") or pos.get("instrument_token") or "UNKNOWN"
+        leg_name, leg = _fsm_leg_for_symbol(snap, symbol, active_expiry=active_expiry)
+        if not leg:
+            continue
+        fsm_status = str(leg.get("status") or "").upper()
+        if fsm_status in ("", "ACTIVE"):
+            continue
+        mismatches.append({
+            "symbol": symbol,
+            "fsm_leg": leg_name,
+            "fsm_status": fsm_status,
+            "fsm_exit_price": leg.get("exit_price"),
+            "fsm_exit_reason": leg.get("exit_reason"),
+            "broker_quantity": _position_quantity(pos),
+        })
+    return mismatches
+
+
 def reconcile_cycle_legs(
     r,
     positions: List[Dict[str, Any]],
@@ -2269,7 +2405,10 @@ def manage_thursday_exit_orders(
             old_avg = avg_price
             old_qty = managed_qty
 
-        new_max = max(old_max, ltp, avg_price)
+        # Seed/floor the trail max with the Alpha FSM's observed peak for this leg. While a leg is
+        # unauthorized the Redis max is never written, so without this the trail restarts from entry.
+        fsm_peak = _fsm_peak_for_symbol(_load_thursday_fsm_snapshot(), symbol, active_expiry=active_expiry)
+        new_max = max(old_max, ltp, avg_price, fsm_peak)
         activation_price = avg_price * (1.0 + activation_pct / 100.0)
         if activation_pct > 0 and ltp < activation_price and old_max < activation_price:
             new_stop = compute_initial_sl(avg_price, initial_stop_pct)
@@ -2292,6 +2431,7 @@ def manage_thursday_exit_orders(
             "tag": tag, "quantity": managed_qty, "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
             "product": product_for_position, "avg_price": round(avg_price, 2), "ltp": round(ltp, 2),
             "old_max": round(old_max, 2) if old_max else 0, "new_max": round(new_max, 2),
+            "fsm_peak": round(fsm_peak, 2),
             "old_sl": round(old_sl, 2) if old_sl else 0, "existing_trigger": round(existing_trigger, 2) if existing_trigger else 0,
             "existing_pending_quantity": existing_pending_qty if existing else None,
             "final_stop": round(final_stop, 2), "phase": phase, "existing_order_id": existing_order_id or None,
@@ -2639,6 +2779,14 @@ def main() -> int:
 
         # 5. Run Exit Order Management
         active_expiry = get_active_strategy_expiry("3day_strategy")
+        for mismatch in _fsm_closed_legs_with_open_positions(
+            _load_thursday_fsm_snapshot(), positions, active_expiry=active_expiry
+        ):
+            logger.critical(
+                "[THU-RECON] Alpha FSM marked %s as %s (exit %s, reason: %s) but broker still holds %s x%s. Position is UNPROTECTED; manual review required.",
+                mismatch["fsm_leg"], mismatch["fsm_status"], mismatch["fsm_exit_price"],
+                mismatch["fsm_exit_reason"], mismatch["symbol"], mismatch["broker_quantity"],
+            )
         summary = manage_thursday_exit_orders(
             token=token,
             positions=positions,
@@ -2705,8 +2853,19 @@ def main() -> int:
                 r.set("ORDERS_LIVE_THU", "0")
                 r.set("fno:orders_live:thursday", "0")
             else:
-                # Check if all legs are closed; if so, reset ORDERS_LIVE_THU = 0
-                _check_and_reset_orders_live_thu(r, broker=active_broker)
+                # Reset ORDERS_LIVE_THU = 0 only when no enabled legs remain AND no open
+                # Thursday long is left without an authorization key (it would be unmanaged).
+                unmanaged_longs = _unmanaged_thu_long_positions(
+                    r, positions, broker=active_broker, active_expiry=active_expiry
+                )
+                if unmanaged_longs:
+                    logger.critical(
+                        "Cannot reset ORDERS_LIVE_THU: %d open Thursday long position(s) have no authorization key: %s. Keeping gate active; manual review required.",
+                        len(unmanaged_longs),
+                        [p.get("tradingsymbol") or p.get("instrument_token") for p in unmanaged_longs],
+                    )
+                else:
+                    _check_and_reset_orders_live_thu(r, broker=active_broker)
 
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return 1 if summary.get("fatal_error") else 0

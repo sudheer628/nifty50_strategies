@@ -1858,3 +1858,95 @@ def test_thursday_exit_immediately_partial_fill_retry_with_updated_position_snap
 
 
 
+
+
+def _unmanaged_fixture(authorized_keys):
+    mock_redis = MagicMock()
+    mock_redis.get.side_effect = lambda k: "1" if k in authorized_keys else None
+    return mock_redis
+
+
+def test_unmanaged_thu_long_detected_when_no_authorization_key():
+    """Nov-5 regression: an open 24500 PE with no enabled key must block the ORDERS_LIVE_THU reset."""
+    pe_pos = {"tradingsymbol": "NIFTY26N0924500PE", "instrument_token": "NSE_FO|40004", "quantity": 65}
+    keys = thu_module.build_trail_redis_keys("upstox", "NIFTY26N0924500PE", "NSE_FO|40004", active_expiry="2026-11-09")
+    r = _unmanaged_fixture(authorized_keys=set())
+    unmanaged = thu_module._unmanaged_thu_long_positions(r, [pe_pos], broker="upstox", active_expiry="2026-11-09")
+    assert unmanaged == [pe_pos], keys
+
+
+def test_unmanaged_thu_long_empty_when_authorized_via_canonical_key():
+    pe_pos = {"tradingsymbol": "NIFTY26N0924500PE", "instrument_token": "NSE_FO|40004", "quantity": 65}
+    keys = thu_module.build_trail_redis_keys("upstox", "NIFTY26N0924500PE", "NSE_FO|40004", active_expiry="2026-11-09")
+    r = _unmanaged_fixture(authorized_keys={keys["enabled_canonical"]})
+    assert thu_module._unmanaged_thu_long_positions(r, [pe_pos], broker="upstox", active_expiry="2026-11-09") == []
+
+
+def test_unmanaged_thu_long_ignores_other_expiry_and_zero_qty():
+    other_expiry = {"tradingsymbol": "NIFTY03NOV2622650CE", "instrument_token": "NSE_FO|53750", "quantity": 65}
+    zero_qty = {"tradingsymbol": "NIFTY26N0924500PE", "instrument_token": "NSE_FO|40004", "quantity": 0}
+    r = _unmanaged_fixture(authorized_keys=set())
+    assert thu_module._unmanaged_thu_long_positions(
+        r, [other_expiry, zero_qty], broker="upstox", active_expiry="2026-11-09"
+    ) == []
+
+
+def test_unmanaged_thu_long_fails_closed_on_redis_error():
+    pe_pos = {"tradingsymbol": "NIFTY26N0924500PE", "instrument_token": "NSE_FO|40004", "quantity": 65}
+    r = MagicMock()
+    r.get.side_effect = RuntimeError("redis down")
+    assert thu_module._unmanaged_thu_long_positions(r, [pe_pos], broker="upstox", active_expiry="2026-11-09") == [pe_pos]
+
+
+def _thu_snapshot(put_status="SALVAGED_CLOSED", call_status="MANUAL_CLOSED", status="ongoing"):
+    return {
+        "cycle_id": "CYCLE-THU-20261105",
+        "expiry_date": "20261109",
+        "status": status,
+        "alpha_fsm": {
+            "call_leg": {"strike": 24200, "status": call_status, "peak_ltp": 421.25, "exit_price": 391.9},
+            "put_leg": {"strike": 24500, "status": put_status, "peak_ltp": 226.3,
+                        "exit_price": 97.45, "exit_reason": "SALVAGE_STOP (test)"},
+        },
+    }
+
+
+def test_fsm_peak_seeds_trail_for_matching_leg():
+    snap = _thu_snapshot()
+    assert thu_module._fsm_peak_for_symbol(snap, "NIFTY26N0924500PE", active_expiry="2026-11-09") == 226.3
+    assert thu_module._fsm_peak_for_symbol(snap, "NIFTY26N0924200CE", active_expiry="2026-11-09") == 421.25
+
+
+def test_fsm_peak_zero_for_other_strike_expiry_or_missing_snapshot():
+    snap = _thu_snapshot()
+    assert thu_module._fsm_peak_for_symbol(snap, "NIFTY26N0924600PE", active_expiry="2026-11-09") == 0.0
+    assert thu_module._fsm_peak_for_symbol(snap, "NIFTY03NOV2624500PE", active_expiry="2026-11-09") == 0.0
+    assert thu_module._fsm_peak_for_symbol(None, "NIFTY26N0924500PE", active_expiry="2026-11-09") == 0.0
+
+
+def test_load_thursday_snapshot_ignores_closed_cycle(tmp_path):
+    path = tmp_path / "thu.json"
+    path.write_text(json.dumps(_thu_snapshot(status="closed")))
+    import config
+    with patch.object(config, "THURSDAY_SNAPSHOT_FILE", str(path)):
+        assert thu_module._load_thursday_fsm_snapshot() is None
+    path.write_text(json.dumps(_thu_snapshot(status="ongoing")))
+    with patch.object(config, "THURSDAY_SNAPSHOT_FILE", str(path)):
+        assert thu_module._load_thursday_fsm_snapshot() is not None
+
+
+def test_recon_flags_fsm_closed_leg_still_held_by_broker():
+    """Nov-6 regression: FSM says PE SALVAGED_CLOSED but broker still holds 65 PE."""
+    pe_pos = {"tradingsymbol": "NIFTY26N0924500PE", "instrument_token": "NSE_FO|40004", "quantity": 65}
+    out = thu_module._fsm_closed_legs_with_open_positions(_thu_snapshot(), [pe_pos], active_expiry="2026-11-09")
+    assert len(out) == 1
+    assert out[0]["fsm_leg"] == "put_leg" and out[0]["fsm_status"] == "SALVAGED_CLOSED"
+    assert out[0]["broker_quantity"] == 65
+
+
+def test_recon_silent_when_leg_active_or_flat_at_broker():
+    pe_pos = {"tradingsymbol": "NIFTY26N0924500PE", "instrument_token": "NSE_FO|40004", "quantity": 65}
+    snap_active = _thu_snapshot(put_status="ACTIVE")
+    assert thu_module._fsm_closed_legs_with_open_positions(snap_active, [pe_pos], active_expiry="2026-11-09") == []
+    flat_pe = dict(pe_pos, quantity=0)
+    assert thu_module._fsm_closed_legs_with_open_positions(_thu_snapshot(), [flat_pe], active_expiry="2026-11-09") == []
