@@ -81,7 +81,7 @@ Verify `cycle_id`, `status` (`"ongoing"` vs `"closed"`), strikes, entry prices, 
 
 | Directory | Relationship & What to Review |
 |---|---|
-| **`/home/ubuntu/sentinel-hermes`** | **Primary Sibling Repository**: Ingests `nifty50_strategies` snapshots and runs inference (`inference_runner.py`), fast exit checks (`fast_exit_check.py`), AI exit runners (`ai_exit_runner.py`), exit alert dispatches, weekly merges (`run_weekly_merge.sh`), and skill generation (`skill_generator.py`). Review its code, tests, and databases (`dispatched_exit_alerts.db`, `dispatched_peak_alerts.db`) to verify cross-system contracts. |
+| **`/home/ubuntu/sentinel-hermes`** | **Primary Sibling Repository**: Ingests `nifty50_strategies` snapshots and runs inference (`inference_runner.py`), fast exit checks (`fast_exit_check.py`), exit alert dispatches, weekly merges (`run_weekly_merge.sh`), and skill generation (`skill_generator.py`). Review its code, tests, and databases (`dispatched_exit_alerts.db`, `dispatched_peak_alerts.db`) to verify cross-system contracts. |
 | **`/home/ubuntu/market_signal_agent`** | Upstream market data provider for NIFTY spot LTP, 1m/5m candles, and option chain surface data (`signals_data_*.db`). Review when verifying price continuity or strike selection feeds. |
 | **`/home/ubuntu/nifty_signal_features`** | Technical feature engine (ATR, India VIX, volatility bands, trend regime filters). Review when debugging Smart Entry Gate inputs. |
 | **`/home/ubuntu/generate_trading_keys`** | SmartAPI authentication refresher that writes `angelone_jwt_feed` to Redis. Review when troubleshooting SmartAPI token or login failures. |
