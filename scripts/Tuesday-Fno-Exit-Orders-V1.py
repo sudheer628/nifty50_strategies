@@ -2345,16 +2345,181 @@ def manage_tuesday_exit_orders(
                         cooldown_seconds=600,
                     )
 
-        # Stop Breached check
+        # Stop Breached check: LTP fell to or below the required stop price.
+        # An SL-M order cannot be placed with trigger >= LTP (exchange rejects it).
+        # Fall back to an immediate MARKET exit instead of leaving the position unmanaged.
         if ltp <= final_stop:
+            logger.critical(
+                "[%s] STOP BREACHED: LTP %.2f <= required stop %.2f (existing order: %s). Initiating automatic MARKET exit.",
+                symbol, ltp, final_stop, existing_order_id or "none"
+            )
             base.update({
-                "status": "breached_existing_order_needs_review" if existing else "breached_needs_immediate_exit",
-                "reason": f"LTP {ltp:.2f} <= required stop {final_stop:.2f}; immediate manual review required",
-                "requires_immediate_attention": True
+                "status": "breach_market_exit",
+                "breached": True,
+                "reason": f"LTP {ltp:.2f} <= required stop {final_stop:.2f}; automatic MARKET exit on breach",
+                "requires_immediate_attention": True,
             })
+
+            if not execute:
+                base.update({
+                    "status": "cancel_slm_for_breach_market_exit" if existing else "breach_market_exit",
+                    "dry_run": True,
+                    "action_needed": True,
+                    "order_id": existing_order_id or None,
+                    "mode": "immediate",
+                })
+                actions.append(base)
+                alerts.append({"severity": "CRITICAL", **base})
+                continue
+
+            if token == MOCK_TOKEN:
+                base.update({
+                    "status": "mock_execute_blocked",
+                    "reason": "mock token cannot place real orders",
+                    "mode": "immediate",
+                    "success": False,
+                })
+                actions.append(base)
+                continue
+
+            # Lock validity check before broker mutation
+            if abort_event is not None and abort_event.is_set():
+                logger.critical("[%s] Distributed lock lost immediately before breach market exit! Aborting.", symbol)
+                base.update({"status": "lock_lost", "error": "Distributed lock lost before broker mutation", "success": False, "mode": "immediate"})
+                actions.append(base)
+                alerts.append({"severity": "CRITICAL", **base})
+                return {
+                    "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker,
+                    "positions": len(positions), "authorized_positions": len(authorized),
+                    "actions": actions, "orphan_managed_orders": orphan_managed_orders,
+                    "alerts": alerts, "fatal_error": "lock_lost", "dry_run": not execute,
+                }
+
+            # Market hours check before broker mutation (unless force)
+            if not force:
+                is_open, open_reason = is_market_hours_ist()
+                if not is_open:
+                    logger.warning("[%s] Market closed (%s) before breach market exit. Aborting.", symbol, open_reason)
+                    base.update({"status": "market_closed", "error": f"Market closed before broker mutation: {open_reason}", "success": False, "mode": "immediate"})
+                    actions.append(base)
+                    alerts.append({"severity": "CRITICAL", **base})
+                    return {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker,
+                        "positions": len(positions), "authorized_positions": len(authorized),
+                        "actions": actions, "orphan_managed_orders": orphan_managed_orders,
+                        "alerts": alerts, "fatal_error": "market_closed", "dry_run": not execute,
+                    }
+
+            # If an open SL-M order already exists, cancel it first to prevent duplicate fills / naked shorts
+            if existing:
+                existing_type = str(existing.get("order_type") or existing.get("ordertype") or "").upper()
+                if existing_type == "MARKET":
+                    base.update({
+                        "status": "market_order_in_flight", "order_id": existing_order_id, "mode": "immediate",
+                        "reason": f"Market exit order {existing_order_id} is already in-flight",
+                    })
+                    actions.append(base)
+                    logger.info("[%s] Market exit order %s is already in-flight", symbol, existing_order_id)
+                    continue
+
+                cancel_res = cancel_order(token, existing_order_id, broker=broker, variety="STOPLOSS")
+                if not cancel_res.get("success"):
+                    cancel_err = cancel_res.get("error")
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="BREACH_SLM_CANCEL_FAILED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=f"Failed to cancel existing SL-M order {existing_order_id} before breach market exit: {cancel_err}",
+                        details={"order_id": existing_order_id, "error": cancel_err, "result": cancel_res},
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+                    base.update({
+                        "status": "cancel_slm_failed", "order_id": existing_order_id, "mode": "immediate",
+                        "error": cancel_err, "success": False,
+                    })
+                    actions.append(base)
+                    alerts.append({"severity": "CRITICAL", **base})
+                    continue
+
+                time.sleep(0.5)
+                fresh_orders = fetch_order_book(token, broker=broker)
+                fresh_existing = next((o for o in fresh_orders if str(o.get("order_id") or o.get("orderid") or "") == existing_order_id), None)
+                if fresh_existing is not None:
+                    fresh_status = normalize_order_status(fresh_existing.get("status"))
+                    if fresh_status in OPEN_ORDER_STATUSES:
+                        logger.warning("[%s] SL-M %s cancel requested but still pending (%s). Next run will place market order.", symbol, existing_order_id, fresh_status)
+                        base.update({
+                            "status": "cancel_slm_pending", "order_id": existing_order_id, "mode": "immediate",
+                            "reason": f"SL-M cancellation in-flight ({fresh_status}); will place market order on next run",
+                            "success": True,
+                        })
+                        actions.append(base)
+                        continue
+                    elif fresh_status in TERMINAL_FILLED_STATUSES:
+                        logger.info("[%s] SL-M %s filled before cancellation. Position flat.", symbol, existing_order_id)
+                        base.update({
+                            "status": "slm_already_filled", "order_id": existing_order_id, "mode": "immediate", "success": True,
+                        })
+                        actions.append(base)
+                        continue
+
+                fresh_positions, _ = parse_positions(fetch_positions(token, broker=broker))
+                fresh_pos = next((p for p in fresh_positions if order_matches_position({"instrument_token": token_key, "tradingsymbol": symbol}, p)), None)
+                remaining_qty = int(_position_quantity(fresh_pos)) if fresh_pos else 0
+                if remaining_qty <= 0:
+                    logger.info("[%s] Position flat after SL-M cancellation. Cleaning up.", symbol)
+                    _cleanup_tuesday_leg_state(r, keys, broker=broker, symbol=symbol)
+                    continue
+                managed_qty = min(remaining_qty, leg_target_qty)
+
+            # Place immediate MARKET exit order on breach
+            try:
+                result = place_exit_order_market(token, pos, managed_qty, product=product_for_position, tag=tag, broker=broker)
+                base.update({
+                    "status": "place_market", "mode": "immediate",
+                    "result": result, "success": result.get("success", False),
+                })
+                if result.get("success"):
+                    new_market_id = result.get("order_id")
+                    base["order_id"] = new_market_id
+                    if r and new_market_id:
+                        r.set(keys["mode"], "immediate")
+                        r.set(keys["market_order_id"], new_market_id)
+                        r.set(keys["order_id"], new_market_id)
+                        r.sadd(f"fno:{broker}:managed_order_ids:tue", new_market_id)
+                        r.sadd(f"fno:{broker}:managed_order_ids", new_market_id)
+                    logger.info("[%s] STOP BREACHED: Successfully placed MARKET exit order for %d qty (order_id: %s)", symbol, managed_qty, new_market_id)
+                else:
+                    base["error"] = result.get("error")
+                    logger.error("[%s] Breach market order placement failed: %s", symbol, result.get("error"))
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="SELL_MARKET_BREACH",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=str(result.get("error")),
+                        details=result,
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+            except Exception as exc:
+                base.update({"status": "execution_failed", "error": str(exc), "success": False, "mode": "immediate"})
+                logger.error("[%s] Exception during breach market order placement: %s", symbol, exc)
+                dispatch_order_failure_discord(
+                    broker=broker,
+                    action="SELL_MARKET_BREACH",
+                    track=CYCLE_TRACK,
+                    symbol=symbol,
+                    quantity=managed_qty,
+                    error_reason=str(exc),
+                    redis_client=r,
+                    cooldown_seconds=600,
+                )
             actions.append(base)
-            alerts.append({"severity": "CRITICAL", **base})
-            logger.critical("[%s] STOP BREACHED: LTP %.2f <= stop %.2f", symbol, ltp, final_stop)
             continue
 
         # Minimum Ratchet Step Filter

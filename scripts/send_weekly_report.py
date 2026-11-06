@@ -546,6 +546,14 @@ def render_html(rows: Sequence[Dict], summary: Dict, chart_src: str) -> str:
     else:
         pnl_card_title = "STRATEGY FINAL P&L (CYCLE CLOSE)"
 
+    counterfactual_html = ""
+    if summary.get('exit_mode') != 'HOLD_TO_EXPIRY' and summary.get('passive_gainloss') is not None:
+        adv_label = 'Alpha Secured by FSM' if summary.get('is_fsm_flat') else 'Net FSM Advantage vs Passive Hold'
+        counterfactual_html = f"""<div style="margin:10px 8px;padding:12px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;font-size:12px;color:#334155;">
+      <strong>📉 Counterfactual: Passive Unhedged Hold (No Exit):</strong> {_number(summary.get('passive_gainloss'))} pts (₹{summary.get('passive_inr', 0):+,.0f}) &nbsp;·&nbsp;
+      <strong style="color:#15803d;">🛡️ {adv_label}:</strong> {summary.get('alpha_saved_pts', 0):+,.2f} pts (+₹{summary.get('alpha_saved_inr', 0):+,.0f})
+    </div>"""
+
     return f"""<!doctype html>
 <html><body style="margin:0;background:#eef2f7;font-family:Arial,sans-serif;color:#0f172a;">
 <div style="max-width:900px;margin:0 auto;padding:24px 12px;">
@@ -575,10 +583,7 @@ def render_html(rows: Sequence[Dict], summary: Dict, chart_src: str) -> str:
       </td>
     </tr></table>
 
-    {f"""<div style="margin:10px 8px;padding:12px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;font-size:12px;color:#334155;">
-      <strong>📉 Counterfactual: Passive Unhedged Hold (No Exit):</strong> {_number(summary.get('passive_gainloss'))} pts (₹{summary.get('passive_inr', 0):+,.0f}) &nbsp;·&nbsp;
-      <strong style="color:#15803d;">🛡️ {'Alpha Secured by FSM' if summary.get('is_fsm_flat') else 'Net FSM Advantage vs Passive Hold'}:</strong> {summary.get('alpha_saved_pts', 0):+,.2f} pts (+₹{summary.get('alpha_saved_inr', 0):+,.0f})
-    </div>""" if summary.get('exit_mode') != 'HOLD_TO_EXPIRY' and summary.get('passive_gainloss') is not None else ""}
+    {counterfactual_html}
 
     <div style="margin:16px 8px;padding:16px;background:#eff6ff;border-left:4px solid #2563eb;border-radius:8px;">
       <div style="margin-bottom:6px;">

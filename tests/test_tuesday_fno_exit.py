@@ -1651,3 +1651,81 @@ def test_reconcile_no_alert_when_managed_sell_filled():
 
     assert len(cleaned) == 1 and cleaned[0]["exit_executed"] is True
     mock_alert.assert_not_called()
+
+
+def test_tuesday_breach_triggers_automatic_market_exit():
+    """Verify that when LTP falls below the stop in live execute mode, a MARKET exit is placed automatically."""
+    mock_redis = MockRedis()
+    keys = tue_module.build_trail_redis_keys("upstox", "NIFTY26NOV22650CE", "NSE_FO_53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "instrument_token": "NSE_FO_53750",
+        "exchange": "NSE_FO",
+        "quantity": 65,
+        "average_price": 100.0,
+        "last_price": 40.0,
+    }]
+    orders = []
+
+    with patch.object(tue_module, "fetch_ltp", return_value=40.0), \
+         patch.object(tue_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(tue_module, "place_exit_order_market", return_value={"success": True, "order_id": "mkt_breach_tue_123"}) as mock_place_mkt:
+
+        res = tue_module.manage_tuesday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=False,
+            redis_client=mock_redis,
+        )
+
+        mock_place_mkt.assert_called_once()
+        assert res.get("placed") == 1
+        action = res["actions"][0]
+        assert action["status"] == "place_market"
+        assert action["mode"] == "immediate"
+        assert action["order_id"] == "mkt_breach_tue_123"
+        assert action.get("breached") is True
+        assert mock_redis.get(keys["mode"]) == "immediate"
+        assert mock_redis.get(keys["market_order_id"]) == "mkt_breach_tue_123"
+
+
+def test_tuesday_breach_dry_run_reports_action_needed():
+    """Verify that in dry-run mode (execute=False), a breach reports dry_run=True and does not place real orders."""
+    mock_redis = MockRedis()
+    keys = tue_module.build_trail_redis_keys("upstox", "NIFTY26NOV22650CE", "NSE_FO_53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "instrument_token": "NSE_FO_53750",
+        "exchange": "NSE_FO",
+        "quantity": 65,
+        "average_price": 100.0,
+        "last_price": 40.0,
+    }]
+    orders = []
+
+    with patch.object(tue_module, "fetch_ltp", return_value=40.0), \
+         patch.object(tue_module, "is_market_hours_ist", return_value=(True, "Open")), \
+         patch.object(tue_module, "place_exit_order_market") as mock_place_mkt:
+
+        res = tue_module.manage_tuesday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=False,
+            exit_immediately=False,
+            redis_client=mock_redis,
+        )
+
+        mock_place_mkt.assert_not_called()
+        action = res["actions"][0]
+        assert action["status"] == "breach_market_exit"
+        assert action["dry_run"] is True
+        assert action["action_needed"] is True
+        assert action["breached"] is True
+
