@@ -1277,23 +1277,73 @@ def reconcile_cycle_legs(
                 break
 
         if not exit_executed:
-            reason = (
-                f"Alpha exit authorization {enabled_key} is being retired WITHOUT any filled managed SELL: "
-                f"no open broker position matched {leg_strike} {leg_opt} (expiry {leg_expiry}). "
-                "Check for strike/symbol mismatch or a manual close."
-            )
-            logger.critical(reason)
-            dispatch_order_failure_discord(
-                broker=broker,
-                action="SELL_AUTH_UNMATCHED",
-                track=CYCLE_TRACK,
-                symbol=f"{leg_strike}{leg_opt}",
-                quantity=0,
-                error_reason=reason,
-                details={"enabled_key": enabled_key, "open_positions": [p.get("tradingsymbol") for p in positions]},
-                redis_client=r,
-                cooldown_seconds=3600,
-            )
+            # Attempt to auto-detect and record manual exit from broker position data
+            manual_exit_recorded = False
+            try:
+                # Find the closed position in broker data
+                for closed_pos in positions:
+                    pos_qty = _position_quantity(closed_pos)
+                    pos_day_sell_qty = int(_to_float(closed_pos.get("day_sell_quantity") or 0))
+                    pos_symbol = str(closed_pos.get("tradingsymbol") or closed_pos.get("instrument_token") or "")
+                    
+                    # Match the contract
+                    pos_details = parse_tradingsymbol(pos_symbol)
+                    pos_strike = int(pos_details.get("strike") or 0) if pos_details.get("strike") else 0
+                    pos_opt = pos_details.get("option_type")
+                    
+                    if pos_strike == int(leg_strike) and pos_opt == leg_opt and pos_qty == 0 and pos_day_sell_qty > 0:
+                        # Manual exit detected - auto-record it
+                        sell_price = float(closed_pos.get("sell_price") or closed_pos.get("day_sell_price") or 0.0)
+                        if sell_price <= 0:
+                            sell_value = float(closed_pos.get("sell_value") or closed_pos.get("day_sell_value") or 0.0)
+                            if sell_value > 0 and pos_day_sell_qty > 0:
+                                sell_price = round(sell_value / pos_day_sell_qty, 2)
+                        
+                        if sell_price > 0:
+                            from scripts.auto_record_manual_exit import auto_record_manual_exit
+                            import time
+                            
+                            result = auto_record_manual_exit(
+                                track=CYCLE_TRACK,
+                                broker=broker,
+                                strike=int(leg_strike),
+                                option_type=leg_opt,
+                                expiry_iso=eff_expiry,
+                                sell_price=sell_price,
+                                sell_ts=int(time.time()),
+                                sell_qty=pos_day_sell_qty,
+                                redis_client=r,
+                                dry_run=False,
+                            )
+                            
+                            if result.get("success"):
+                                manual_exit_recorded = True
+                                logger.info(
+                                    "Auto-recorded manual exit for %s %s @ ₹%.2f (qty=%d)",
+                                    leg_strike, leg_opt, sell_price, pos_day_sell_qty
+                                )
+                                break
+            except Exception as exc:
+                logger.warning("Failed to auto-record manual exit: %s", exc)
+            
+            if not manual_exit_recorded:
+                reason = (
+                    f"Alpha exit authorization {enabled_key} is being retired WITHOUT any filled managed SELL: "
+                    f"no open broker position matched {leg_strike} {leg_opt} (expiry {leg_expiry}). "
+                    "Check for strike/symbol mismatch or a manual close."
+                )
+                logger.critical(reason)
+                dispatch_order_failure_discord(
+                    broker=broker,
+                    action="SELL_AUTH_UNMATCHED",
+                    track=CYCLE_TRACK,
+                    symbol=f"{leg_strike}{leg_opt}",
+                    quantity=0,
+                    error_reason=reason,
+                    details={"enabled_key": enabled_key, "open_positions": [p.get("tradingsymbol") for p in positions]},
+                    redis_client=r,
+                    cooldown_seconds=3600,
+                )
 
         # All checks passed: No short position, long position is 0, AND open order is absent/terminal.
         _cleanup_thursday_leg_state(r, leg_keys, broker=broker, symbol=eff_symbol)
