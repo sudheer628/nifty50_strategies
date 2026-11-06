@@ -91,6 +91,20 @@ class TestConfigBrokerRouting:
             assert get_broker_for_track("5day_strategy") == "angelone"
             assert get_broker_for_track("3day_strategy") == "angelone"
 
+    def test_kotak_configuration(self):
+        """Kotak broker configurations and aliases."""
+        with patch.dict(os.environ, {"TUESDAY_BROKER": "kotak", "THURSDAY_BROKER": "kotak"}):
+            assert get_broker_for_track("5day_strategy") == "kotak"
+            assert get_broker_for_track("3day_strategy") == "kotak"
+
+        with patch.dict(os.environ, {"TUESDAY_BROKER": "kotakneo", "THURSDAY_BROKER": "kotak_neo"}):
+            assert get_broker_for_track("5day_strategy") == "kotak"
+            assert get_broker_for_track("3day_strategy") == "kotak"
+
+        with patch.dict(os.environ, {"TUESDAY_BROKER": "neo", "THURSDAY_BROKER": "angelone"}):
+            assert get_broker_for_track("5day_strategy") == "kotak"
+            assert get_broker_for_track("3day_strategy") == "angelone"
+
     def test_whitespace_and_case_normalization(self):
         """Broker names with mixed case and whitespace normalize cleanly."""
         with patch.dict(os.environ, {"TUESDAY_BROKER": "  UpStOx  ", "THURSDAY_BROKER": "  AngelOne  "}):
@@ -218,6 +232,11 @@ class TestBrokerAdapterPolymorphism:
         # Alias angel
         angel_alias = get_broker_adapter("angel")
         assert isinstance(angel_alias, AngelOneAdapter)
+
+        kotak = get_broker_adapter("kotak")
+        assert kotak.name == "kotak"
+        kotak_alias = get_broker_adapter("kotakneo")
+        assert kotak_alias.name == "kotak"
 
     def test_get_broker_adapter_unsupported_raises(self):
         with pytest.raises(ValueError, match="Unsupported broker 'dhan'"):
@@ -1420,3 +1439,165 @@ class TestBootstrapPreservesBrokerMetadata:
         assert active["3day_strategy"]["day1_locked_price"]["call_order_id"] == "THU_CALL_ENTRY_001"
         assert active["3day_strategy"]["day1_locked_price"]["put_order_id"] == "THU_PUT_ENTRY_001"
         assert active["3day_strategy"]["status"] == "active"
+
+
+class TestExitOnKotakNeo:
+    """Verify Tuesday and Thursday managers executing with broker='kotak'."""
+
+    def test_tuesday_places_slm_order_on_kotak(self):
+        """Tuesday manages a Kotak position, places SL-M order, and saves order ID in Redis."""
+        mock_redis = MagicMock()
+        mock_redis.get.side_effect = lambda k: json.dumps({"enabled": True, "qty": 65}) if "enabled" in k else None
+        mock_pipe = MagicMock()
+        mock_redis.pipeline.return_value = mock_pipe
+
+        positions = [{
+            "tradingsymbol": "NIFTY03NOV2622650CE",
+            "symboltoken": "53750",
+            "exchange": "NFO",
+            "quantity": 65,
+            "product": "NRML",
+            "average_price": 100.0,
+            "buy_price": 100.0,
+            "last_price": 110.0,
+        }]
+        orders = []
+
+        with patch.object(tue_module, "fetch_ltp", return_value=110.0), \
+             patch.object(tue_module, "place_exit_order_slm") as mock_place:
+            mock_place.return_value = {"success": True, "order_id": "KOTAK_TUE_101"}
+
+            res = tue_module.manage_tuesday_exit_orders(
+                token="REAL_TOKEN",
+                positions=positions,
+                orders=orders,
+                execute=True,
+                redis_client=mock_redis,
+                broker="kotak",
+                active_expiry="2026-11-03",
+                force=True,
+            )
+
+            assert res["placed"] == 1
+            mock_place.assert_called_once()
+            call_kwargs = mock_place.call_args[1]
+            assert call_kwargs.get("broker") == "kotak"
+            # Verify order_id KOTAK_TUE_101 was recorded
+            set_calls = [call[0] for call in mock_pipe.set.call_args_list]
+            assert any(call[1] == "KOTAK_TUE_101" for call in set_calls)
+
+    def test_tuesday_immediate_exit_on_kotak(self):
+        """Tuesday immediate market exit on Kotak Neo."""
+        mock_redis = MagicMock()
+        mock_redis.get.side_effect = lambda k: json.dumps({"enabled": True, "qty": 65}) if "enabled" in k else None
+        mock_pipe = MagicMock()
+        mock_redis.pipeline.return_value = mock_pipe
+
+        positions = [{
+            "tradingsymbol": "NIFTY03NOV2622650CE",
+            "symboltoken": "53750",
+            "exchange": "NFO",
+            "quantity": 65,
+            "product": "NRML",
+            "average_price": 100.0,
+            "buy_price": 100.0,
+            "last_price": 110.0,
+        }]
+        orders = []
+
+        with patch.object(tue_module, "place_exit_order_market") as mock_market:
+            mock_market.return_value = {"success": True, "order_id": "KOTAK_TUE_MKT_202"}
+
+            res = tue_module.manage_tuesday_exit_orders(
+                token="REAL_TOKEN",
+                positions=positions,
+                orders=orders,
+                execute=True,
+                exit_immediately=True,
+                redis_client=mock_redis,
+                broker="kotak",
+                active_expiry="2026-11-03",
+                force=True,
+            )
+
+            assert res["placed"] == 1
+            mock_market.assert_called_once()
+            assert mock_market.call_args[1].get("broker") == "kotak"
+
+    def test_thursday_places_slm_order_on_kotak(self):
+        """Thursday manages a Kotak position and places SL-M order."""
+        mock_redis = MagicMock()
+        mock_redis.get.side_effect = lambda k: json.dumps({"enabled": True, "qty": 65}) if "enabled" in k else None
+        mock_pipe = MagicMock()
+        mock_redis.pipeline.return_value = mock_pipe
+
+        positions = [{
+            "tradingsymbol": "NIFTY03NOV2622650CE",
+            "symboltoken": "53750",
+            "exchange": "NFO",
+            "quantity": 65,
+            "product": "NRML",
+            "average_price": 100.0,
+            "buy_price": 100.0,
+            "last_price": 110.0,
+        }]
+        orders = []
+
+        with patch.object(thu_module, "fetch_ltp", return_value=110.0), \
+             patch.object(thu_module, "place_exit_order_slm") as mock_place:
+            mock_place.return_value = {"success": True, "order_id": "KOTAK_THU_303"}
+
+            res = thu_module.manage_thursday_exit_orders(
+                token="REAL_TOKEN",
+                positions=positions,
+                orders=orders,
+                execute=True,
+                redis_client=mock_redis,
+                broker="kotak",
+                active_expiry="2026-11-03",
+                force=True,
+            )
+
+            assert res["placed"] == 1
+            mock_place.assert_called_once()
+            assert mock_place.call_args[1].get("broker") == "kotak"
+            set_calls = [call[0] for call in mock_pipe.set.call_args_list]
+            assert any(call[1] == "KOTAK_THU_303" for call in set_calls)
+
+    def test_thursday_immediate_exit_on_kotak(self):
+        """Thursday immediate market exit on Kotak Neo."""
+        mock_redis = MagicMock()
+        mock_redis.get.side_effect = lambda k: json.dumps({"enabled": True, "qty": 65}) if "enabled" in k else None
+        mock_pipe = MagicMock()
+        mock_redis.pipeline.return_value = mock_pipe
+
+        positions = [{
+            "tradingsymbol": "NIFTY03NOV2622650CE",
+            "symboltoken": "53750",
+            "exchange": "NFO",
+            "quantity": 65,
+            "product": "NRML",
+            "average_price": 100.0,
+            "buy_price": 100.0,
+            "last_price": 110.0,
+        }]
+        orders = []
+
+        with patch.object(thu_module, "place_exit_order_market") as mock_market:
+            mock_market.return_value = {"success": True, "order_id": "KOTAK_THU_MKT_404"}
+
+            res = thu_module.manage_thursday_exit_orders(
+                token="REAL_TOKEN",
+                positions=positions,
+                orders=orders,
+                execute=True,
+                exit_immediately=True,
+                redis_client=mock_redis,
+                broker="kotak",
+                active_expiry="2026-11-03",
+                force=True,
+            )
+
+            assert res["placed"] == 1
+            mock_market.assert_called_once()
+            assert mock_market.call_args[1].get("broker") == "kotak"

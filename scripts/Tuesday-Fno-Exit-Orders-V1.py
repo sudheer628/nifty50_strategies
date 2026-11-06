@@ -104,7 +104,7 @@ DEFAULT_BROKER = os.getenv("TUESDAY_BROKER", "upstox").lower().strip()
 
 UPSTOX_BASE = os.getenv("UPSTOX_BASE_URL", "https://api.upstox.com").rstrip("/")
 PRODUCT_NRML = "D"
-PRODUCT_MAP = {"upstox": "D", "angelone": "CARRYFORWARD", "angel": "CARRYFORWARD", "icici": "NRML", "breeze": "NRML"}
+PRODUCT_MAP = {"upstox": "D", "angelone": "CARRYFORWARD", "angel": "CARRYFORWARD", "icici": "NRML", "breeze": "NRML", "kotak": "NRML", "kotakneo": "NRML"}
 
 ORDER_TYPE_SLM = "SL-M"
 ORDER_TYPE_SL = "SL"
@@ -699,9 +699,6 @@ def place_exit_order_market(token: str, position: Dict[str, Any], target_qty: in
 
 def modify_exit_order_slm(token: str, order: Dict[str, Any], target_qty: int, trigger_price: float, tag: str = DEFAULT_TAG, broker: str = "upstox") -> Dict[str, Any]:
     return get_broker_adapter(broker).modify_exit_order_slm(token, order, target_qty, trigger_price, tag=tag)
-    url = f"{UPSTOX_BASE}/v2/order/modify"
-    resp = requests.put(url, headers=_headers(token), json=payload, timeout=REQUEST_TIMEOUT)
-    return _order_response("modify", resp, payload)
 
 
 def _order_response(action: str, resp, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2458,7 +2455,7 @@ def main() -> int:
     parser.add_argument("--trail-pct", type=float, default=DEFAULT_TRAIL_PCT, help=f"Trail %% below high-water mark (default {DEFAULT_TRAIL_PCT})")
     parser.add_argument("--initial-stop-pct", type=float, default=DEFAULT_INITIAL_STOP_PCT, help=f"Initial stop %% below average before activation (default {DEFAULT_INITIAL_STOP_PCT})")
     parser.add_argument("--activation-pct", type=float, default=DEFAULT_ACTIVATION_PCT, help="Start trailing after LTP reaches average*(1+activation/100); 0=from start")
-    parser.add_argument("--min-ratchet-step", type=float, default=DEFAULT_MIN_RATCHET_STEP, help=f"Minimum ₹ increase to modify order (default ₹{DEFAULT_MIN_RATCHET_STEP})")
+    parser.add_argument("--min-ratchet-step", type=float, default=DEFAULT_MIN_RATCHET_STEP, help=f"Minimum Rs. increase to modify order (default Rs. {DEFAULT_MIN_RATCHET_STEP})")
     parser.add_argument("--tag", default=DEFAULT_TAG, help=f"Order tag (default {DEFAULT_TAG})")
     parser.add_argument("--auto-cancel-orphans", action="store_true", default=True, help="Auto-cancel orphan TUE-SL orders when position is closed (default: True to prevent naked shorts)")
     parser.add_argument("--no-auto-cancel-orphans", action="store_false", dest="auto_cancel_orphans", help="Disable auto-cancellation of orphan orders (leaves orphan orders open for manual cancel)")
@@ -2480,7 +2477,12 @@ def main() -> int:
         pass
 
     # Redis client first: execution gates and sizing are read Redis-first (fallback: .env, then default)
-    r = None if args.mock else get_redis_client()
+    if args.mock:
+        r = None
+        from config import _config_redis_state
+        _config_redis_state["unavailable"] = True
+    else:
+        r = get_redis_client()
     from config import get_config_bool, get_config_int
     # 1. Master Gate: LIVE_EXIT_TRIGGER_TUESDAY (Redis -> .env -> false)
     live_env_enabled = get_config_bool("LIVE_EXIT_TRIGGER_TUESDAY", default=False, redis_client=r)

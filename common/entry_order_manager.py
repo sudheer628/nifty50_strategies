@@ -217,8 +217,20 @@ def get_broker_token(broker: str, redis_client=None) -> str:
             return MOCK_TOKEN
         raise RuntimeError("No access token found for AngelOne in Redis or environment.")
 
+    elif broker in ("kotak", "kotakneo", "kotak_neo", "neo"):
+        if os.getenv("TEST_MODE") == "true" or os.getenv("MOCK_BROKER") == "true":
+            return MOCK_TOKEN
+        try:
+            from common.kotak_neo_adapter import KotakNeoAdapter
+            adapter = KotakNeoAdapter()
+            return adapter.get_access_token(redis_client=redis_client)
+        except Exception as exc:
+            if os.getenv("TEST_MODE") == "true" or os.getenv("MOCK_BROKER") == "true":
+                return MOCK_TOKEN
+            raise RuntimeError(f"No access token found for Kotak Neo in Redis or environment: {exc}")
+
     else:
-        raise ValueError(f"Unsupported broker '{broker}'. Must be 'upstox' or 'angelone'.")
+        raise ValueError(f"Unsupported broker '{broker}'. Must be 'upstox', 'angelone', or 'kotak'.")
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +269,10 @@ def get_available_funds(broker: str, token: str) -> float:
         data = body.get("data") or {}
         funds = data.get("availablecash") or data.get("net") or data.get("availablemargin") or 0.0
         return float(funds)
+
+    elif broker in ("kotak", "kotakneo", "kotak_neo", "neo"):
+        from common.kotak_neo_adapter import KotakNeoAdapter
+        return KotakNeoAdapter().get_available_funds(token)
 
     raise ValueError(f"Unsupported broker '{broker}' for funds check")
 
@@ -304,6 +320,11 @@ def preflight_entry(
         put_sym = put_contract.get("trading_symbol") or put_contract.get("tradingsymbol")
         if not call_tok or not put_tok or not call_sym or not put_sym:
             return False, f"AngelOne contract missing token or symbol: call=({call_sym}, {call_tok}), put=({put_sym}, {put_tok})", {}
+    elif broker in ("kotak", "kotakneo", "kotak_neo", "neo"):
+        call_sym = call_contract.get("trading_symbol") or call_contract.get("tradingsymbol") or call_contract.get("trdSym")
+        put_sym = put_contract.get("trading_symbol") or put_contract.get("tradingsymbol") or put_contract.get("trdSym")
+        if not call_sym or not put_sym:
+            return False, f"Kotak Neo contract missing trading_symbol: call={call_sym}, put={put_sym}", {}
     else:
         return False, f"Unsupported broker '{broker}'", {}
 
@@ -471,6 +492,36 @@ def place_market_order(
             "response": body,
         }
 
+    elif broker in ("kotak", "kotakneo", "kotak_neo", "neo"):
+        from common.kotak_neo_adapter import KotakNeoAdapter
+        adapter = KotakNeoAdapter()
+        res = adapter.place_market_order(
+            token=token,
+            contract=contract,
+            quantity=quantity,
+            transaction_type=transaction_type,
+            tag=tag,
+        )
+        if res.get("success"):
+            return {
+                "success": True,
+                "order_id": res.get("order_id"),
+                "status": "submitted",
+                "broker": "kotak",
+                "quantity": quantity,
+                "transaction_type": transaction_type,
+                "response": res.get("response"),
+            }
+        return {
+            "success": False,
+            "order_id": None,
+            "status": "rejected",
+            "broker": "kotak",
+            "error": res.get("error", "Unknown Kotak order error"),
+            "http_status": res.get("http_status"),
+            "response": res.get("response"),
+        }
+
     raise ValueError(f"Unsupported broker '{broker}'")
 
 
@@ -507,6 +558,10 @@ def cancel_broker_order(
             body = {"raw": resp.text[:300]}
         success = 200 <= resp.status_code < 300 and isinstance(body, dict) and body.get("status") is True
         return {"action": "cancel", "order_id": order_id, "success": success, "http_status": resp.status_code, "response": body}
+
+    elif broker in ("kotak", "kotakneo", "kotak_neo", "neo"):
+        from common.kotak_neo_adapter import KotakNeoAdapter
+        return KotakNeoAdapter().cancel_order(token=token, order_id=str(order_id), variety=variety)
 
     raise ValueError(f"Unsupported broker '{broker}'")
 
@@ -575,6 +630,31 @@ def fetch_normalized_orders(broker: str, token: str) -> List[Dict[str, Any]]:
                 "transaction_type": str(o.get("transactiontype") or "").upper(),
                 "symboltoken": str(o.get("symboltoken") or ""),
                 "symbol": str(o.get("tradingsymbol") or ""),
+                "raw": o,
+            })
+        return normalized
+
+    elif broker in ("kotak", "kotakneo", "kotak_neo", "neo"):
+        from common.kotak_neo_adapter import KotakNeoAdapter
+        orders = KotakNeoAdapter().fetch_order_book(token)
+        normalized = []
+        for o in orders:
+            oid = str(o.get("order_id") or o.get("orderid") or "")
+            st = normalize_status(o.get("status"))
+            fq = int(_to_float(o.get("filled_quantity", 0)))
+            tq = int(_to_float(o.get("quantity", 0)))
+            avg_p = _to_float(o.get("average_price") or o.get("avg_price") or o.get("price"))
+            normalized.append({
+                "order_id": oid,
+                "status": st,
+                "raw_status": str(o.get("raw_status") or o.get("status") or ""),
+                "filled_quantity": fq,
+                "quantity": tq,
+                "average_price": avg_p,
+                "transaction_type": str(o.get("transaction_type") or o.get("transactiontype") or "").upper(),
+                "instrument_token": str(o.get("instrument_token") or o.get("symboltoken") or ""),
+                "symbol": str(o.get("trading_symbol") or o.get("tradingsymbol") or o.get("symbol") or ""),
+                "trading_symbol": str(o.get("trading_symbol") or o.get("tradingsymbol") or o.get("symbol") or ""),
                 "raw": o,
             })
         return normalized
@@ -680,6 +760,11 @@ def fetch_broker_positions(broker: str, token: str) -> List[Dict[str, Any]]:
         if body.get("status") is False:
             raise RuntimeError(f"AngelOne positions API error: {body.get('message') or body}")
         return body.get("data") or []
+
+    elif broker in ("kotak", "kotakneo", "kotak_neo", "neo"):
+        from common.kotak_neo_adapter import KotakNeoAdapter
+        res = KotakNeoAdapter().fetch_positions(token)
+        return res.get("data") or []
 
     raise ValueError(f"Unsupported broker '{broker}' for positions check")
 
@@ -1454,8 +1539,8 @@ def execute_paired_market_buy(
     5. Atomic rollback if either leg fails.
     """
     broker = (broker or "").lower().strip()
-    if broker not in ("upstox", "angelone", "angel"):
-        raise ValueError(f"Unsupported broker '{broker}'. Must be 'upstox' or 'angelone'.")
+    if broker not in ("upstox", "angelone", "angel", "kotak", "kotakneo", "kotak_neo", "neo"):
+        raise ValueError(f"Unsupported broker '{broker}'. Must be one of ('upstox', 'angelone', 'kotak').")
 
     # 1. Acquire Token
     try:

@@ -502,6 +502,10 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 from common.angelone_client import resolve_option_token
                 call_contract = resolve_option_token(expiry_angelone, call_strike, "CE")
                 put_contract = resolve_option_token(expiry_angelone, put_strike, "PE")
+            elif track_broker == "kotak":
+                from common.kotak_neo_adapter import resolve_kotak_option_contract
+                call_contract = resolve_kotak_option_contract(expiry_angelone, call_strike, "CE")
+                put_contract = resolve_kotak_option_contract(expiry_angelone, put_strike, "PE")
             else:
                 from common.entry_order_manager import resolve_upstox_option_key
                 call_key = resolve_upstox_option_key(expiry_angelone, call_strike, "CE")

@@ -47,7 +47,19 @@ STRATEGY_NAME_THURSDAY = "nifty50_thursday_3day_collector"
 # ---------------------------------------------------------------------------
 TUESDAY_BROKER = os.getenv("TUESDAY_BROKER", "upstox").lower().strip()
 THURSDAY_BROKER = os.getenv("THURSDAY_BROKER", "angelone").lower().strip()
-SUPPORTED_BROKERS = ("upstox", "angelone")
+SUPPORTED_BROKERS = ("upstox", "angelone", "kotak")
+
+
+def normalize_broker_name(broker: Optional[str]) -> str:
+    """Normalize broker aliases to canonical names ('upstox', 'angelone', 'kotak')."""
+    b = str(broker or "").lower().strip()
+    if b in ("angelone", "angel"):
+        return "angelone"
+    if b == "upstox":
+        return "upstox"
+    if b in ("kotak", "kotakneo", "kotak_neo", "neo"):
+        return "kotak"
+    return b
 
 
 def get_entry_qty_for_track(track: str, redis_client=None) -> int:
@@ -74,7 +86,7 @@ def get_entry_qty_for_track(track: str, redis_client=None) -> int:
     return get_config_int("STRATEGY_BUY_QTY", lot_size, redis_client=redis_client)
 
 
-def get_broker_for_track(track: str) -> str:
+def get_broker_for_track(track: str, redis_client=None) -> str:
     """
     Resolve and validate the configured broker for a strategy track.
 
@@ -83,19 +95,20 @@ def get_broker_for_track(track: str) -> str:
       - '3day_strategy', '3day', 'thursday', 'thu' -> returns THURSDAY_BROKER
 
     Returns:
-      Normalized broker name ('upstox' or 'angelone').
+      Normalized broker name ('upstox', 'angelone', or 'kotak').
 
     Raises:
       ValueError if track is unrecognized or resolved broker is unsupported.
     """
     norm = str(track or "").lower().strip()
     if norm in ("5day_strategy", "5day", "tuesday", "tue", "weekly"):
-        broker = os.getenv("TUESDAY_BROKER", TUESDAY_BROKER).lower().strip()
+        broker_raw = get_config_flag("TUESDAY_BROKER", os.getenv("TUESDAY_BROKER", TUESDAY_BROKER), redis_client=redis_client)
     elif norm in ("3day_strategy", "3day", "thursday", "thu"):
-        broker = os.getenv("THURSDAY_BROKER", THURSDAY_BROKER).lower().strip()
+        broker_raw = get_config_flag("THURSDAY_BROKER", os.getenv("THURSDAY_BROKER", THURSDAY_BROKER), redis_client=redis_client)
     else:
         raise ValueError(f"Unknown strategy track '{track}'. Expected '5day_strategy' or '3day_strategy'.")
 
+    broker = normalize_broker_name(broker_raw)
     if broker not in SUPPORTED_BROKERS:
         raise ValueError(
             f"Unsupported broker '{broker}' configured for track '{track}'. "

@@ -872,12 +872,17 @@ def get_broker_adapter(broker: str) -> BrokerAdapter:
         b = "angelone"
     elif b == "upstox":
         b = "upstox"
+    elif b in ("kotak", "kotakneo", "kotak_neo", "neo"):
+        b = "kotak"
     else:
-        raise ValueError(f"Unsupported broker '{broker}'. Must be 'upstox' or 'angelone'.")
+        raise ValueError(f"Unsupported broker '{broker}'. Must be 'upstox', 'angelone', or 'kotak'.")
 
     if b not in _ADAPTER_REGISTRY:
         if b == "upstox":
             _ADAPTER_REGISTRY[b] = UpstoxAdapter()
         elif b == "angelone":
             _ADAPTER_REGISTRY[b] = AngelOneAdapter()
+        elif b == "kotak":
+            from common.kotak_neo_adapter import KotakNeoAdapter
+            _ADAPTER_REGISTRY[b] = KotakNeoAdapter()
     return _ADAPTER_REGISTRY[b]
