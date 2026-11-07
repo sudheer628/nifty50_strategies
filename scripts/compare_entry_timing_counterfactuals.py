@@ -58,6 +58,33 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 WEEKLY_DB_RE = re.compile(r"nifty50_weekly_data_(\d{8})_(\d{8})\.db$")
 
 
+def _to_timestamp(val: Any) -> int:
+    """Robustly parse Unix integer timestamp or ISO datetime string to integer seconds."""
+    if val is None:
+        return 0
+    if isinstance(val, (int, float)):
+        return int(val)
+    val_str = str(val).strip()
+    if not val_str:
+        return 0
+    try:
+        return int(float(val_str))
+    except (ValueError, TypeError):
+        pass
+    try:
+        dt = datetime.datetime.fromisoformat(val_str.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d"):
+        try:
+            dt = datetime.datetime.strptime(val_str, fmt)
+            return int(dt.timestamp())
+        except Exception:
+            continue
+    return 0
+
+
 def get_surface_quote_for_strike(surface: dict, strike: int, leg: str) -> Optional[float]:
     """Extract LTP or close from an option chain surface JSON dictionary for a strike and leg."""
     if not surface or not isinstance(surface, dict):
@@ -173,10 +200,10 @@ def simulate_fsm_run(
 ) -> Dict[str, Any]:
     """Simulate FSM execution for an entry variant across hourly ticks starting at or after entry_ts."""
     if entry_ts is None:
-        entry_ts = int(strategy_rows[0].get("collection_timestamp") or strategy_rows[0].get("ts") or 0)
+        entry_ts = _to_timestamp(strategy_rows[0].get("collection_timestamp") or strategy_rows[0].get("ts") or 0)
 
     # Filter ticks so delayed variants (e.g. entered at 10:01) do not evaluate pre-entry ticks
-    eval_rows = [r for r in strategy_rows if int(r.get("collection_timestamp") or r.get("ts") or 0) >= entry_ts]
+    eval_rows = [r for r in strategy_rows if _to_timestamp(r.get("collection_timestamp") or r.get("ts") or 0) >= entry_ts]
     if not eval_rows:
         eval_rows = strategy_rows[-1:]
 
@@ -189,7 +216,7 @@ def simulate_fsm_run(
     )
 
     for row in eval_rows:
-        ts = int(row.get("collection_timestamp") or row.get("ts") or 0)
+        ts = _to_timestamp(row.get("collection_timestamp") or row.get("ts") or 0)
         c_ltp = float(row.get("call_ltp") or 0.0)
         p_ltp = float(row.get("put_ltp") or 0.0)
         spot = float(row.get("nifty_ltp") or 0.0)
@@ -274,7 +301,7 @@ def analyze_weekly_cycle(
         return None
 
     # Date resolution
-    start_ts = int(snapshot.get("captured_at") or first_row.get("collection_timestamp") or 0)
+    start_ts = _to_timestamp(snapshot.get("captured_at") or first_row.get("collection_timestamp") or 0)
     dt_start = datetime.datetime.fromtimestamp(start_ts, tz=UTC_TZ).astimezone(IST_TZ)
     trade_date_str = dt_start.strftime("%Y-%m-%d")
 
@@ -293,7 +320,7 @@ def analyze_weekly_cycle(
             if v_name:
                 call_ts = s.get("call_entry_ts")
                 put_ts = s.get("put_entry_ts")
-                valid_ts = [int(t) for t in (call_ts, put_ts) if t is not None]
+                valid_ts = [_to_timestamp(t) for t in (call_ts, put_ts) if t is not None]
                 variants[v_name] = {
                     "call_buy": float(s.get("call_entry_price") or 0.0),
                     "put_buy": float(s.get("put_entry_price") or 0.0),

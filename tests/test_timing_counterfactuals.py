@@ -272,6 +272,70 @@ class TimingCounterfactualsTests(unittest.TestCase):
             self.assertIn("status", res["variants"]["V0_baseline_0931"])
             self.assertIn("pnl_pts", res["variants"]["V0_baseline_0931"])
 
+    def test_iso_timestamp_in_buy_snapshot_parsed_cleanly(self):
+        """Regression test: ISO timestamp in buy_snapshot captured_at must not raise ValueError."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            strat_db = str(Path(temp_dir) / "nifty50_weekly_data_20260818_20260825.db")
+            init_db(strat_db)
+
+            conn = sqlite3.connect(strat_db)
+            conn.execute("""
+                INSERT INTO strategy_buy_snapshots (
+                    strategy_name, captured_at, cycle_id, expiry_date, week_start_date,
+                    call_strike, put_strike, call_buy_price, put_buy_price
+                ) VALUES (
+                    'test', '2026-08-18T04:30:02.669263+00:00', 'CYCLE-TEST', '20260825', '2026-08-18',
+                    25000, 25200, 200.0, 200.0
+                )
+            """)
+            conn.execute("""
+                INSERT INTO strategy_hourly_data (
+                    strategy_name, collection_timestamp, expiry_date,
+                    put_strike, call_strike, put_ltp, call_ltp,
+                    call_buy_price, put_buy_price, cycle_id, nifty_ltp
+                ) VALUES (
+                    'test', '2026-08-18T04:30:02.669263+00:00', '20260825',
+                    25200, 25000, 200.0, 200.0,
+                    200.0, 200.0, 'CYCLE-TEST', 25100.0
+                )
+            """)
+            conn.commit()
+            conn.close()
+
+            shadow_v0 = {
+                "cycle_id": "CYCLE-TEST",
+                "trade_date": "2026-08-18",
+                "variant": "V0_baseline_0931",
+                "call_strike": 25000,
+                "put_strike": 25200,
+                "call_entry_time": "09:31:00",
+                "call_entry_price": 200.0,
+                "call_entry_ts": 1786452660,
+                "put_entry_time": "09:31:00",
+                "put_entry_price": 200.0,
+                "put_entry_ts": 1786452660,
+                "combined_entry_price": 400.0,
+                "spot_at_call_entry": 25100.0,
+                "spot_at_put_entry": 25100.0,
+                "nifty_spot_entry": 25100.0,
+                "moneyness": "ITM",
+                "created_at": 1786452660,
+            }
+            shadow_v1 = dict(shadow_v0)
+            shadow_v1["variant"] = "V1_delayed_1000"
+            shadow_v1["call_entry_price"] = 190.0
+            shadow_v1["put_entry_price"] = 190.0
+            shadow_v1["combined_entry_price"] = 380.0
+            shadow_v1["call_entry_ts"] = 1786454460
+            shadow_v1["put_entry_ts"] = 1786454460
+
+            insert_timing_shadow_entry(strat_db, shadow_v0)
+            insert_timing_shadow_entry(strat_db, shadow_v1)
+
+            res = analyze_weekly_cycle(strat_db, signals_dir=temp_dir, exit_model="hold_to_expiry")
+            self.assertIsNotNone(res)
+            self.assertEqual(res["trade_date"], "2026-08-18")
+
 
 if __name__ == "__main__":
     unittest.main()
