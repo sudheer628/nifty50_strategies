@@ -236,3 +236,69 @@ def test_collector_reuses_manual_snapshot_on_wednesday():
     assert cycle["put_strike"] == 24100
     assert cycle["call_buy_price"] == 220.50
     assert cycle["put_buy_price"] == 195.00
+
+
+def test_prompt_user_input_strips_spaces_and_casts():
+    """Verify prompt_user_input removes all whitespace and correctly validates."""
+    from scripts.register_manual_entry import prompt_user_input
+
+    # 1. Strips internal and surrounding spaces for integer
+    with patch("builtins.input", return_value="  24 300  "):
+        val = prompt_user_input("Enter Strike", "Strike", cast_type=int)
+        assert val == 24300
+
+    # 2. Strips spaces for float
+    with patch("builtins.input", return_value="  220 . 50  "):
+        val = prompt_user_input("Enter Price", "Price", cast_type=float)
+        assert val == 220.50
+
+    # 3. Accepts default when input is empty
+    with patch("builtins.input", return_value="   "):
+        val = prompt_user_input("Enter Qty", "Qty", default="65", cast_type=int)
+        assert val == 65
+
+    # 4. Exits when input is empty and no default exists
+    with patch("builtins.input", return_value="   "), pytest.raises(SystemExit) as exc:
+        prompt_user_input("Enter Strike", "Strike", cast_type=int)
+    assert exc.value.code == 1
+
+    # 5. Exits when value <= min_val
+    with patch("builtins.input", return_value="0"), pytest.raises(SystemExit) as exc:
+        prompt_user_input("Enter Price", "Price", cast_type=float, min_val=0.0)
+    assert exc.value.code == 1
+
+
+def test_interactive_wizard_flow():
+    """Verify full interactive wizard prompts step-by-step and completes registration."""
+    from scripts.register_manual_entry import main
+
+    inputs = iter([
+        "n",                     # [1] Auto-detect? -> No, use manual wizard
+        "24300",                 # [2] CALL Strike
+        "220.50",                # [3] CALL Buy Price
+        "261109000177180",       # [4] CALL Order ID
+        "24100",                 # [5] PUT Strike
+        "195.00",                # [6] PUT Buy Price
+        "261109000177181",       # [7] PUT Order ID
+        "65",                    # [8] Qty
+        "2026-11-17",            # [9] Expiry
+        "y",                     # [10] Run as dry-run? -> Yes
+    ])
+
+    with patch("sys.argv", ["register_manual_entry.py"]), \
+         patch("builtins.input", lambda _: next(inputs)), \
+         patch("scripts.register_manual_entry.register_manual_cycle") as mock_reg:
+        mock_reg.return_value = {"status": "dry_run"}
+        ret = main()
+        assert ret == 0
+        assert mock_reg.called
+        call_kwargs = mock_reg.call_args[1]
+        assert call_kwargs["call_strike"] == 24300
+        assert call_kwargs["call_price"] == 220.50
+        assert call_kwargs["call_order_id"] == "261109000177180"
+        assert call_kwargs["put_strike"] == 24100
+        assert call_kwargs["put_price"] == 195.00
+        assert call_kwargs["put_order_id"] == "261109000177181"
+        assert call_kwargs["qty"] == 65
+        assert call_kwargs["expiry_iso"] == "2026-11-17"
+        assert call_kwargs["dry_run"] is True

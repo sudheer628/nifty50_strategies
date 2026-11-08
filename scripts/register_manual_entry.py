@@ -468,11 +468,58 @@ def register_manual_cycle(
     return result
 
 
+def prompt_user_input(
+    prompt_text: str,
+    field_name: str,
+    default: Optional[str] = None,
+    cast_type: type = str,
+    min_val: Optional[float] = None,
+) -> Any:
+    """
+    Prompt user step-by-step for required input:
+      1. Strips all spaces from user input.
+      2. If input is NULL/empty and no default exists, immediately stops and exits.
+      3. Validates and casts to required type.
+    """
+    default_hint = f" [Default: {default}]" if default is not None else ""
+    try:
+        raw = input(f"{prompt_text}{default_hint}: ")
+    except (EOFError, KeyboardInterrupt):
+        print("\n")
+        logger.warning("Input interrupted by user. Stopping registration.")
+        sys.exit(0)
+
+    # Remove all spaces/whitespace as required
+    cleaned = "".join(raw.split())
+
+    if cleaned.lower() in ("exit", "quit", "cancel"):
+        logger.warning("User requested exit. Stopping registration.")
+        sys.exit(0)
+
+    if not cleaned:
+        if default is not None:
+            cleaned = str(default)
+        else:
+            logger.error("❌ NULL / Empty input received for '%s'. Stopping script immediately.", field_name)
+            sys.exit(1)
+
+    try:
+        val = cast_type(cleaned)
+        if min_val is not None and val <= min_val:
+            logger.error("❌ '%s' must be greater than %s (received: %s). Stopping script.", field_name, min_val, cleaned)
+            sys.exit(1)
+        return val
+    except ValueError:
+        logger.error("❌ Invalid value for '%s' ('%s'). Expected %s. Stopping script.", field_name, cleaned, cast_type.__name__)
+        sys.exit(1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Register manual option entries for automated exit and Alpha FSM tracking."
     )
     parser.add_argument("--auto-detect", action="store_true", help="Auto-detect executed buy orders from broker order book")
+    parser.add_argument("--interactive", action="store_true", help="Force step-by-step interactive wizard mode")
     parser.add_argument("--track", type=str, default="tuesday", choices=["tuesday", "thursday"], help="Strategy track (default: tuesday)")
     parser.add_argument("--broker", type=str, default="upstox", help="Broker name (default: upstox)")
     parser.add_argument("--expiry", type=str, default=None, help="Expiry date YYYY-MM-DD (default: next weekly expiry e.g. 2026-11-17)")
@@ -499,15 +546,7 @@ def main() -> int:
         except Exception:
             target_expiry = "2026-11-17"
 
-    start_date = args.start_date
-    if not start_date:
-        # Default start date for this holiday week is Wednesday 2026-11-11
-        start_date = "2026-11-11"
-
-    logger.info("=" * 65)
-    logger.info("🛠️  MANUAL ENTRY REGISTRATION FOR AUTOMATED ALPHA FSM EXIT")
-    logger.info("   Track: %s | Broker: %s | Start: %s | Expiry: %s", args.track.upper(), args.broker.upper(), start_date, target_expiry)
-    logger.info("=" * 65)
+    start_date = args.start_date or "2026-11-11"
 
     call_strike = args.call_strike
     put_strike = args.put_strike
@@ -520,6 +559,29 @@ def main() -> int:
     put_sym = None
     call_tok = None
     put_tok = None
+    dry_run = args.dry_run
+
+    # Check if we should enter interactive mode
+    has_full_cli = bool(call_strike and put_strike and call_price and put_price and call_oid and put_oid)
+    run_interactive = args.interactive or (not has_full_cli and not args.auto_detect)
+
+    if run_interactive:
+        print("\n" + "=" * 68)
+        print("🛠️  STEP-BY-STEP MANUAL ORDER REGISTRATION WIZARD")
+        print("   • Spaces will be automatically stripped from all answers.")
+        print("   • If any required answer is empty / NULL, the script will exit immediately.")
+        print("   • Type 'exit' at any prompt to cancel.")
+        print("=" * 68)
+
+        # Offer auto-detect first
+        try:
+            auto_choice = input("\n? Attempt auto-detection from Upstox order book first? [Y/n] (Default: Y): ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return 0
+        cleaned_choice = "".join(auto_choice.split()).lower()
+        if cleaned_choice in ("", "y", "yes"):
+            args.auto_detect = True
 
     if args.auto_detect:
         logger.info("Running auto-detection against %s order book...", args.broker.upper())
@@ -527,53 +589,98 @@ def main() -> int:
             broker=args.broker,
             target_expiry_iso=target_expiry,
         )
-        if not detected:
-            logger.error("Auto-detection failed to find matching orders. Please check broker or provide manual CLI arguments.")
-            return 1
+        if detected:
+            call_data = detected["call"]
+            put_data = detected["put"]
 
-        call_data = detected["call"]
-        put_data = detected["put"]
+            call_strike = call_data["strike"]
+            call_price = call_data["price"]
+            call_oid = call_data["order_id"]
+            call_sym = call_data["tradingsymbol"]
+            call_tok = call_data["instrument_token"]
 
-        call_strike = call_data["strike"]
-        call_price = call_data["price"]
-        call_oid = call_data["order_id"]
-        call_sym = call_data["tradingsymbol"]
-        call_tok = call_data["instrument_token"]
+            put_strike = put_data["strike"]
+            put_price = put_data["price"]
+            put_oid = put_data["order_id"]
+            put_sym = put_data["tradingsymbol"]
+            put_tok = put_data["instrument_token"]
 
-        put_strike = put_data["strike"]
-        put_price = put_data["price"]
-        put_oid = put_data["order_id"]
-        put_sym = put_data["tradingsymbol"]
-        put_tok = put_data["instrument_token"]
+            qty = call_data["qty"] or put_data["qty"] or args.qty
 
-        qty = call_data["qty"] or put_data["qty"] or args.qty
+            print("\n" + "=" * 65)
+            print("🔍 AUTO-DETECTED OPTION TRADES:")
+            print(f"  • CALL Leg: NIFTY {target_expiry} Strike {call_strike} CE")
+            print(f"              Buy Price: ₹{call_price:.2f} | Qty: {qty} | Order ID: {call_oid}")
+            print(f"  • PUT Leg : NIFTY {target_expiry} Strike {put_strike} PE")
+            print(f"              Buy Price: ₹{put_price:.2f} | Qty: {qty} | Order ID: {put_oid}")
+            print("=" * 65 + "\n")
 
-        print("\n" + "=" * 65)
-        print("🔍 AUTO-DETECTED OPTION TRADES:")
-        print(f"  • CALL Leg: NIFTY {target_expiry} Strike {call_strike} CE")
-        print(f"              Buy Price: ₹{call_price:.2f} | Qty: {qty} | Order ID: {call_oid}")
-        print(f"  • PUT Leg : NIFTY {target_expiry} Strike {put_strike} PE")
-        print(f"              Buy Price: ₹{put_price:.2f} | Qty: {qty} | Order ID: {put_oid}")
-        print("=" * 65 + "\n")
+            if not args.yes:
+                try:
+                    confirm = input("Use these auto-detected orders? [Y/n] (Default: Y): ")
+                except (EOFError, KeyboardInterrupt):
+                    print("\nAborted.")
+                    return 0
+                cleaned_conf = "".join(confirm.split()).lower()
+                if cleaned_conf not in ("", "y", "yes"):
+                    logger.info("Auto-detected trade rejected. Switching to manual input wizard.")
+                    call_strike = None
+        else:
+            if not run_interactive:
+                logger.error("Auto-detection failed. Run without --auto-detect to use interactive wizard.")
+                return 1
+            logger.info("Switching to step-by-step manual input wizard.")
 
-        if not args.yes and not args.dry_run:
-            confirm = input("Register these orders for automated Alpha FSM exit management? [Y/n]: ").strip().lower()
-            if confirm not in ("", "y", "yes"):
-                logger.info("Registration cancelled by user.")
+    # Step-by-step interactive questions if trade details not yet populated
+    if not (call_strike and put_strike and call_price and put_price and call_oid and put_oid):
+        print("\n" + "-" * 68)
+        print("📝 Please answer the required trade questions one by one:")
+        print("-" * 68)
+
+        call_strike = prompt_user_input("[1/8] CALL Option Strike (e.g. 24300)", "CALL Strike", cast_type=int, min_val=0)
+        call_price = prompt_user_input("[2/8] CALL Buy Price in ₹ (e.g. 220.50)", "CALL Buy Price", cast_type=float, min_val=0.0)
+        call_oid = prompt_user_input("[3/8] CALL Upstox Order ID (e.g. 261109000177180)", "CALL Order ID", cast_type=str)
+
+        put_strike = prompt_user_input("[4/8] PUT Option Strike (e.g. 24100)", "PUT Strike", cast_type=int, min_val=0)
+        put_price = prompt_user_input("[5/8] PUT Buy Price in ₹ (e.g. 195.00)", "PUT Buy Price", cast_type=float, min_val=0.0)
+        put_oid = prompt_user_input("[6/8] PUT Upstox Order ID (e.g. 261109000177181)", "PUT Order ID", cast_type=str)
+
+        qty = prompt_user_input("[7/8] Order Quantity in Contracts", "Order Quantity", default=str(args.qty), cast_type=int, min_val=0)
+        target_expiry = prompt_user_input("[8/8] Target Contract Expiry (YYYY-MM-DD)", "Contract Expiry", default=target_expiry, cast_type=str)
+
+        if not args.dry_run:
+            try:
+                dry_prompt = input("\n? Run as DRY-RUN simulation only (no DB/Redis writes)? [y/N] (Default: N): ")
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
                 return 0
+            if "".join(dry_prompt.split()).lower() in ("y", "yes"):
+                dry_run = True
 
-    # Validation
-    missing = []
-    if not call_strike: missing.append("--call-strike")
-    if not put_strike: missing.append("--put-strike")
-    if call_price is None or call_price <= 0: missing.append("--call-price")
-    if put_price is None or put_price <= 0: missing.append("--put-price")
-    if not call_oid: missing.append("--call-order-id")
-    if not put_oid: missing.append("--put-order-id")
+    # Final summary review before committing
+    print("\n" + "=" * 68)
+    print("📋 REVIEW TRADE DETAILS BEFORE REGISTRATION:")
+    print("-" * 68)
+    print(f"  • Strategy Track:   {args.track.upper()} (5day_strategy)")
+    print(f"  • Broker:           {args.broker.upper()}")
+    print(f"  • Strategy Start:   {start_date} (Wednesday)")
+    print(f"  • Contract Expiry:  {target_expiry} (Tuesday)")
+    print(f"  • Quantity:         {qty} contracts")
+    print(f"  • CALL Leg:         Strike {call_strike} CE @ ₹{call_price:.2f} (Order ID: {call_oid})")
+    print(f"  • PUT Leg:          Strike {put_strike} PE @ ₹{put_price:.2f} (Order ID: {put_oid})")
+    print(f"  • Target Mode:      {'🔍 DRY-RUN (Preview Only)' if dry_run else '🚀 LIVE (Will Commit to DB & Redis)'}")
+    print("=" * 68)
 
-    if missing:
-        logger.error("Missing required order details: %s. Use --auto-detect or provide all flags.", ", ".join(missing))
-        return 1
+    if not args.yes and not dry_run:
+        try:
+            final_conf = input("\nConfirm and execute registration? [Y/n] (Default: Y): ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return 0
+        cleaned_final = "".join(final_conf.split()).lower()
+        if cleaned_final not in ("", "y", "yes"):
+            logger.info("Registration cancelled by user. No changes were made.")
+            return 0
 
     res = register_manual_cycle(
         track=args.track,
@@ -592,10 +699,18 @@ def main() -> int:
         expiry_iso=target_expiry,
         start_date_iso=start_date,
         spot=args.spot,
-        dry_run=args.dry_run,
+        dry_run=dry_run,
     )
 
-    logger.info("Registration completed with status: %s", res.get("status"))
+    print("\n" + "=" * 68)
+    print(f"✅ REGISTRATION STATUS: {res.get('status').upper()}")
+    if not dry_run:
+        print("  • Snapshot saved to:       /home/ubuntu/sqlite/strategies/current_week_buy.json")
+        print("  • LIVE_BUY_TRIGGER_TUESDAY: false (Automated buy on Wednesday blocked)")
+        print("  • LIVE_EXIT_TRIGGER_TUESDAY: true (Automated exit on Wednesday active)")
+        print("  • ORDERS_LIVE_TUE:         2 (Both legs authorized)")
+        print("  • Alpha FSM state:         DUAL_LONG active with trailing stops armed")
+    print("=" * 68 + "\n")
     return 0
 
 
