@@ -132,7 +132,7 @@ class CycleSnapshotTests(unittest.TestCase):
         self.assertEqual(record["gainloss"], 6.0)
         insert_snapshot.assert_called_once()
 
-    @patch("strategies.weekly_option_collector.select_strikes", return_value=(25250, 24800, 25100, 24900, "ITM", "Mocked selection", 0.0, "NEUTRAL", 0.68, -0.68))
+    @patch("strategies.weekly_option_collector.itm1_strikes", return_value=(25250, 24800))
     @patch("strategies.weekly_option_collector.insert_record")
     @patch("strategies.weekly_option_collector.insert_buy_snapshot")
     @patch("strategies.weekly_option_collector.save_active_snapshot")

@@ -41,7 +41,10 @@ thu_spec = importlib.util.spec_from_file_location(
     os.path.join(scripts_dir, "Thursday-Fno-Exit-Orders-V1.py")
 )
 thu_module = importlib.util.module_from_spec(thu_spec)
-thu_spec.loader.exec_module(thu_module)
+# These suites exercise the AngelOne SmartAPI Thursday path (fno:angelone:* keys);
+# load the script with THURSDAY_BROKER=angelone (its defaults are bound at import time).
+with patch.dict(os.environ, {"THURSDAY_BROKER": "angelone"}):
+    thu_spec.loader.exec_module(thu_module)
 
 
 class TestOrderFailureAlerting:

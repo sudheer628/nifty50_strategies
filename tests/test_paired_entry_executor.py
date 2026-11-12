@@ -4,7 +4,7 @@ Unit tests for Automated Paired MARKET BUY Entry Order Manager.
 Validates:
 1. Broker Routing:
    - Tuesday pinned strictly to Upstox.
-   - Thursday pinned strictly to AngelOne.
+   - Thursday broker routed via THURSDAY_BROKER (default upstox).
    - Invalid brokers rejected with ValueError.
 2. Funds Preflight:
    - Preflight passes when funds sufficient (cost + buffer + charges).
@@ -504,7 +504,7 @@ def test_tuesday_collector_live_buy_insufficient_funds_skips(sample_contracts):
         stack.enter_context(patch("strategies.weekly_option_collector.check_nse_holiday", return_value=False))
         stack.enter_context(patch("strategies.weekly_option_collector.is_strategy_start_day", return_value=True))
         stack.enter_context(patch("strategies.weekly_option_collector.get_nifty_spot", return_value={"ltp": 24500.0, "open": 24450.0, "close": 24400.0}))
-        stack.enter_context(patch("strategies.weekly_option_collector.select_strikes", return_value=(24400, 24600, 24400, 24600, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.68, -0.68)))
+        stack.enter_context(patch("strategies.weekly_option_collector.itm1_strikes", return_value=(24400, 24600)))
         stack.enter_context(patch("strategies.weekly_option_collector.get_nifty_option_chain", return_value={
             "call": {"ltp": 150.0, "instrument_key": "NSE_FO|53750"},
             "put": {"ltp": 140.0, "instrument_key": "NSE_FO|53795"},
@@ -583,7 +583,6 @@ def test_thursday_collector_live_buy_insufficient_funds_skips(sample_contracts):
         stack.enter_context(patch("strategies.thursday_option_collector.is_thursday_strategy_active_day", return_value=True))
         stack.enter_context(patch("strategies.thursday_option_collector.is_thursday_strategy_start_day", return_value=True))
         stack.enter_context(patch("strategies.thursday_option_collector.get_nifty_spot", return_value={"ltp": 24500.0, "open": 24450.0, "close": 24400.0}))
-        stack.enter_context(patch("strategies.thursday_option_collector.select_strikes", return_value=(24500, 24500, 24500, 24500, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.50, -0.50)))
         stack.enter_context(patch("strategies.thursday_option_collector.get_nifty_option_chain", return_value={
             "call": {"ltp": 120.0, "token": "53750", "trading_symbol": "NIFTY03NOV2624500CE"},
             "put": {"ltp": 110.0, "token": "53795", "trading_symbol": "NIFTY03NOV2624500PE"},
@@ -601,6 +600,9 @@ def test_thursday_collector_live_buy_insufficient_funds_skips(sample_contracts):
         mock_place.assert_not_called()
         assert mock_save.called
         saved_snap = mock_save.call_args[0][0]
+        # Fixed ITM1 around spot 24500: CALL 24450, PUT 24550 (no AI selector)
+        assert saved_snap["call_strike"] == 24450
+        assert saved_snap["put_strike"] == 24550
         assert saved_snap["entry_status"] == "SKIPPED_INSUFFICIENT_FUNDS"
         assert saved_snap["call_buy_price"] is None
         assert saved_snap["put_buy_price"] is None
@@ -825,7 +827,7 @@ def test_collector_cli_argument_precedence_and_env():
          patch("strategies.weekly_option_collector.check_nse_holiday", return_value=False), \
          patch("strategies.weekly_option_collector.is_tuesday", return_value=True), \
          patch("strategies.weekly_option_collector.get_nifty_spot", return_value={"ltp": 24500.0, "open": 24450.0, "close": 24400.0}), \
-         patch("strategies.weekly_option_collector.select_strikes", return_value=(24600, 24400, 24600, 24400, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.68, -0.68)), \
+         patch("strategies.weekly_option_collector.itm1_strikes", return_value=(24600, 24400)), \
          patch("strategies.weekly_option_collector.get_nifty_option_chain", return_value={
              "call": {"ltp": 150.0, "token": "53750", "trading_symbol": "NIFTY03NOV2624600CE"},
              "put": {"ltp": 140.0, "token": "53795", "trading_symbol": "NIFTY03NOV2624400PE"},
@@ -870,7 +872,7 @@ def test_collector_dry_run_does_not_suppress_live_buy(sample_contracts):
          patch("strategies.weekly_option_collector.check_nse_holiday", return_value=False), \
          patch("strategies.weekly_option_collector.is_tuesday", return_value=True), \
          patch("strategies.weekly_option_collector.get_nifty_spot", return_value={"ltp": 24500.0, "open": 24450.0, "close": 24400.0}), \
-         patch("strategies.weekly_option_collector.select_strikes", return_value=(24600, 24400, 24600, 24400, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.68, -0.68)), \
+         patch("strategies.weekly_option_collector.itm1_strikes", return_value=(24600, 24400)), \
          patch("strategies.weekly_option_collector.get_nifty_option_chain", return_value={
              "call": {"ltp": 150.0, "token": "53750", "trading_symbol": "NIFTY03NOV2624600CE"},
              "put": {"ltp": 140.0, "token": "53795", "trading_symbol": "NIFTY03NOV2624400PE"},
@@ -922,7 +924,7 @@ def test_unified_strategy_store_and_mongo_synced_on_failed_entry():
              patch("strategies.weekly_option_collector.check_nse_holiday", return_value=False), \
              patch("strategies.weekly_option_collector.is_tuesday", return_value=True), \
              patch("strategies.weekly_option_collector.get_nifty_spot", return_value={"ltp": 24500.0, "open": 24450.0, "close": 24400.0}), \
-             patch("strategies.weekly_option_collector.select_strikes", return_value=(24600, 24400, 24600, 24400, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.68, -0.68)), \
+             patch("strategies.weekly_option_collector.itm1_strikes", return_value=(24600, 24400)), \
              patch("strategies.weekly_option_collector.get_nifty_option_chain", return_value={
                  "call": {"ltp": 150.0, "token": "53750", "trading_symbol": "NIFTY03NOV2624600CE"},
                  "put": {"ltp": 140.0, "token": "53795", "trading_symbol": "NIFTY03NOV2624400PE"},

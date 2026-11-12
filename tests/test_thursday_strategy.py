@@ -24,6 +24,7 @@ from common.storage import (
 )
 from scripts.send_weekly_report import send_weekly_report_discord
 from strategies.peak_profit_monitor import monitor_once
+from common.expiry import itm1_strikes
 from strategies.thursday_option_collector import collect_once, THURSDAY_SNAPSHOT_FILE
 from common.entry_gate import EntryGateResult
 
@@ -230,7 +231,7 @@ class ThursdayStrategyTests(unittest.TestCase):
     @patch("strategies.thursday_option_collector._ensure_thursday_db", return_value="test_thursday.db")
     @patch("strategies.thursday_option_collector.get_nifty_option_chain")
     @patch("strategies.thursday_option_collector.get_nifty_spot")
-    @patch("strategies.thursday_option_collector.select_strikes")
+    @patch("strategies.thursday_option_collector.itm1_strikes", wraps=itm1_strikes)
     @patch("strategies.thursday_option_collector.evaluate_entry_gate")
     @patch("strategies.thursday_option_collector.load_active_snapshot", return_value={})
     @patch("strategies.thursday_option_collector.check_nse_holiday", return_value=False)
@@ -251,10 +252,6 @@ class ThursdayStrategyTests(unittest.TestCase):
             opening_range=25.0,
             evaluated_at_ist="09:31:00",
         )
-        mock_strikes.return_value = (
-            25100, 25300, 25100, 25300, "DYNAMIC_AI", "Balanced volatility profile",
-            0.15, "BULLISH", 0.35, -0.35
-        )
         mock_spot.return_value = {"ltp": 25200.0, "open": 25180.0, "close": 25150.0}
         mock_chain.return_value = {
             "call": {"ltp": 120.0},
@@ -268,14 +265,15 @@ class ThursdayStrategyTests(unittest.TestCase):
         mock_gate.assert_called_once()
         self.assertEqual(mock_gate.call_args[1].get("reference_ltp"), 25200.0)
 
-        # 2. Strikes selected
+        # 2. Fixed ITM1 strikes around spot 25200 (CALL one strike below, PUT one strike above)
         mock_strikes.assert_called_once()
 
         # 3. Snapshot saved with Thursday strikes and buy prices to THURSDAY_SNAPSHOT_FILE
         mock_save.assert_called_once()
         saved_snap = mock_save.call_args[0][0]
-        self.assertEqual(saved_snap["call_strike"], 25300)
-        self.assertEqual(saved_snap["put_strike"], 25100)
+        self.assertEqual(saved_snap["call_strike"], 25150)
+        self.assertEqual(saved_snap["put_strike"], 25250)
+        self.assertEqual(saved_snap["selection_mode"], "ITM1_FIXED")
         self.assertEqual(saved_snap["call_buy_price"], 120.0)
         self.assertEqual(saved_snap["put_buy_price"], 95.0)
         self.assertEqual(mock_save.call_args[1].get("filepath"), THURSDAY_SNAPSHOT_FILE)
@@ -293,7 +291,7 @@ class ThursdayStrategyTests(unittest.TestCase):
     @patch("strategies.thursday_option_collector._ensure_thursday_db", return_value="test_thursday.db")
     @patch("strategies.thursday_option_collector.get_nifty_option_chain")
     @patch("strategies.thursday_option_collector.get_nifty_spot")
-    @patch("strategies.thursday_option_collector.select_strikes")
+    @patch("strategies.thursday_option_collector.itm1_strikes", wraps=itm1_strikes)
     @patch("strategies.thursday_option_collector.evaluate_entry_gate")
     @patch("strategies.thursday_option_collector.load_active_snapshot", return_value={})
     @patch("strategies.thursday_option_collector.check_nse_holiday", return_value=False)
@@ -314,10 +312,6 @@ class ThursdayStrategyTests(unittest.TestCase):
             opening_range=8.0,
             evaluated_at_ist="09:31:00",
         )
-        mock_strikes.return_value = (
-            25100, 25300, 25100, 25300, "DYNAMIC_AI", "Counterfactual",
-            0.0, "NEUTRAL", 0.35, -0.35
-        )
         mock_spot.return_value = {"ltp": 25200.0, "open": 25195.0, "close": 25190.0}
         mock_chain.return_value = {
             "call": {"ltp": 115.0},
@@ -332,8 +326,9 @@ class ThursdayStrategyTests(unittest.TestCase):
         shadow_rec = mock_shadow.call_args[0][1]
         self.assertEqual(shadow_rec["gate_status"], "DEFERRED")
         self.assertEqual(shadow_rec["defer_reason"], "Opening chop range < 15 pts")
-        self.assertEqual(shadow_rec["hypothetical_call_strike"], 25300)
-        self.assertEqual(shadow_rec["hypothetical_put_strike"], 25100)
+        self.assertEqual(shadow_rec["hypothetical_call_strike"], 25150)
+        self.assertEqual(shadow_rec["hypothetical_put_strike"], 25250)
+        self.assertEqual(shadow_rec["selection_mode"], "ITM1_FIXED")
 
         # Active snapshot MUST NOT be saved
         mock_save.assert_not_called()

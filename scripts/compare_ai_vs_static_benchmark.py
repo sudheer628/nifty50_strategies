@@ -15,6 +15,7 @@ import datetime
 import glob
 import json
 import logging
+import math
 import os
 import sqlite3
 import sys
@@ -34,7 +35,12 @@ if _PROJECT_ROOT not in sys.path:
 
 from config import logger, SQLITE_DIR, SNAPSHOT_DIR, ACTIVE_SNAPSHOT_FILE
 from common.storage import load_active_snapshot
-from common.ai_strike_selector import compute_static_strikes
+
+
+def compute_static_strikes(reference_ltp: float, step: int = 100) -> Tuple[int, int]:
+    """Legacy static +/-100 ITM benchmark (formerly in common.ai_strike_selector, now removed)."""
+    anchor = int(math.floor(reference_ltp / step)) * step
+    return anchor + step, anchor - step  # (put, call)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 

@@ -40,6 +40,7 @@ from config import (
     STRATEGY_NAME,
     SQLITE_DIR,
     STRIKE_MONEYNESS_MODE,
+    ITM1_STRIKE_STEP,
 )
 
 from common.expiry import (
@@ -49,6 +50,7 @@ from common.expiry import (
     format_expiry_file,
     strike_selector,
     compute_intrinsic_extrinsic,
+    itm1_strikes,
 )
 
 
@@ -57,12 +59,6 @@ from common.calendar_utils import (
     is_strategy_start_day,
     is_strategy_closing_day,
     get_strategy_cycle_role,
-)
-
-from common.ai_strike_selector import (
-    select_strikes,
-    compute_static_strikes,
-    get_last_composite_score,
 )
 
 from common.entry_gate import evaluate_entry_gate
@@ -137,6 +133,16 @@ def _is_market_time() -> bool:
     market_open = time(9, 15)
     market_close = time(15, 35)
     return market_open <= now.time() <= market_close
+
+
+# Tuesday weekly track strike rule: fixed ITM1 (CALL one strike below spot, PUT one strike above).
+# No AI / LLM inference anywhere in strike selection.
+SELECTION_MODE_ITM1 = "ITM1_FIXED"
+
+
+def _estimate_itm1_delta(spot: float, strike: int, days_to_expiry: float, is_call: bool, iv: float = 0.14) -> float:
+    """Telemetry-only Black-Scholes delta estimate for the logged ITM1 strike (does not drive selection)."""
+    return float(estimate_option_delta(spot, strike, days_to_expiry, is_call, iv))
 
 
 def _ensure_db(week_start: date, expiry_date: date) -> str:
@@ -376,24 +382,12 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
 
                 # Counterfactual Shadow Entry: Record hypothetical entry prices for training & benchmarking
                 try:
-                    (
-                        hyp_put,
-                        hyp_call,
-                        hyp_stat_put,
-                        hyp_stat_call,
-                        hyp_mode,
-                        hyp_rationale,
-                        hyp_comp_score,
-                        hyp_dir_bias,
-                        hyp_c_delta,
-                        hyp_p_delta,
-                    ) = select_strikes(
-                        reference_ltp=nifty_ltp,
-                        sqlite_dir=SQLITE_DIR,
-                        force_static=force_static,
-                        moneyness_mode=STRIKE_MONEYNESS_MODE,
-                        days_to_expiry=d_to_exp,
-                    )
+                    hyp_put, hyp_call = itm1_strikes(nifty_ltp, step=ITM1_STRIKE_STEP)
+                    hyp_mode = SELECTION_MODE_ITM1
+                    hyp_comp_score = 0.0
+                    hyp_dir_bias = "N/A"
+                    hyp_c_delta = _estimate_itm1_delta(nifty_ltp, hyp_call, d_to_exp, is_call=True)
+                    hyp_p_delta = _estimate_itm1_delta(nifty_ltp, hyp_put, d_to_exp, is_call=False)
                     hyp_chain = get_nifty_option_chain(expiry_angelone, hyp_call, hyp_put)
                     hyp_call_ltp = (hyp_chain.get("call") or {}).get("ltp")
                     hyp_put_ltp = (hyp_chain.get("put") or {}).get("ltp")
@@ -432,29 +426,21 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
 
                 return True
 
-        # Dynamic AI strike selector (with fail-safe static anchor +/- 100 fallback)
-        (
-            put_strike,
-            call_strike,
-            static_put_strike,
-            static_call_strike,
-            selection_mode,
-            selection_rationale,
-            composite_score,
-            directional_bias,
-            target_call_delta,
-            target_put_delta,
-        ) = select_strikes(
-            reference_ltp=nifty_ltp,
-            sqlite_dir=SQLITE_DIR,
-            force_static=force_static,
-            moneyness_mode=STRIKE_MONEYNESS_MODE,
-            days_to_expiry=d_to_exp,
+        # Fixed ITM1 strike selection (deterministic; no AI / delta-scan)
+        put_strike, call_strike = itm1_strikes(nifty_ltp, step=ITM1_STRIKE_STEP)
+        static_put_strike, static_call_strike = put_strike, call_strike
+        selection_mode = SELECTION_MODE_ITM1
+        selection_rationale = (
+            f"Fixed ITM1 ({ITM1_STRIKE_STEP}-pt grid): CALL = nearest strike below spot, "
+            "PUT = nearest strike above spot. No AI inference."
         )
+        composite_score = 0.0
+        directional_bias = "N/A"
+        target_call_delta = _estimate_itm1_delta(nifty_ltp, call_strike, d_to_exp, is_call=True)
+        target_put_delta = _estimate_itm1_delta(nifty_ltp, put_strike, d_to_exp, is_call=False)
         logger.info(
-            "Selected strikes from LTP %.2f [%s]: PUT=%d (Delta=%.2f)  CALL=%d (Delta=%.2f) | Bias=%s (Score=%.2f) (Static Benchmark: PUT=%d CALL=%d)",
+            "Selected strikes from LTP %.2f [%s]: PUT=%d (Est.Delta=%.2f)  CALL=%d (Est.Delta=%.2f)",
             nifty_ltp, selection_mode, put_strike, target_put_delta, call_strike, target_call_delta,
-            directional_bias, composite_score, static_put_strike, static_call_strike
         )
 
     option_data = get_nifty_option_chain(
@@ -669,10 +655,10 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 "static_put_strike": static_put_strike,
                 "selection_mode": selection_mode,
                 "selection_rationale": selection_rationale,
-                "composite_direction_score": composite_score if 'composite_score' in locals() else get_last_composite_score(),
-                "directional_bias": directional_bias if 'directional_bias' in locals() else "NEUTRAL",
-                "target_call_delta": target_call_delta if 'target_call_delta' in locals() else 0.68,
-                "target_put_delta": target_put_delta if 'target_put_delta' in locals() else -0.68,
+                "composite_direction_score": composite_score,
+                "directional_bias": directional_bias,
+                "target_call_delta": target_call_delta,
+                "target_put_delta": target_put_delta,
                 "moneyness": STRIKE_MONEYNESS_MODE,
                 "spread_width": ie["spread_width"],
                 "call_intrinsic": ie["call_intrinsic"],
@@ -688,7 +674,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     call_buy_price=call_buy_price,
                     put_buy_price=put_buy_price,
                     entry_ts=_now_utc_ts(),
-                    composite_score=composite_score if 'composite_score' in locals() else get_last_composite_score(),
+                    composite_score=composite_score,
                     moneyness=STRIKE_MONEYNESS_MODE,
                     call_intrinsic=ie["call_intrinsic"],
                     call_extrinsic=ie["call_extrinsic"],
@@ -788,10 +774,10 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 "static_put_strike": static_put_strike,
                 "selection_mode": selection_mode,
                 "selection_rationale": selection_rationale,
-                "composite_direction_score": get_last_composite_score(),
-                "directional_bias": "NEUTRAL",
-                "target_call_delta": 0.68,
-                "target_put_delta": -0.68,
+                "composite_direction_score": composite_score,
+                "directional_bias": directional_bias,
+                "target_call_delta": target_call_delta,
+                "target_put_delta": target_put_delta,
                 "moneyness": STRIKE_MONEYNESS_MODE,
                 "spread_width": ie["spread_width"],
                 "call_intrinsic": ie["call_intrinsic"],
@@ -807,7 +793,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     call_buy_price=call_buy_price,
                     put_buy_price=put_buy_price,
                     entry_ts=_now_utc_ts(),
-                    composite_score=get_last_composite_score(),
+                    composite_score=composite_score,
                     moneyness=STRIKE_MONEYNESS_MODE,
                     call_intrinsic=ie["call_intrinsic"],
                     call_extrinsic=ie["call_extrinsic"],

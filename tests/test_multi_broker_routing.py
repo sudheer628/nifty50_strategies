@@ -4,9 +4,9 @@ tests/test_multi_broker_routing.py - Multi-Broker Routing & Interchangeability T
 Tests:
 1. Config resolution & validation (get_broker_for_track, case-insensitive, strip whitespace, rejection of unknown brokers/tracks).
 2. All 4 strategy cycle broker combinations:
-   - Tuesday Upstox / Thursday AngelOne (default)
+   - Tuesday Upstox / Thursday Upstox (current .env default)
    - Tuesday AngelOne / Thursday Upstox (swapped)
-   - Tuesday Upstox / Thursday Upstox (both Upstox)
+   - Tuesday Upstox / Thursday AngelOne
    - Tuesday AngelOne / Thursday AngelOne (both AngelOne)
 3. Active cycle persistence & fail-closed protection when config contradicts stored broker.
 4. Combined execution locks (cycle lock + broker lock). Same broker prevents concurrent mutations; different brokers run concurrently.
@@ -64,12 +64,12 @@ class TestConfigBrokerRouting:
     """Test get_broker_for_track resolver and configuration precedence."""
 
     def test_default_track_broker_resolution(self):
-        """Without env overrides, Tuesday is upstox and Thursday is angelone."""
+        """Without env overrides, Tuesday and Thursday both default to upstox."""
         with patch.dict(os.environ, {}, clear=True):
             assert get_broker_for_track("5day_strategy") == "upstox"
             assert get_broker_for_track("tuesday") == "upstox"
-            assert get_broker_for_track("3day_strategy") == "angelone"
-            assert get_broker_for_track("thursday") == "angelone"
+            assert get_broker_for_track("3day_strategy") == "upstox"
+            assert get_broker_for_track("thursday") == "upstox"
 
     def test_swapped_broker_configuration(self):
         """Tuesday on AngelOne, Thursday on Upstox."""

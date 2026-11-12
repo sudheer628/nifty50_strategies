@@ -4,8 +4,8 @@ Entry Order Manager for Automated Paired MARKET BUY Strategy Execution.
 Handles paired CALL + PUT market entry order submission, funds preflight,
 rapid polling verification, and atomic cancel-and-SELL rollback for weekly
 NIFTY 50 options strategies:
-  - Tuesday Track (5-Day Strategy): Strictly pinned to Upstox.
-  - Thursday Track (3-Day Strategy): Strictly pinned to AngelOne.
+  - Tuesday Track (5-Day Strategy): broker per TUESDAY_BROKER (default upstox).
+  - Thursday Track (3-Day Strategy): broker per THURSDAY_BROKER (default upstox).
 
 Key Invariants:
 1. Preflight both legs: Check broker funds, validate contracts, quantities, LTPs.
@@ -168,7 +168,7 @@ def _headers_angelone(token: str) -> Dict[str, str]:
 def get_broker_token(broker: str, redis_client=None) -> str:
     """
     Retrieve access token for the specified broker.
-    Tuesday strictly supports 'upstox'; Thursday strictly supports 'angelone'.
+    Supported brokers per track: 'upstox', 'angelone', 'kotak' (set via TUESDAY_BROKER / THURSDAY_BROKER).
     """
     broker = (broker or "").lower().strip()
     if os.getenv("TEST_MODE") == "true" or os.getenv("MOCK_BROKER") == "true":

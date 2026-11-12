@@ -10,7 +10,7 @@ Parallel strategy track:
     - Friday through Monday: Collection continues for this 3-day cycle using the Thursday buy prices.
 
 All strike selection, entry-gate, FSM, and peak-profit logic is reused 1:1 from the tested
-master modules (ai_strike_selector, entry_gate, fsm_strategy, profit_monitor) using their
+master modules (entry_gate, fsm_strategy, profit_monitor) using their
 exact published call contracts.
 """
 
@@ -35,6 +35,7 @@ from config import (
     THURSDAY_SNAPSHOT_FILE,
     ACTIVE_SNAPSHOT_FILE,
     STRIKE_MONEYNESS_MODE_THURSDAY,
+    ITM1_STRIKE_STEP,
 )
 
 from common.expiry import (
@@ -42,6 +43,7 @@ from common.expiry import (
     format_expiry_angelone,
     format_expiry_file,
     compute_intrinsic_extrinsic,
+    itm1_strikes,
 )
 
 from common.calendar_utils import (
@@ -50,8 +52,6 @@ from common.calendar_utils import (
     is_thursday_strategy_active_day,
     is_strategy_closing_day,
 )
-
-from common.ai_strike_selector import select_strikes
 
 from common.entry_gate import evaluate_entry_gate
 from common.entry_order_manager import (
@@ -226,6 +226,16 @@ def _build_record(
     return record
 
 
+# Thursday 3-day track strike rule: fixed ITM1 (CALL one strike below spot, PUT one strike above).
+# No AI / LLM strike selection: it picked 25150 CE / 25550 PE on 2026-11-12 at spot 25325.
+THURSDAY_SELECTION_MODE = "ITM1_FIXED"
+
+
+def _estimate_thursday_delta(spot: float, strike: int, days_to_expiry: float, is_call: bool, iv: float = 0.14) -> float:
+    """Telemetry-only Black-Scholes delta estimate for the logged ITM1 strike (does not drive selection)."""
+    return float(estimate_option_delta(spot, strike, days_to_expiry, is_call, iv))
+
+
 def collect_once(force_static: bool = False, force_entry: bool = False, dry_run: bool = False, execute_buy: Optional[bool] = None) -> bool:
     """
     Perform one data collection cycle for the 3-day Thursday track.
@@ -353,27 +363,15 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     "Writing shadow record and retrying next interval.",
                     gate_decision.defer_reason
                 )
-                # Counterfactual Shadow Entry: record hypothetical AI strikes + LTPs
+                # Counterfactual Shadow Entry: record hypothetical ITM1 strikes + LTPs
                 # (mirrors the master track's gate_deferred_shadows logic).
                 try:
-                    (
-                        hyp_put,
-                        hyp_call,
-                        _hyp_static_put,
-                        _hyp_static_call,
-                        hyp_mode,
-                        _hyp_rationale,
-                        hyp_comp_score,
-                        hyp_dir_bias,
-                        hyp_c_delta,
-                        hyp_p_delta,
-                    ) = select_strikes(
-                        reference_ltp=nifty_ltp,
-                        sqlite_dir=SQLITE_DIR,
-                        force_static=force_static,
-                        moneyness_mode=STRIKE_MONEYNESS_MODE_THURSDAY,
-                        days_to_expiry=d_to_exp,
-                    )
+                    hyp_put, hyp_call = itm1_strikes(nifty_ltp, step=ITM1_STRIKE_STEP)
+                    hyp_mode = THURSDAY_SELECTION_MODE
+                    hyp_comp_score = 0.0
+                    hyp_dir_bias = "N/A"
+                    hyp_c_delta = _estimate_thursday_delta(nifty_ltp, hyp_call, d_to_exp, is_call=True)
+                    hyp_p_delta = _estimate_thursday_delta(nifty_ltp, hyp_put, d_to_exp, is_call=False)
                     hyp_chain = get_nifty_option_chain(expiry_angelone, hyp_call, hyp_put)
                     hyp_call_ltp = (hyp_chain.get("call") or {}).get("ltp")
                     hyp_put_ltp = (hyp_chain.get("put") or {}).get("ltp")
@@ -415,30 +413,21 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     )
                 return True
 
-        # --- Dynamic AI strike selection (fail-safe static fallback inside select_strikes) ---
-        (
-            put_strike,
-            call_strike,
-            static_put_strike,
-            static_call_strike,
-            selection_mode,
-            selection_rationale,
-            composite_score,
-            directional_bias,
-            target_call_delta,
-            target_put_delta,
-        ) = select_strikes(
-            reference_ltp=nifty_ltp,
-            sqlite_dir=SQLITE_DIR,
-            force_static=force_static,
-            moneyness_mode=STRIKE_MONEYNESS_MODE_THURSDAY,
-            days_to_expiry=d_to_exp,
+        # --- Fixed ITM1 strike selection (deterministic; no AI / delta-scan) ---
+        put_strike, call_strike = itm1_strikes(nifty_ltp, step=ITM1_STRIKE_STEP)
+        static_put_strike, static_call_strike = put_strike, call_strike
+        selection_mode = THURSDAY_SELECTION_MODE
+        selection_rationale = (
+            f"Fixed ITM1 ({ITM1_STRIKE_STEP}-pt grid): CALL = nearest strike below spot, "
+            "PUT = nearest strike above spot. No AI inference."
         )
+        composite_score = 0.0
+        directional_bias = "N/A"
+        target_call_delta = _estimate_thursday_delta(nifty_ltp, call_strike, d_to_exp, is_call=True)
+        target_put_delta = _estimate_thursday_delta(nifty_ltp, put_strike, d_to_exp, is_call=False)
         logger.info(
-            "[Thursday Track] Selected strikes from LTP %.2f [%s]: PUT=%d (Delta=%.2f)  CALL=%d (Delta=%.2f) "
-            "| Bias=%s (Score=%.2f) (Static Benchmark: PUT=%d CALL=%d)",
+            "[Thursday Track] Selected strikes from LTP %.2f [%s]: PUT=%d (Est.Delta=%.2f)  CALL=%d (Est.Delta=%.2f)",
             nifty_ltp, selection_mode, put_strike, target_put_delta, call_strike, target_call_delta,
-            directional_bias, composite_score, static_put_strike, static_call_strike
         )
 
     # ------------------------------------------------------------------
@@ -480,7 +469,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
 
         cycle_id = f"CYCLE-THU-{start_str}"
 
-        # Check if live MARKET BUY entry is enabled (Thursday is strictly AngelOne)
+        # Check if live MARKET BUY entry is enabled (broker per THURSDAY_BROKER)
         from config import get_config_bool
         env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_THURSDAY", default=False)
         is_live_buy = env_live_buy if execute_buy is None else bool(execute_buy)

@@ -47,7 +47,7 @@ STRATEGY_NAME_THURSDAY = "nifty50_thursday_3day_collector"
 # Configurable Broker Routing per Strategy Cycle
 # ---------------------------------------------------------------------------
 TUESDAY_BROKER = os.getenv("TUESDAY_BROKER", "upstox").lower().strip()
-THURSDAY_BROKER = os.getenv("THURSDAY_BROKER", "angelone").lower().strip()
+THURSDAY_BROKER = os.getenv("THURSDAY_BROKER", "upstox").lower().strip()
 SUPPORTED_BROKERS = ("upstox", "angelone", "kotak")
 
 
@@ -122,6 +122,8 @@ def get_broker_for_track(track: str, redis_client=None) -> str:
 # Trading parameters
 # ---------------------------------------------------------------------------
 STRIKE_STEP = 100                 # 100-point strike grid
+# Fixed ITM1 strike grid for BOTH tracks (no AI selection). NIFTY lists 50-pt strikes.
+ITM1_STRIKE_STEP = int(os.getenv("ITM1_STRIKE_STEP", "50"))
 COLLECTION_START_HOUR = 9         # 9:30 AM IST is the first collection
 COLLECTION_START_MINUTE = 30
 COLLECTION_INTERVAL_MINUTES = 60  # Hourly after start
