@@ -19,7 +19,7 @@ This strategy:
 ### In scope
 
 - Automated weekly option data collection (NIFTY50 spot + option chains)
-- Tuesday dynamic AI strike selection and static benchmark tracking
+- Tuesday fixed ITM1 strike selection (CE one strike below spot, PE one strike above; same rule on Thursday)
 - Parallel 3-Day Thursday Strategy Track (Thursday–Monday cycle tracking fresh strikes locked on Thursday open, running alongside the Tuesday master cycle)
 - Price collection every 30 minutes from 09:31 AM to 15:31 PM IST
 - Smart Entry Gate timing (volatility, momentum, and technical filters with counterfactual shadow logging)
@@ -29,13 +29,13 @@ This strategy:
 - Persistent storage in SQLite (per-cycle DBs) and MongoDB Atlas synchronization
 - Automated post-market weekly close orchestration and HTML/chart reporting
 
-- **Broker-Segregated Live F&O Trailing Stop-Loss Order Execution**: Dedicated exit managers (`Tuesday-Fno-Exit-Orders-V1.py` on Upstox and `Thursday-Fno-Exit-Orders-V1.py` on AngelOne SmartAPI) managing Stop-Loss Market (SL-M) orders, triggered strictly when Alpha FSM exit signals trigger in `sentinel-hermes`
-- **Automated Paired MARKET BUY Strategy Entry**: Collectors (`weekly_option_collector.py` for Tuesday via Upstox, `thursday_option_collector.py` for Thursday via AngelOne) execute paired MARKET BUY orders at strategy start. Includes broker preflight margin checks, back-to-back MARKET submissions, atomic cancel-and-SELL rollback on partial or failed fills, fill price vs reference LTP tracking, and cycle idempotency without Redis dependency.
+- **Broker-Segregated Live F&O Trailing Stop-Loss Order Execution**: Dedicated exit managers (`Tuesday-Fno-Exit-Orders-V1.py` on Upstox and `Thursday-Fno-Exit-Orders-V1.py` on the Thursday broker, currently Upstox via `THURSDAY_BROKER`) managing Stop-Loss Market (SL-M) orders, triggered strictly when Alpha FSM exit signals trigger in `sentinel-hermes`
+- **Automated Paired MARKET BUY Strategy Entry**: Collectors (`weekly_option_collector.py` for Tuesday via Upstox, `thursday_option_collector.py` for Thursday via the Thursday broker, currently Upstox) execute paired MARKET BUY orders at strategy start. Includes broker preflight margin checks, back-to-back MARKET submissions, atomic cancel-and-SELL rollback on partial or failed fills, fill price vs reference LTP tracking, and cycle idempotency without Redis dependency.
 
 ### Out of scope
 
 - General equity or cash market order execution
-- Cross-broker fallback (Tuesday is strictly Upstox; Thursday is strictly AngelOne)
+- Broker per track is set in `.env` (`TUESDAY_BROKER`, `THURSDAY_BROKER`; both currently `upstox`)
 - Stale retry attempts (cycles with insufficient funds are safely skipped rather than retried late)
 
 ---
@@ -53,7 +53,6 @@ nifty50_strategies/
 │   ├── angelone_client.py               # SmartAPI auth + market data fetchers
 │   ├── entry_order_manager.py           # Paired MARKET BUY executor, funds preflight & cancel-and-SELL rollback
 │   ├── expiry.py                        # Expiry resolution + static strike selector
-│   ├── ai_strike_selector.py            # Dynamic AI strike selector (VIX, ATR, Greeks)
 │   ├── calendar_utils.py                # Holiday detection via Upstox API & cycle calendar
 │   ├── entry_gate.py                    # Smart Entry Gate (deferral & shadow logging)
 │   ├── fno_keys.py                      # Canonical Redis key building, multi-format expiry normalization & parsing
@@ -70,7 +69,7 @@ nifty50_strategies/
 │   └── peak_profit_monitor.py           # Standalone 15-min peak monitor (runs :16/:46 & :17/:47)
 ├── scripts/
 │   ├── Tuesday-Fno-Exit-Orders-V1.py    # Dedicated Tuesday 5-day cycle Upstox trailing SL manager (tag: TUE-SL)
-│   ├── Thursday-Fno-Exit-Orders-V1.py   # Dedicated Thursday 3-day cycle AngelOne SmartAPI trailing SL manager (Redis order_id tracking)
+│   ├── Thursday-Fno-Exit-Orders-V1.py   # Dedicated Thursday 3-day cycle trailing SL manager (broker per THURSDAY_BROKER) (Redis order_id tracking)
 │   ├── run_weekly_close.py              # Master weekly close orchestrator (runs Mon 15:37)
 │   ├── run_thursday_close.py            # Thursday cycle close orchestrator (runs Mon 15:38)
 │   ├── send_weekly_report.py            # Monday HTML email + chart generator (supports --track)
@@ -78,7 +77,6 @@ nifty50_strategies/
 │   ├── compare_entry_timing_counterfactuals.py # Counterfactual entry timing evaluation
 │   └── sync_to_mongodb.py               # MongoDB Atlas derivatives synchronization CLI (supports --track)
 ├── tests/                               # 260 automated pytest unit tests
-│   ├── test_ai_strike_selector.py
 │   ├── test_angelone_resolution.py
 │   ├── test_calendar_utils.py
 │   ├── test_entry_gate.py
@@ -107,8 +105,7 @@ nifty50_strategies/
 |---|---|
 | `config.py` | Loads `.env`, Redis client factory, constants (strike step=100, lot size=65, NIFTY token, Angel One base URL, storage paths, Thursday strategy constants) |
 | `common/angelone_client.py` | JWT auth from Redis `angelone_jwt_feed`, NIFTY spot LTP, daily instrument-master option lookup, and `get_nifty_option_chain()` for CALL+PUT LTPs |
-| `common/expiry.py` | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()` (static 100-pt grid) |
-| `common/ai_strike_selector.py` | AI Strike Selector: optimizes strikes on standard 50-pt grid using VIX, ATR, Greeks ($\Delta \approx 0.35$), and IV skew via OpenRouter with asymmetric technical fallback |
+| `common/expiry.py` | `get_next_weekly_expiry()`, `is_tuesday()`, `format_expiry_angelone()`, `format_expiry_file()`, `strike_selector()` (static 100-pt grid), `itm1_strikes()` (fixed ITM1 50-pt grid, used by both tracks) |
 | `common/calendar_utils.py` | NSE holiday calendar resolution via Upstox API with in-process caching, strategy start/closing day detection (Tuesday master & Thursday 3-day), and Monday-holiday deferred close handling |
 | `common/entry_gate.py` | Smart Entry Gate: checks trend, ATR, and momentum filters at cycle open to gate entry; writes counterfactual shadow records on deferral |
 | `common/fno_keys.py` | Canonical Redis key builder (`fno:{broker}:enabled:{cycle}:{expiry_iso}:{strike}:{option_type}`), multi-format expiry normalization (ISO, Upstox format, Angel One format, compact format, yearless `4AUG`), and key parser |
@@ -122,7 +119,7 @@ nifty50_strategies/
 | `strategies/monday_gamma_sniper.py` | Monday afternoon gamma scalper (13:15–15:00 IST): evaluates 5-min VWAP and volume surges ($\ge 1.5\times$) with target (+75%), stop-loss (-35%), and 15:10 IST time-stop |
 | `strategies/peak_profit_monitor.py` | Standalone 15-minute peak monitor (runs :16 & :46 for weekly; :17 & :47 for thursday via `--track thursday`): checks floating strangle profits against high-water marks |
 | `scripts/Tuesday-Fno-Exit-Orders-V1.py` | Dedicated Tuesday 5-day cycle trailing Stop-Loss Market (SL-M) order manager for Upstox; enforces `tag="TUE-SL"`, cross-process distributed lock (`fno_execution_lock()`) with heartbeat auto-renewal, 15:30:00 IST exact-second cutoff, NSE exchange holiday checks, pre-mutation lock/time validation, asynchronous cancel lifecycle confirmation, and order slicing |
-| `scripts/Thursday-Fno-Exit-Orders-V1.py` | Dedicated Thursday 3-day cycle trailing Stop-Loss Market (SL-M) order manager strictly for AngelOne SmartAPI; enforces `producttype="CARRYFORWARD"`, authoritative Redis `order_id` tracking, `LOTS_THURSDAY=1` (65 qty default), isolated fast gate `ORDERS_LIVE_THU`, cycle-isolated execution lock (`fno:lock:exit_order_manager:thursday`), holiday/market-hours guards, and short-position safeguards |
+| `scripts/Thursday-Fno-Exit-Orders-V1.py` | Dedicated Thursday 3-day cycle trailing Stop-Loss Market (SL-M) order manager (broker per `THURSDAY_BROKER`, currently Upstox); enforces `producttype="CARRYFORWARD"`, authoritative Redis `order_id` tracking, `LOTS_THURSDAY=1` (65 qty default), isolated fast gate `ORDERS_LIVE_THU`, cycle-isolated execution lock (`fno:lock:exit_order_manager:thursday`), holiday/market-hours guards, and short-position safeguards |
 | `scripts/run_weekly_close.py` | Unified master weekly orchestrator (Mon 15:37 IST / Tue 09:07 deferred): closes active cycle upfront, runs report email, benchmark scoring, SQLite merge, and skill generation |
 | `scripts/run_thursday_close.py` | Dedicated Thursday cycle close orchestrator (Mon 15:38 IST / Tue 09:08 deferred): marks Thursday snapshot closed, sends Thursday report email, and syncs to MongoDB Atlas (skips LLM skill generation) |
 | `scripts/compare_ai_vs_static_benchmark.py` | Reconstructs static $\pm 100$ strike LTPs from `signals_data_*.db` `option_chain_surface` to compute side-by-side outperformance delta vs AI strategy |
@@ -190,48 +187,26 @@ For a mid-cycle start on Monday 10 Aug 2026, with the cycle that began Tuesday
 }
 ```
 
-### 4.6 Dynamic AI Strike Selection & Retrospective Benchmark (September 2026+)
+### 4.6 Fixed ITM1 Strike Selection (since 2026-11-12)
 
-On Tuesday at 09:31 AM IST, `weekly_option_collector.py` invokes [`common/ai_strike_selector.py`](file:///c:/Users/sai-s/Documents/GitHub/nifty50_strategies/common/ai_strike_selector.py):
-1. **Dynamic Greeks & Volatility Ingestion**: Ingests live India VIX, ATR(14) daily range, Bollinger Band Width %, and option chain Greeks ($\Delta \approx 0.35, \Theta, \text{IV Skew}$) from SQLite.
-2. **AI Strike Calibration**: Queries OpenRouter LLMs via Redis `finance_llm_models` to select volatility-adaptive strikes on a standard 50-point NIFTY strike grid (e.g. widening in high VIX, balancing Put IV skew).
-3. **Fail-Safe Fallback**: If OpenRouter times out (>5s) or returns invalid output, the system falls back to the deterministic **directional asymmetric rule** (`ASYM_FALLBACK_{bias}`: Bullish $\rightarrow$ +50 CE / -150 PE, Bearish $\rightarrow$ +150 CE / -50 PE, Neutral $\rightarrow$ +100 CE / -100 PE). The symmetric static $\pm 100$ strike benchmark is applied only if `--force-static` is specified or when no `OPENROUTER_API_KEY` is present.
-4. **Snapshot Persistence**: Saves both the AI strikes and the static benchmark strikes in `current_week_buy.json`:
-   ```json
-   {
-     "strategy_name": "nifty50_weekly_option_collector",
-     "cycle_id": "20260901-a1b2c3d4",
-     "status": "ongoing",
-     "week_start_date": "20260901",
-     "expiry_date": "20260908",
-     "call_strike": 24650,
-     "put_strike": 24400,
-     "call_buy_price": 128.5,
-     "put_buy_price": 112.0,
-     "captured_at": 1788244200,
-     "static_call_strike": 24600,
-     "static_put_strike": 24400,
-     "composite_direction_score": 0.42,
-     "directional_bias": "BULLISH",
-     "target_call_delta": 0.35,
-     "target_put_delta": -0.30,
-     "selection_mode": "AI_deepseek-v4-pro",
-     "selection_rationale": "VIX at 15.4 with ATR 160; selected +100 CE / -150 PE due to elevated Put IV skew."
-   }
-   ```
-5. **Retrospective Benchmark Comparison**:
-   Run the comparison script anytime to see side-by-side performance:
-   ```bash
-   python scripts/compare_ai_vs_static_benchmark.py
-   ```
-   This reconstructs the static $\pm 100$ strike performance using `option_chain_surface` from `market_signal_agent` without requiring duplicate live API calls.
+Both tracks select strikes deterministically with `common/expiry.py:itm1_strikes()`:
+1. **Spot anchor**: the NIFTY LTP at the cycle's first trigger.
+2. **CALL**: nearest 50-point strike strictly below spot (one step In-The-Money).
+3. **PUT**: nearest 50-point strike strictly above spot (one step In-The-Money).
+4. **Grid step**: `ITM1_STRIKE_STEP` in `.env` (default 50).
+
+Example: spot 25325.15 gives CE 25300 / PE 25350.
+
+No AI / LLM inference is used for strike selection. The previous AI selector (`common/ai_strike_selector.py`) was removed on 2026-11-12 after it chose CE 25150 / PE 25550 (about 175/225 points ITM) and the BUY was rejected for insufficient funds.
+
+Snapshots record `selection_mode: "ITM1_FIXED"`. The estimated deltas logged alongside the strikes are Black-Scholes telemetry only and do not drive selection.
 
 ### 4.7 Weekly Closed-Loop Lifecycle & Holiday Adaptation
 
 ```
                     WEEKLY LIFECYCLE WITH HOLIDAY RESOLUTION
                     
-  Strategy Start Day     nifty50_strategies evaluates Smart Gate & selects AI Strikes
+  Strategy Start Day     nifty50_strategies evaluates Smart Gate & selects ITM1 strikes
   (Tue 09:31 IST,        • Captures buy prices into current_week_buy.json (status: ongoing)
   or Wed if Tue Hol):    • Evaluated 3 mins later at 09:34 IST by sentinel-hermes
                                           │
@@ -364,8 +339,8 @@ The Tuesday and Thursday strategies operate under complete isolation to ensure z
 | Dimension | Tuesday 5-Day Strategy Track | Thursday 3-Day Strategy Track |
 |---|---|---|
 | **Script Path** | `scripts/Tuesday-Fno-Exit-Orders-V1.py` | `scripts/Thursday-Fno-Exit-Orders-V1.py` |
-| **Broker Adapter** | `Upstox` (Strictly Pinned) | `AngelOne SmartAPI` (Strictly Pinned) |
-| **Order Identification** | Broker order tag `tag="TUE-SL"` | Authoritative Redis `order_id` (`fno:angelone:trail:thu:*:order_id`; no tag sent) |
+| **Broker Adapter** | `Upstox` (`TUESDAY_BROKER`) | Per `THURSDAY_BROKER` (currently `upstox`) |
+| **Order Identification** | Broker order tag `tag="TUE-SL"` | Authoritative Redis `order_id` (`fno:{broker}:trail:thu:*:order_id`) |
 | **Execution Lock (Option A)** | `fno:lock:exit_order_manager:tuesday` | `fno:lock:exit_order_manager:thursday` |
 | **Redis Gate Key** | `ORDERS_LIVE_TUE` | `ORDERS_LIVE_THU` |
 | **Active Cycle Snapshot** | `current_week_buy.json` | `current_thursday_buy.json` |
@@ -376,8 +351,8 @@ The Tuesday and Thursday strategies operate under complete isolation to ensure z
 | **Trailing Stop Trait** | Trailing stop buffer adapts across 5 DTE | Starts directly in tighter 18% DTE bracket |
 
 > [!NOTE]
-> **AngelOne Order Identification (Redis `order_id` Authority)**:
-> Unlike Upstox, AngelOne SmartAPI order placement payloads do not accept or forward custom user tag fields, so no `THU-SL` tag is sent in order payloads or returned in the AngelOne order book. Stop-loss orders placed on AngelOne will **not** display a `THU-SL` tag in AngelOne's web terminal, app, or order book API. Instead, the Thursday manager relies strictly on the broker-assigned `orderid` persisted in Redis (`fno:angelone:trail:thu:*:order_id`) as the authoritative live identifier for tracking, ratcheting, and orphan management on subsequent 1-minute iterations. (The code retains an auxiliary `tag="THU-SL"` check as a compatibility fallback across all execution modes for offline `--mock` data and synthetic test harnesses, while Redis `order_id` is the live production authority). Any unrecognized open SELL order for the contract is treated as manual and left untouched (`manual_sell_conflict`).
+> **Order Identification (AngelOne-specific note) (Redis `order_id` Authority)**:
+> AngelOne SmartAPI order placement payloads do not accept or forward custom user tag fields (relevant only when `THURSDAY_BROKER=angelone`), so no `THU-SL` tag is sent to AngelOne. Stop-loss orders placed on AngelOne will **not** display a `THU-SL` tag in AngelOne's web terminal, app, or order book API. Instead, the Thursday manager relies strictly on the broker-assigned `orderid` persisted in Redis (`fno:{broker}:trail:thu:*:order_id`) as the authoritative live identifier for tracking, ratcheting, and orphan management on subsequent 1-minute iterations. (The code retains an auxiliary `tag="THU-SL"` check as a compatibility fallback across all execution modes for offline `--mock` data and synthetic test harnesses, while Redis `order_id` is the live production authority). Any unrecognized open SELL order for the contract is treated as manual and left untouched (`manual_sell_conflict`).
 
 #### 3. Canonical Expiry-Aware Redis Authorization Contract
 
@@ -388,7 +363,7 @@ fno:{broker}:enabled:{cycle}:{expiry_iso}:{strike}:{option_type}
 ```
 *Examples*:
 - Tuesday (Upstox): `fno:upstox:enabled:tue:2026-11-03:24200:PE`
-- Thursday (AngelOne): `fno:angelone:enabled:thu:2026-11-03:24200:PE`
+- Thursday (broker per `THURSDAY_BROKER`, currently Upstox): `fno:upstox:enabled:thu:2026-11-03:24200:PE`
 
 - **Multi-Format Normalization**: `normalize_expiry()` converts ISO (`2026-11-03`), Upstox format (`03NOV26`), Angel One format (`03NOV2026`), compact (`20261103`), and yearless symbols (`4AUG` resolved against the active cycle's year, including calendar-year crossovers).
 - **Alpha-Only Gating**: Authorization keys are published **exclusively** when Alpha FSM exit signals trigger (`cat == "alpha_fsm"`). Milestone peak-profit alerts ($\ge 20\%$) do **not** enable live order placement.
@@ -399,7 +374,7 @@ fno:{broker}:enabled:{cycle}:{expiry_iso}:{strike}:{option_type}
 
 To eliminate lock contention and guarantee complete account separation between brokers:
 - **Tuesday Execution Lock**: `fno:lock:exit_order_manager:tuesday` (Upstox account)
-- **Thursday Execution Lock**: `fno:lock:exit_order_manager:thursday` (AngelOne account)
+- **Thursday Execution Lock**: `fno:lock:exit_order_manager:thursday` (Thursday broker account)
 - **Independent Mutex**: Neither script blocks the other on API latency, order execution, or retries.
 - **Fail-Closed Acquisition**: If the cycle lock cannot be acquired within 10 seconds, the manager skips the cycle safely with zero broker API calls.
 - **Auto-Renewal Heartbeat Daemon**: A background daemon thread sends heartbeat renewals every `timeout / 3` seconds (20s on a 60s lease).
@@ -464,7 +439,7 @@ For each 30-minute interval, the strategy collects:
 
 ### 6.1 Strike grid
 
-- **AI Strike Selection Mode**: Operates on the standard **50-point NIFTY strike grid** (`ai_strike_selector.py` prompt rule 1), allowing precise Delta centering ($\Delta \approx 0.35$) and IV skew balancing.
+- **ITM1 Strike Selection**: Both tracks use the standard **50-point NIFTY strike grid**: CE = nearest strike below spot, PE = nearest strike above spot. No AI / LLM inference is used for strike selection (removed 2026-11-12).
 - **Static Benchmark / Fallback Mode**: Uses **100-point strike increments** (`STRIKE_STEP = 100` in `config.py` and `expiry.py`) for the deterministic $\pm 100$ anchor comparison.
 
 ### 6.2 Static Algorithm (Benchmark & Fallback)
@@ -599,8 +574,8 @@ Follows the same pattern as the existing `news-analyzer-for-market-sentiment` pr
 | `collection_timestamp`      | INTEGER | Trigger Unix timestamp (seconds since epoch, UTC)       |
 | `expiry_date`               | TEXT    | Expiry date in `YYYYMMDD`                               |
 | `nifty_ltp`                 | REAL    | NIFTY spot LTP at evaluation                            |
-| `hypothetical_call_strike`  | INTEGER | AI-recommended CALL strike had entry proceeded          |
-| `hypothetical_put_strike`   | INTEGER | AI-recommended PUT strike had entry proceeded           |
+| `hypothetical_call_strike`  | INTEGER | ITM1 CALL strike (one step below spot) had entry proceeded |
+| `hypothetical_put_strike`   | INTEGER | ITM1 PUT strike (one step above spot) had entry proceeded  |
 | `call_ltp`                  | REAL    | Live market CALL LTP at evaluation                      |
 | `put_ltp`                   | REAL    | Live market PUT LTP at evaluation                       |
 | `gate_score`                | REAL    | Smart Gate composite evaluation score                   |
@@ -699,7 +674,7 @@ The active snapshot persists the current cycle's entry buy prices, FSM state (`a
 
 ### Phase 5: Dynamic AI Strike Selection, Parallel 3-Day Track & Real-Time Alerts (COMPLETE)
 
-- [x] Dynamic AI Strike Selection via OpenRouter LLMs (`common/ai_strike_selector.py`)
+- [x] ~~Dynamic AI Strike Selection via OpenRouter LLMs~~ (removed 2026-11-12; replaced by fixed ITM1 selection)
 - [x] Asymmetric technical fallback rule and retrospective benchmark comparison (`scripts/compare_ai_vs_static_benchmark.py`)
 - [x] Parallel 3-Day Thursday Strategy Track (`strategies/thursday_option_collector.py`)
 - [x] Smart Entry Gate with counterfactual shadow logging (`common/entry_gate.py`)
@@ -713,7 +688,7 @@ The active snapshot persists the current cycle's entry buy prices, FSM state (`a
 - [x] Expiry-aware canonical Redis authorization keys (`common/fno_keys.py`)
 - [x] Decoupled Alpha-only exit authorization publisher (`common/unified_strategy_store.py`)
 - [x] Dedicated Tuesday 5-Day Exit Manager (`scripts/Tuesday-Fno-Exit-Orders-V1.py`, `tag="TUE-SL"`)
-- [x] Dedicated Thursday 3-Day Exit Manager (`scripts/Thursday-Fno-Exit-Orders-V1.py`, AngelOne SmartAPI + Redis `order_id` tracking)
+- [x] Dedicated Thursday 3-Day Exit Manager (`scripts/Thursday-Fno-Exit-Orders-V1.py`, broker per `THURSDAY_BROKER` + Redis `order_id` tracking)
 - [x] Distributed cross-process mutex with auto-renewing heartbeat daemon (`fno_execution_lock()`)
 - [x] Strict 15:30:00 IST cutoff and NSE exchange holiday gating
 - [x] Pre-broker-mutation atomic lock and market-hours rechecks
@@ -751,7 +726,7 @@ python strategies/weekly_option_collector.py --dry-run
 # Force run outside market hours
 python strategies/weekly_option_collector.py --force
 
-# Force static +/-100 benchmark strikes (bypasses OpenRouter AI selector)
+# Force static +/-100 benchmark strikes (no effect on strike selection since 2026-11-12; ITM1 always applies)
 python strategies/weekly_option_collector.py --force-static
 
 # Force immediate strangle entry (bypasses Smart Entry Gate deferral)
@@ -851,16 +826,16 @@ python scripts/Tuesday-Fno-Exit-Orders-V1.py --mock --force
 
 #### 7. Thursday F&O Exit Order Manager (`scripts/Thursday-Fno-Exit-Orders-V1.py`)
 
-Manages live AngelOne SmartAPI Stop-Loss Market (SL-M) trailing exit orders for active Thursday 3-day cycle legs once authorized by Alpha FSM exits:
+Manages live Stop-Loss Market (SL-M) trailing exit orders on the Thursday broker (currently Upstox) for active Thursday 3-day cycle legs once authorized by Alpha FSM exits:
 
 ```bash
 # Dry-run check (inspects Thursday positions and Redis authorization)
 python scripts/Thursday-Fno-Exit-Orders-V1.py --dry-run
 
-# Mock mode (simulates AngelOne positions, orders, and quotes offline)
+# Mock mode (simulates Thursday-broker positions, orders, and quotes offline)
 python scripts/Thursday-Fno-Exit-Orders-V1.py --mock
 
-# Live execution mode (requires AngelOne JWT via angelone_jwt_feed / ANGELONE_JWT_TOKEN and LIVE_EXIT_TRIGGER_THURSDAY=true)
+# Live execution mode (requires the Thursday broker's credentials and LIVE_EXIT_TRIGGER_THURSDAY=true)
 python scripts/Thursday-Fno-Exit-Orders-V1.py --execute
 
 # Immediate square-off mode (submits MARKET sell order; cancels open SL-M first; persists in Redis)
@@ -949,7 +924,7 @@ All production crontab schedules execute in **UTC** on AWS EC2:
 45-59 3 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Tuesday-Fno-Exit-Orders-V1.py --execute >> logs/tue_exit_$(date +\%F).log 2>&1
 * 4-9 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Tuesday-Fno-Exit-Orders-V1.py --execute >> logs/tue_exit_$(date +\%F).log 2>&1
 
-# Thursday 3-Day Exit Manager (AngelOne SmartAPI, Lots: 1 = 65 qty)
+# Thursday 3-Day Exit Manager (broker per THURSDAY_BROKER, currently Upstox; Lots: 1 = 65 qty)
 45-59 3 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Thursday-Fno-Exit-Orders-V1.py --execute >> logs/thu_exit_$(date +\%F).log 2>&1
 * 4-9 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Thursday-Fno-Exit-Orders-V1.py --execute >> logs/thu_exit_$(date +\%F).log 2>&1
 ```
@@ -1116,9 +1091,8 @@ This project interacts with external brokerage, AI, database, and email services
 | Service | Category | Purpose / Where Used | Auth / Environment Variables | Quota / Billing Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | **Angel One SmartAPI** | Brokerage & Market Data | • `common/angelone_client.py` (NIFTY spot LTP, daily option scrip master, CALL/PUT quotes) | `ANGELONE_API_KEY`<br>*(Prioritizes Redis key `angelone_jwt_feed`)* | Free API access. Rate-limited. Managed at [smartapi.angelbroking.com](https://smartapi.angelbroking.com/) |
-| **OpenRouter** | LLM Gateway | • `common/ai_strike_selector.py` (Dynamic Tuesday strike optimization via DeepSeek/Claude) | `OPENROUTER_API_KEY`<br>*(Reads model list from Redis `finance_llm_models`)* | Prepaid USD credit. Volume: ~1–4 calls/week (1 entry call + up to 3 shadow counterfactual calls). Managed at [openrouter.ai/credits](https://openrouter.ai/credits) |
 | **Upstox API** | Market Calendar & Tuesday F&O Exit Execution | • `common/calendar_utils.py` (NSE holiday calendar)<br>• `scripts/Tuesday-Fno-Exit-Orders-V1.py` (Live F&O trailing stop-loss execution) | `UPSTOX_ACCESS_TOKEN`<br>*(Prioritizes Redis keys `fno:upstox:access_token:*`)* | API trading access. Tuesday manager places SL-M trailing stops strictly on Upstox when Alpha FSM exit signals trigger. |
-| **AngelOne SmartAPI** | Market Feed & Thursday F&O Exit Execution | • `common/angelone_client.py` (SmartAPI feed)<br>• `scripts/Thursday-Fno-Exit-Orders-V1.py` (Live F&O trailing stop-loss execution) | `ANGELONE_JWT_TOKEN` / `angelone_jwt_feed` (Redis) | SmartAPI trading access. Thursday manager places CARRYFORWARD SL-M trailing stops strictly on AngelOne. |
+| **AngelOne SmartAPI** | Market Feed & Thursday F&O Exit Execution (only when `THURSDAY_BROKER=angelone`) | • `common/angelone_client.py` (SmartAPI feed)<br>• `scripts/Thursday-Fno-Exit-Orders-V1.py` (Live F&O trailing stop-loss execution) | `ANGELONE_JWT_TOKEN` / `angelone_jwt_feed` (Redis) | SmartAPI trading access. Thursday manager places CARRYFORWARD SL-M trailing stops strictly on AngelOne. |
 | **MongoDB Atlas** | Cloud NoSQL DB | • `scripts/sync_to_mongodb.py` (Persists weekly dossiers in `derivative_strategies` & `derivative_master`) | `MONGODB_URI` | Free M0 cluster (512MB storage). Managed at [cloud.mongodb.com](https://cloud.mongodb.com/) |
 | **Gmail SMTP** | Email Notifications | • `scripts/send_weekly_report.py` (Dispatches Monday weekly performance reports & charts) | `EMAIL_SENDER`, `EMAIL_APP_PASSWORD`<br>`EMAIL_SMTP_SERVER`, `EMAIL_SMTP_PORT` | Daily sending limit (500/day). |
 
@@ -1131,14 +1105,14 @@ This project interacts with external brokerage, AI, database, and email services
 
 Automated paired MARKET BUY execution runs at the fresh strategy entry point managed by the collector scripts:
 - **Tuesday 5-Day Strategy**: Strictly routed to **Upstox** (`weekly_option_collector.py`).
-- **Thursday 3-Day Strategy**: Strictly routed to **AngelOne SmartAPI** (`thursday_option_collector.py`).
+- **Thursday 3-Day Strategy**: Routed by `THURSDAY_BROKER` (currently **Upstox**, set in `.env`) (`thursday_option_collector.py`).
 - **Separation of Concerns**: Entry BUY order placement belongs strictly to collector scripts, while exit managers (`Tuesday-Fno-Exit-Orders-V1.py` and `Thursday-Fno-Exit-Orders-V1.py`) manage trailing / immediate exits only after Alpha FSM signals trigger.
 
 ### 17.1. Activation Flags & Broker Routing
 
 Live BUY execution requires explicit activation via environment variable or CLI flag:
-- **Tuesday**: `LIVE_BUY_TRIGGER_TUESDAY=true` in `.env` OR `--execute-buy` CLI flag. Pinned strictly to **Upstox**.
-- **Thursday**: `LIVE_BUY_TRIGGER_THURSDAY=true` in `.env` OR `--execute-buy` CLI flag. Pinned strictly to **AngelOne**.
+- **Tuesday**: `LIVE_BUY_TRIGGER_TUESDAY=true` in `.env` OR `--execute-buy` CLI flag. Broker per `TUESDAY_BROKER` (currently **Upstox**).
+- **Thursday**: `LIVE_BUY_TRIGGER_THURSDAY=true` in `.env` OR `--execute-buy` CLI flag. Broker per `THURSDAY_BROKER` (currently **Upstox**).
 - **CLI Precedence**:
   - `--execute-buy`: Explicitly forces live broker BUY placement regardless of `.env`.
   - `--no-execute-buy`: Explicitly forces paper mode regardless of `.env`.

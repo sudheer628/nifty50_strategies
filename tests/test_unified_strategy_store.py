@@ -356,6 +356,7 @@ class UnifiedStrategyStoreTests(unittest.TestCase):
                 "call_strike": 23000,
                 "put_strike": 23000,
                 "expiry_date": "2026-11-03",
+                "broker": "angelone",
             },
             filepath=self.test_json,
         )

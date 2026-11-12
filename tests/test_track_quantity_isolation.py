@@ -63,7 +63,7 @@ def _tuesday_collector_live_buy(env, fill_qty=None):
         st.enter_context(patch("strategies.weekly_option_collector.check_nse_holiday", return_value=False))
         st.enter_context(patch("strategies.weekly_option_collector.is_tuesday", return_value=True))
         st.enter_context(patch("strategies.weekly_option_collector.get_nifty_spot", return_value={"ltp": 23600.0, "open": 23550.0, "close": 23500.0}))
-        st.enter_context(patch("strategies.weekly_option_collector.select_strikes", return_value=(23500, 23700, 23500, 23700, "DYNAMIC", "Rationale", 0.0, "NEUTRAL", 0.68, -0.68)))
+        st.enter_context(patch("strategies.weekly_option_collector.itm1_strikes", return_value=(23500, 23700)))
         st.enter_context(patch("strategies.weekly_option_collector.get_nifty_option_chain", return_value={
             "call": {"ltp": 250.0, "token": "39939", "trading_symbol": "NIFTY09NOV2623500CE"},
             "put": {"ltp": 230.0, "token": "39948", "trading_symbol": "NIFTY09NOV2623700PE"},

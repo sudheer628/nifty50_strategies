@@ -102,12 +102,12 @@ Verify `cycle_id`, `status` (`"ongoing"` vs `"closed"`), strikes, entry prices, 
 ### Step 4.1: Prompt-Driven Scope Only
 - **Make changes strictly as requested in the user prompt**: Do not add unsolicited features, opportunistic refactors, or stylistic churn.
 - **Preserve Business Logic & Risk Invariants**: Unless explicitly directed by the user prompt, DO NOT modify:
-  - Strike selection algorithms or grids (50-pt AI grid, 100-pt static fallback).
-  - Target Delta calculations ($\Delta \approx 0.35$).
+  - Strike selection: fixed ITM1 rule (`common/expiry.py:itm1_strikes`, CE one strike below spot, PE one strike above, `ITM1_STRIKE_STEP` grid). No AI / LLM strike selection.
+  - Delta values are telemetry only (Black-Scholes estimates logged with the ITM1 strikes); they do not drive selection.
   - Decoupled FSM trailing buffers (25% for >5 DTE, 18% for 1.5–5 DTE, 10% for <1.5 DTE, 5% tight trail).
   - Harvest rule (+50% leg profit) or salvage stop rules (-50% ITM / -55% OTM).
   - Peak-profit threshold ($\ge 20\%$) and anti-spam deduplication rules.
-  - Track segregation boundaries (Tuesday = Upstox; Thursday = AngelOne SmartAPI).
+  - Track segregation boundaries (Tuesday = Upstox; Thursday = broker per THURSDAY_BROKER, currently Upstox).
 
 ### Step 4.2: Avoid Over-Engineering Impractical Failure Scenarios
 AI models often become excessively cautious about rare or extreme failure scenarios, adding defensive bloat and speculative fallbacks. In this repository, follow these pragmatic ground rules:
@@ -122,7 +122,7 @@ AI models often become excessively cautious about rare or extreme failure scenar
 
 - **Strict Track Segregation**:
   - Master Weekly Track (`weekly`): Uses `current_week_buy.json`, `nifty50_weekly_data_{start}_{expiry}.db`, Upstox broker adapter, and `tag="TUE-SL"`.
-  - Parallel 3-Day Track (`thursday`): Uses `current_thursday_buy.json`, `nifty50_thursday_data_{start}_{expiry}.db`, AngelOne SmartAPI, and Redis `order_id` authority.
+  - Parallel 3-Day Track (`thursday`): Uses `current_thursday_buy.json`, `nifty50_thursday_data_{start}_{expiry}.db`, broker per THURSDAY_BROKER (currently Upstox), and Redis `order_id` authority.
   - Never allow state, database files, or broker credentials from one track to leak into the other.
 - **Linux LF Line Endings**: All files MUST use Unix LF (`\n`) line endings. Never introduce CRLF (`\r\n`).
 - **Atomic File Operations**: Always write snapshot updates to temporary files and atomically replace them via `os.replace` to prevent corrupting state during concurrent cron reads.

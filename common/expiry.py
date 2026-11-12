@@ -134,6 +134,25 @@ def strike_selector(
     return put_strike, call_strike
 
 
+def itm1_strikes(reference_ltp: float, step: int = 50) -> tuple:
+    """
+    Fixed ITM1 strike pair for the Thursday 3-day track (deterministic, no AI).
+
+    - CALL: nearest strike strictly BELOW spot (one step In-The-Money).
+    - PUT:  nearest strike strictly ABOVE spot (one step In-The-Money).
+
+    Example (spot 25325.15, step 50): CALL 25300, PUT 25350.
+
+    Returns:
+        Tuple ``(put_strike, call_strike)`` as integers.
+    """
+    if reference_ltp <= 0 or step <= 0:
+        raise ValueError(f"itm1_strikes needs positive spot and step (got {reference_ltp}, {step})")
+    call_strike = (math.ceil(reference_ltp / step) - 1) * step
+    put_strike = (math.floor(reference_ltp / step) + 1) * step
+    return int(put_strike), int(call_strike)
+
+
 def compute_intrinsic_extrinsic(
     spot: float,
     call_strike: int,

@@ -16,9 +16,9 @@ Scope & Operational Rules:
 3. Multi-Lot & Quantity Isolation:
    - Manages strictly Thursday's allocated lots (`--lots` or `LOTS_THURSDAY`, default: 1 lot = 65 qty).
    - Authoritative quantity in Redis contract key (e.g. `{"enabled": true, "qty": 65}`) takes priority.
-4. AngelOne Order Tracking (Redis order_id Live Authority):
-   - AngelOne SmartAPI does not accept or forward custom user tags; no `THU-SL` tag is sent in order payloads.
-   - Live orders are identified and tracked strictly via broker `orderid` stored in Redis (`fno:angelone:trail:thu:*:order_id`).
+4. Order Tracking (Redis order_id Live Authority):
+   - Brokers that do not accept or forward custom user tags (AngelOne SmartAPI) receive no `THU-SL` tag in order payloads.
+   - Live orders are identified and tracked strictly via broker `orderid` stored in Redis (`fno:{broker}:trail:thu:*:order_id`).
    - The code retains an auxiliary `tag="THU-SL"` check as a compatibility fallback across all execution modes (primarily for offline `--mock` data and synthetic test harnesses), while Redis `order_id` remains the authoritative identifier for live market trading.
    - Any open SELL order in the broker order book not matching the stored Redis `orderid` (and carrying no compatibility tag) is treated as a manual sell order and left untouched (`manual_sell_conflict`).
 5. Ratchet Trailing SL:
@@ -115,7 +115,7 @@ ORDER_TYPE_SL = "STOPLOSS_LIMIT"
 VALIDITY_DAY = "DAY"
 TICK_SIZE = 0.05
 DEFAULT_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
-DEFAULT_BROKER = os.getenv("THURSDAY_BROKER", "angelone").lower().strip()
+DEFAULT_BROKER = os.getenv("THURSDAY_BROKER", "upstox").lower().strip()
 DEFAULT_LOCK_KEY = "fno:lock:exit_order_manager:thursday"
 
 OPEN_ORDER_STATUSES = {
@@ -879,7 +879,7 @@ def _save_trailing_state(
         return False
 
 
-def _cleanup_thursday_leg_state(r, keys: Dict[str, str], broker: str = "angelone", symbol: Optional[str] = None) -> None:
+def _cleanup_thursday_leg_state(r, keys: Dict[str, str], broker: str = "upstox", symbol: Optional[str] = None) -> None:
     """Clean up Redis trailing state and authorization for a closed Thursday leg."""
     if not r:
         return
