@@ -598,6 +598,11 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             put_order_id = buy_res.get("put_order_id")
             entry_status = "FILLED"
             broker_name = track_broker
+            logger.info(
+                "[Thursday Track] LIVE BUY FILLED on %s: CALL %d CE @ %.2f (order_id=%s) | PUT %d PE @ %.2f (order_id=%s) | qty=%s",
+                track_broker, call_strike, call_buy_price, call_order_id,
+                put_strike, put_buy_price, put_order_id, qty,
+            )
         else:
             call_buy_price = call_ltp
             put_buy_price = put_ltp
