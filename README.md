@@ -848,28 +848,41 @@ python scripts/Thursday-Fno-Exit-Orders-V1.py --execute --lots 1
 python scripts/Thursday-Fno-Exit-Orders-V1.py --mock --force
 ```
 
-### Runtime Configuration Overrides (Redis-first)
+### Runtime Configuration (Controlled Exclusively via Redis Cloud)
 
-Execution gates and sizing are resolved **Redis first, then `.env`, then a safe hardcoded default** (`config.get_config_bool` / `get_config_int` / `get_config_flag`). Redis keys use the exact `.env` variable names:
+All runtime execution gates, sizing, and order mode switches are controlled **exclusively via Redis Cloud** as the single source of truth. The `.env` file is strictly reserved for static infrastructure credentials (API keys, Redis/MongoDB connection strings, Discord webhooks) and contains zero dynamic execution switches.
 
-| Key | Used by | Default |
-|---|---|---|
-| `LIVE_EXIT_TRIGGER_TUESDAY` / `LIVE_EXIT_TRIGGER_THURSDAY` | Exit managers (live vs forced dry-run) | `false` |
-| `EXIT_IMMEDIATELY_TUESDAY` / `EXIT_IMMEDIATELY_THURSDAY` | Exit managers (MARKET exit vs trailing SL-M); the `--exit-immediately` CLI flag still forces immediate mode | `false` |
-| `LIVE_BUY_TRIGGER_TUESDAY` / `LIVE_BUY_TRIGGER_THURSDAY` | Collectors (live paired BUY vs paper entry); `--execute-buy` / `--no-execute-buy` still take precedence | `false` |
-| `LOTS_TUESDAY` / `LOTS_THURSDAY` | New-cycle BUY size and legacy exit sizing | Tue `2`, Thu `1` |
-| `NIFTY_LOT_SIZE`, `STRATEGY_BUY_QTY` | Lot size / BUY-size fallback when `LOTS_*` is unset | `65` |
+| Redis Key | Used by | Description | Default |
+|---|---|---|---|
+| `LIVE_BUY_TRIGGER_TUESDAY` / `LIVE_BUY_TRIGGER_THURSDAY` | Collectors | Live paired MARKET BUY entry (`true`) vs paper simulation (`false`); CLI `--execute-buy` / `--no-execute-buy` still take precedence | `false` |
+| `LIVE_EXIT_TRIGGER_TUESDAY` / `LIVE_EXIT_TRIGGER_THURSDAY` | Exit managers | Live exit order placement on broker (`true`) vs forced dry-run / manual mode (`false`) | `false` |
+| `EXIT_IMMEDIATELY_TUESDAY` / `EXIT_IMMEDIATELY_THURSDAY` | Exit managers | Instant MARKET square-off mode (`true`) vs trailing SL-M orders (`false`); CLI `--exit-immediately` also forces immediate mode | `false` |
+| `ORDERS_LIVE_TUE` / `ORDERS_LIVE_THU` | Exit managers | Fast 1-millisecond Redis gate: `1` (or `true`) allows exit loop to inspect positions; `0` sleeps in 1ms | `0` (tripped to `1` on entry) |
+| `LOTS_TUESDAY` / `LOTS_THURSDAY` | Collectors | Sizing for fresh cycle entries (number of lots) | Tue `2`, Thu `1` |
+| `NIFTY_LOT_SIZE` | All scripts | Lot size multiplier | `65` |
+
+#### Operational Quick Reference (redis-cli):
 
 ```bash
-redis-cli SET EXIT_IMMEDIATELY_THURSDAY true   # switch Thursday exits to immediate MARKET orders
-redis-cli SET LOTS_THURSDAY 2                  # next Thursday cycle buys 2 lots (130 qty)
-redis-cli DEL LOTS_THURSDAY                    # revert to the .env value
+# --- Tuesday Cycle Controls ---
+redis-cli SET LIVE_BUY_TRIGGER_TUESDAY true      # Enable automated BUY entry at 09:31 IST
+redis-cli SET LIVE_EXIT_TRIGGER_TUESDAY true     # Enable live automated EXIT manager
+redis-cli SET EXIT_IMMEDIATELY_TUESDAY true      # Force immediate MARKET exits (skip trailing SL-M)
+redis-cli SET ORDERS_LIVE_TUE 1                  # Manually activate exit gate (set to 0 to idle)
+
+# --- Thursday Cycle Controls ---
+redis-cli SET LIVE_BUY_TRIGGER_THURSDAY true     # Enable automated BUY entry on Thursday
+redis-cli SET LIVE_EXIT_TRIGGER_THURSDAY true    # Enable live automated Thursday EXIT manager
+redis-cli SET EXIT_IMMEDIATELY_THURSDAY true     # Force immediate MARKET exits on Thursday
+redis-cli SET ORDERS_LIVE_THU 1                  # Manually activate Thursday exit gate
+
+# --- Check Full Runtime Status ---
+redis-cli MGET LIVE_BUY_TRIGGER_TUESDAY LIVE_EXIT_TRIGGER_TUESDAY EXIT_IMMEDIATELY_TUESDAY ORDERS_LIVE_TUE
 ```
 
-- If Redis is unreachable, or a key is missing, empty or invalid (e.g. `ture`, `two`, `0` lots), the `.env` value is used and a warning is logged; Redis overrides are logged as `Config KEY=value (source: Redis override)`.
-- Sizing changes apply to **new cycle entries only**: an open cycle always exits the quantity it actually bought (`entry_qty` recorded at entry).
-- A leg whose immediate exit has already started stays in immediate mode even if `EXIT_IMMEDIATELY_*` is later turned off.
-- Anyone with write access to Redis Cloud can enable live trading; keep the Redis credentials as protected as the broker tokens.
+- **Clean Decoupling**: Deleting these dynamic execution keys from `.env` guarantees that runtime behavior is managed dynamically from Redis without modifying files on disk or restarting cron jobs.
+- **Sizing Rule**: Sizing changes (`LOTS_*`) apply to **new cycle entries only**: an open cycle always exits the quantity it actually bought (`entry_qty` recorded at entry).
+- **Gate Auto-Reset**: When all open legs of a cycle exit and reach 0 quantity in the broker, the exit manager automatically resets `ORDERS_LIVE_TUE = 0` / `ORDERS_LIVE_THU = 0`.
 
 ### Production Crontab Entries
 
@@ -1110,13 +1123,13 @@ Automated paired MARKET BUY execution runs at the fresh strategy entry point man
 
 ### 17.1. Activation Flags & Broker Routing
 
-Live BUY execution requires explicit activation via environment variable or CLI flag:
-- **Tuesday**: `LIVE_BUY_TRIGGER_TUESDAY=true` in `.env` OR `--execute-buy` CLI flag. Broker per `TUESDAY_BROKER` (currently **Upstox**).
-- **Thursday**: `LIVE_BUY_TRIGGER_THURSDAY=true` in `.env` OR `--execute-buy` CLI flag. Broker per `THURSDAY_BROKER` (currently **Upstox**).
+Live BUY execution requires explicit activation via Redis Cloud or CLI flag:
+- **Tuesday**: `LIVE_BUY_TRIGGER_TUESDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_TUESDAY true`) OR `--execute-buy` CLI flag. Broker per `TUESDAY_BROKER` (currently **Upstox**).
+- **Thursday**: `LIVE_BUY_TRIGGER_THURSDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_THURSDAY true`) OR `--execute-buy` CLI flag. Broker per `THURSDAY_BROKER` (currently **Upstox**).
 - **CLI Precedence**:
-  - `--execute-buy`: Explicitly forces live broker BUY placement regardless of `.env`.
-  - `--no-execute-buy`: Explicitly forces paper mode regardless of `.env`.
-  - Flag omitted: Automatically defers to `LIVE_BUY_TRIGGER_TUESDAY` / `LIVE_BUY_TRIGGER_THURSDAY` in `.env`.
+  - `--execute-buy`: Explicitly forces live broker BUY placement regardless of Redis state.
+  - `--no-execute-buy`: Explicitly forces paper mode regardless of Redis state.
+  - Flag omitted: Automatically defers to `LIVE_BUY_TRIGGER_TUESDAY` / `LIVE_BUY_TRIGGER_THURSDAY` in Redis Cloud (default: `false`).
 - **Alert Decoupling**: Passing `--no-alert` (Tuesday) or `--dry-run` (Thursday) suppresses external Discord milestone notifications only; it does **not** suppress live broker order placement.
 
 ```bash

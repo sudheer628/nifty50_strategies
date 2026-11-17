@@ -202,7 +202,7 @@ def test_register_manual_cycle_live(tmp_path):
         set_calls = {call[0][0]: call[0][1] for call in mock_redis.set.call_args_list}
         assert set_calls.get("fno:upstox:enabled:tue:2026-11-17:24300:CE") == "65"
         assert set_calls.get("fno:upstox:enabled:tue:2026-11-17:24100:PE") == "65"
-        assert set_calls.get("ORDERS_LIVE_TUE") == "2"
+        assert set_calls.get("ORDERS_LIVE_TUE") == "1"
         assert set_calls.get("LIVE_BUY_TRIGGER_TUESDAY") == "false"
         assert set_calls.get("LIVE_EXIT_TRIGGER_TUESDAY") == "true"
 

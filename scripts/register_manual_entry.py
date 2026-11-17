@@ -363,7 +363,7 @@ def register_manual_cycle(
         ("SET", put_auth_key, str(qty)),
         ("SADD", managed_orders_key, call_order_id),
         ("SADD", managed_orders_key, put_order_id),
-        ("SET", orders_live_key, "2"),
+        ("SET", orders_live_key, "1"),
         ("SET", live_buy_key, "false"),
         ("SET", live_exit_key, "true"),
         # Trailing keys for Call

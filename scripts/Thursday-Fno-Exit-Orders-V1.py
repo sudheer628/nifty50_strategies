@@ -2899,7 +2899,8 @@ def main() -> int:
             return 1
 
         orders_live = r.get("ORDERS_LIVE_THU") or r.get("fno:orders_live:thursday")
-        if str(orders_live or "").strip().lower() not in ("1", "true", "yes"):
+        orders_val = str(orders_live or "").strip().lower()
+        if orders_val not in ("1", "true", "yes") and not (orders_val.isdigit() and int(orders_val) > 0):
             logger.info("ORDERS_LIVE_THU is inactive in Redis. Exiting immediately in 1ms.")
             print(json.dumps({
                 "status": "idle",
