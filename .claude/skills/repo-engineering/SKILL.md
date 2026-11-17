@@ -31,18 +31,23 @@ Before making any diagnoses or code edits, inspect the active production runtime
 
 ### Step 2.1: Inspect Crontab Jobs (`crontab -l`)
 Run `crontab -l` in bash to determine which scripts are currently active and their execution cadence:
-- **Master Weekly Track (Tuesday–Monday)**:
+- **Master Weekly Track (Tuesday–Monday + Wednesday Extension)**:
   - `strategies/weekly_option_collector.py` (:01 and :31 past every hour, 04:01–10:01 UTC)
+    - Starts standard weekly cycle on Tuesday (`CYCLE-TUE-YYYYMMDD`).
+    - Evaluates Wednesday cycle extension (`CYCLE-WED-YYYYMMDD`) when `LIVE_BUY_TRIGGER_TUESDAY=true` and broker is verified to have 0 open positions and 0 pending orders from Tuesday.
   - `strategies/peak_profit_monitor.py` (:16 and :46 past every hour, 03:46–09:46 UTC)
   - `strategies/monday_gamma_sniper.py` (Mondays every 10m, 07:00–09:50 UTC)
   - `scripts/run_weekly_close.py` (Mondays 10:07 UTC / Tue 03:37 UTC deferred)
-- **Parallel 3-Day Track (Thursday–Monday)**:
+- **Parallel 3-Day Track (Thursday–Monday + Friday Extension)**:
   - `strategies/thursday_option_collector.py` (:02 and :32 past every hour on Mon, Thu, Fri)
+    - Starts standard 3-day cycle on Thursday (`CYCLE-THU-YYYYMMDD`).
+    - Evaluates Friday cycle extension (`CYCLE-FRI-YYYYMMDD`) when `LIVE_BUY_TRIGGER_THURSDAY=true` and broker is verified to have 0 open positions and 0 pending orders from Thursday (and no Tuesday overlap).
   - `strategies/peak_profit_monitor.py --track thursday` (:17 and :47 past every hour)
   - `scripts/run_thursday_close.py` (Mondays 10:08 UTC / Tue 03:38 UTC deferred)
-- **Live Exit Managers**:
+- **Live Exit Managers & Broker Manual-Exit Auto-Reconciliation**:
   - `scripts/Tuesday-Fno-Exit-Orders-V1.py` (Every 1 min during market hours)
   - `scripts/Thursday-Fno-Exit-Orders-V1.py` (Every 1 min during market hours)
+  - Both collectors run `scripts/auto_record_manual_exit.py:reconcile_broker_positions_with_snapshot()` at the start of every cycle to reconcile manual broker square-offs into `MANUAL_CLOSED` state regardless of whether `ORDERS_LIVE_*` is armed.
 
 > [!IMPORTANT]
 > **Check timing before editing**: If a collector or monitor runs at `:01` or `:02` and the current time is near that trigger, avoid saving partial edits that could corrupt or crash a live cron run.
@@ -116,6 +121,21 @@ AI models often become excessively cautious about rare or extreme failure scenar
 - **No Defensive Bloat**: Never introduce local queue synchronizers, secondary fallback broker adapters, emergency offline stores, or redundant connection pools to guard against catastrophic cloud outages unless the user prompt explicitly requests them.
 - **Focus on Core Trading Logic**: Dedicate engineering effort to signal accuracy, correct strike math, accurate P&L tracking, and fulfilling the user's specific prompt rather than speculating on catastrophic cloud-provider outages.
 
+### Step 4.3: Manual Square-Off & Cycle Extension Invariants
+- **Broker-Authoritative Manual Exit Sync**:
+  - Traders may manually square off one or both strategy legs directly on the broker app at any time.
+  - Position reconciliation (`scripts/auto_record_manual_exit.py`) runs at every collector execution (even if `ORDERS_LIVE_*` is 0). It detects zero net position with same-day sell quantity, marks the leg `MANUAL_CLOSED` in Alpha FSM, purges Redis authorization/trailing keys, updates `active_strategies.json`, and syncs MongoDB.
+  - When all legs reach terminal states (`HARVESTED_CLOSED`, `TRAILING_STOP_CLOSED`, `SALVAGED_CLOSED`, `MANUAL_CLOSED`), the cycle snapshot is marked `status="closed"`, and exit gates (`ORDERS_LIVE_TUE=0` / `fno:orders_live:tuesday=0` or `ORDERS_LIVE_THU=0` / `fno:orders_live:thursday=0`) are disarmed.
+  - In `sentinel-hermes`, exit alerts are strictly suppressed on `MANUAL_CLOSED` legs to prevent bogus alerts for already-closed positions.
+- **Wednesday & Friday Extension Guard (Fail-Closed Policy)**:
+  - Fresh entry on extension days (Wednesday for Tuesday track, Friday for Thursday track) strictly requires `LIVE_BUY_TRIGGER_TUESDAY=true` or `LIVE_BUY_TRIGGER_THURSDAY=true`. `ORDERS_LIVE_*` is an exit gate and must NEVER authorize buy entry.
+  - `check_prior_cycle_open_positions(track)` strictly verifies live broker positions and order books before any extension entry.
+  - If token fetch fails, position fetch fails, order book fetch fails, contract identity is missing, or unverified exposure exists, the guard returns `is_safe_to_enter=False` (fail-closed). Entry proceeds ONLY when zero open exposure and zero open orders are confirmed.
+  - Friday extensions verify both Thursday contracts and Tuesday cross-track overlap contracts.
+- **Exact Contract Matching**:
+  - `contract_matches()` enforces matching of underlying (`NIFTY`), strike, option type (`CE`/`PE`), and resolved expiry. Symbols without expiry (e.g. `NIFTY24000CE`) must reject to prevent cross-expiry position confusion.
+  - Order statuses with spaces or mixed case (e.g., `"Partially Filled"`, `"Trigger Pending"`) must be normalized using `normalize_order_status()`.
+
 ---
 
 ## 5. Architectural Rules & Code Integrity
@@ -151,6 +171,7 @@ cd /home/ubuntu/nifty50_strategies
 
 # Run targeted pytest tests (fastest validation)
 .venv/bin/pytest tests/test_<relevant_module>.py -v
+.venv/bin/pytest tests/test_broker_manual_exit_reconciliation.py tests/test_cycle_extensions.py -v
 
 # Run the complete test suite (must pass 100%)
 .venv/bin/pytest
@@ -165,8 +186,18 @@ cd /home/ubuntu/nifty50_strategies
 .venv/bin/python scripts/run_weekly_close.py --dry-run
 .venv/bin/python scripts/run_thursday_close.py --dry-run
 
+# Broker Manual Exit & Cycle Extension Verification:
+# 1. Inspect live broker exposure for active track:
+.venv/bin/python -c "from scripts.auto_record_manual_exit import check_prior_cycle_open_positions; print(check_prior_cycle_open_positions('5day_strategy'))"
+# 2. Preview manual exit reconciliation (dry-run):
+.venv/bin/python -c "from scripts.auto_record_manual_exit import reconcile_broker_positions_with_snapshot; import json; print(json.dumps(reconcile_broker_positions_with_snapshot('5day_strategy', dry_run=True), indent=2))"
+# 3. Apply manual exit reconciliation:
+.venv/bin/python -c "from scripts.auto_record_manual_exit import reconcile_broker_positions_with_snapshot; reconcile_broker_positions_with_snapshot('5day_strategy')"
+# 4. Explicit manual leg exit recording via CLI:
+.venv/bin/python scripts/mark_manual_exit.py --track tuesday --leg CALL --price 120.50 --dry-run
+
 # Validating sibling sentinel-hermes tests when reviewing cross-repo contracts:
-# cd /home/ubuntu/sentinel-hermes && .venv/bin/pytest tests/test_<module>.py -v
+# cd /home/ubuntu/sentinel-hermes && .venv/bin/pytest tests/test_manual_closed_suppression.py -v
 ```
 
 ---
