@@ -43,6 +43,18 @@ from common.unified_strategy_store import (
 )
 
 
+def _today_ist():
+    """Return current date in IST."""
+    try:
+        from zoneinfo import ZoneInfo
+        ist = ZoneInfo("Asia/Kolkata")
+    except ImportError:
+        import pytz
+        ist = pytz.timezone("Asia/Kolkata")
+    from datetime import datetime
+    return datetime.now(ist).date()
+
+
 def bootstrap_from_snapshots(poll_now: bool = False, reset_mongo: bool = False) -> bool:
     """Read existing buy snapshots and bootstrap active_strategies.json."""
     logger.info("Starting mid-week bootstrap for active options strategies...")
@@ -159,7 +171,7 @@ def bootstrap_from_snapshots(poll_now: bool = False, reset_mongo: bool = False) 
                     except ValueError:
                         pass
 
-            today_ist = datetime.now(ist).date()
+            today_ist = _today_ist()
             if exp_date_obj and exp_date_obj < today_ist:
                 logger.info(
                     "Thursday snapshot %s expired on %s (today is %s). Initializing 3day_strategy as 'pending_entry' awaiting Thursday morning start.",

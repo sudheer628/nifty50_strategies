@@ -1410,10 +1410,13 @@ class TestBootstrapPreservesBrokerMetadata:
         with open(thu_snap_file, "w", encoding="utf-8") as f:
             json.dump(thu_snap_data, f)
 
+        from datetime import date
+
         with patch("scripts.bootstrap_active_strategies.ACTIVE_SNAPSHOT_FILE", tue_snap_file), \
              patch("scripts.bootstrap_active_strategies.THURSDAY_SNAPSHOT_FILE", thu_snap_file), \
              patch("scripts.bootstrap_active_strategies.ACTIVE_STRATEGIES_JSON", active_json_file), \
              patch("common.unified_strategy_store.ACTIVE_STRATEGIES_JSON", active_json_file), \
+             patch("scripts.bootstrap_active_strategies._today_ist", return_value=date(2026, 11, 5)), \
              patch("scripts.bootstrap_active_strategies.sync_active_cycles_to_mongodb"), \
              patch("common.unified_strategy_store.sync_active_cycles_to_mongodb"), \
              patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"), \
