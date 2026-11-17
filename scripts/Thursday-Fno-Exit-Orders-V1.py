@@ -554,13 +554,13 @@ def is_derivative_position(pos: Dict[str, Any]) -> bool:
     return any(token.startswith(prefix) for prefix in DERIVATIVE_KEY_PREFIXES)
 
 
-def parse_positions(raw: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def parse_positions(raw: Any, include_closed: bool = False):
     """
     Parse AngelOne / Upstox positions response.
-    Returns: (long_positions, short_positions)
+    Returns: (long_positions, short_positions) or (long_positions, short_positions, closed_positions)
     """
     from common.broker_adapters import parse_positions as adapter_parse_positions
-    return adapter_parse_positions(raw)
+    return adapter_parse_positions(raw, include_closed=include_closed)
 
 
 def normalize_order_status(status: Any) -> str:
@@ -1096,6 +1096,7 @@ def reconcile_cycle_legs(
     tag: str = "THU-SL",
     short_positions: Optional[List[Dict[str, Any]]] = None,
     active_expiry: Optional[Union[str, date, datetime]] = None,
+    closed_positions: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Reconcile all enabled Redis legs for this cycle against live broker positions & open orders.
@@ -1277,55 +1278,82 @@ def reconcile_cycle_legs(
                 break
 
         if not exit_executed:
-            # Attempt to auto-detect and record manual exit from broker position data
+            # Attempt to auto-detect and record manual exit from broker position data and order book
             manual_exit_recorded = False
             try:
-                # Find the closed position in broker data
-                for closed_pos in positions:
+                from common.broker_adapters import contract_matches, OPEN_ORDER_STATUSES
+
+                # Check if any order is still open / pending for this contract
+                pending_order_exists = False
+                for od in (orders or []):
+                    st = normalize_order_status(od.get("status") or od.get("orderstatus"))
+                    if st in OPEN_ORDER_STATUSES:
+                        if contract_matches(od, target_strike=leg_strike, target_opt_type=leg_opt, target_expiry=eff_expiry, target_underlying="NIFTY"):
+                            pending_order_exists = True
+                            break
+                if pending_order_exists:
+                    logger.info("Leg %s %s has pending order at broker; skipping auto-recording manual exit", leg_strike, leg_opt)
+                    continue
+
+                candidate_sell_price = None
+                candidate_sell_qty = None
+
+                # 1. Match closed positions in broker data
+                for closed_pos in (closed_positions or []):
                     pos_qty = _position_quantity(closed_pos)
-                    pos_day_sell_qty = int(_to_float(closed_pos.get("day_sell_quantity") or 0))
-                    pos_symbol = str(closed_pos.get("tradingsymbol") or closed_pos.get("instrument_token") or "")
-                    
-                    # Match the contract
-                    pos_details = parse_tradingsymbol(pos_symbol)
-                    pos_strike = int(pos_details.get("strike") or 0) if pos_details.get("strike") else 0
-                    pos_opt = pos_details.get("option_type")
-                    
-                    if pos_strike == int(leg_strike) and pos_opt == leg_opt and pos_qty == 0 and pos_day_sell_qty > 0:
-                        # Manual exit detected - auto-record it
-                        sell_price = float(closed_pos.get("sell_price") or closed_pos.get("day_sell_price") or 0.0)
-                        if sell_price <= 0:
-                            sell_value = float(closed_pos.get("sell_value") or closed_pos.get("day_sell_value") or 0.0)
-                            if sell_value > 0 and pos_day_sell_qty > 0:
-                                sell_price = round(sell_value / pos_day_sell_qty, 2)
-                        
-                        if sell_price > 0:
-                            from scripts.auto_record_manual_exit import auto_record_manual_exit
-                            import time
-                            
-                            result = auto_record_manual_exit(
-                                track=CYCLE_TRACK,
-                                broker=broker,
-                                strike=int(leg_strike),
-                                option_type=leg_opt,
-                                expiry_iso=eff_expiry,
-                                sell_price=sell_price,
-                                sell_ts=int(time.time()),
-                                sell_qty=pos_day_sell_qty,
-                                redis_client=r,
-                                dry_run=False,
-                            )
-                            
-                            if result.get("success"):
-                                manual_exit_recorded = True
-                                logger.info(
-                                    "Auto-recorded manual exit for %s %s @ ₹%.2f (qty=%d)",
-                                    leg_strike, leg_opt, sell_price, pos_day_sell_qty
-                                )
-                                break
+                    if pos_qty == 0 and contract_matches(closed_pos, target_strike=leg_strike, target_opt_type=leg_opt, target_expiry=eff_expiry, target_underlying="NIFTY"):
+                        pos_day_sell_qty = int(_to_float(closed_pos.get("day_sell_quantity") or 0))
+                        sell_p = float(closed_pos.get("sell_price") or closed_pos.get("day_sell_price") or 0.0)
+                        if sell_p <= 0:
+                            sell_val = float(closed_pos.get("sell_value") or closed_pos.get("day_sell_value") or 0.0)
+                            if sell_val > 0 and pos_day_sell_qty > 0:
+                                sell_p = round(sell_val / pos_day_sell_qty, 2)
+                        if sell_p > 0:
+                            candidate_sell_price = sell_p
+                            candidate_sell_qty = pos_day_sell_qty
+                        break
+
+                # 2. Check order book for completed SELL orders if fill price not in position summary
+                if candidate_sell_price is None or candidate_sell_price <= 0:
+                    for od in (orders or []):
+                        if str(od.get("transaction_type") or "").upper() == "SELL":
+                            st = normalize_order_status(od.get("status"))
+                            if st in ("complete", "completed", "filled"):
+                                if contract_matches(od, target_strike=leg_strike, target_opt_type=leg_opt, target_expiry=eff_expiry, target_underlying="NIFTY"):
+                                    fill_p = float(od.get("average_price") or od.get("price") or 0.0)
+                                    if fill_p > 0:
+                                        candidate_sell_price = fill_p
+                                        candidate_sell_qty = int(order_filled_quantity(od))
+                                        break
+
+                # Record manual exit since no open position remains and no open sell order remains
+                from scripts.auto_record_manual_exit import auto_record_manual_exit
+                import time
+
+                result = auto_record_manual_exit(
+                    track=CYCLE_TRACK,
+                    broker=broker,
+                    strike=int(leg_strike),
+                    option_type=leg_opt,
+                    expiry_iso=eff_expiry,
+                    sell_price=candidate_sell_price if candidate_sell_price and candidate_sell_price > 0 else None,
+                    sell_ts=int(time.time()),
+                    sell_qty=candidate_sell_qty if (candidate_sell_qty and candidate_sell_qty > 0) else None,
+                    redis_client=r,
+                    dry_run=False,
+                )
+
+                if result.get("success"):
+                    manual_exit_recorded = True
+                    price_display = f"₹{candidate_sell_price:.2f}" if candidate_sell_price else "price unavailable"
+                    qty_display = f"qty={candidate_sell_qty}" if candidate_sell_qty else "qty=unknown"
+                    logger.info(
+                        "Auto-recorded manual exit for %s %s @ %s (%s)",
+                        leg_strike, leg_opt, price_display, qty_display
+                    )
             except Exception as exc:
                 logger.warning("Failed to auto-record manual exit: %s", exc)
-            
+
             if not manual_exit_recorded:
                 reason = (
                     f"Alpha exit authorization {enabled_key} is being retired WITHOUT any filled managed SELL: "
@@ -2983,7 +3011,7 @@ def main() -> int:
                 token = get_access_token(broker=active_broker)
                 raw_pos = fetch_positions(token, broker=active_broker)
                 orders = fetch_order_book(token, broker=active_broker)
-            positions, short_positions = parse_positions(raw_pos)
+            positions, short_positions, closed_positions = parse_positions(raw_pos, include_closed=True)
         except Exception as exc:
             logger.error("Fetch failed: %s", exc)
             print(json.dumps({"error": "fetch_failed", "cycle": CYCLE_NAME, "message": str(exc)}, indent=2))
@@ -3043,6 +3071,7 @@ def main() -> int:
                 tag=args.tag,
                 short_positions=short_positions,
                 active_expiry=active_expiry,
+                closed_positions=closed_positions,
             )
             if retired_legs:
                 logger.info("Reconciled and retired %d closed Thursday leg(s) in Redis.", len(retired_legs))

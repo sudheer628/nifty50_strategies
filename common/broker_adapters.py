@@ -22,8 +22,9 @@ import json
 import logging
 import math
 import os
+import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
@@ -83,10 +84,116 @@ def _position_quantity(pos: Dict[str, Any]) -> float:
     return 0.0
 
 
-def parse_positions(raw: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def parse_tradingsymbol(tradingsymbol: str) -> Dict[str, str]:
+    """
+    Robust parser for NSE / Upstox / AngelOne option tradingsymbols:
+      - Weekly with 2-digit year at end: NIFTY03NOV2622650CE -> NIFTY, 03NOV26, 22650, CE
+      - Monthly/Weekly with 2-digit year first: NIFTY26NOV22650CE -> NIFTY, 26NOV, 22650, CE
+      - Compact Upstox format: NIFTY26N0923500CE -> NIFTY, 26N09, 23500, CE
+      - Legacy format: NIFTY4AUG24000CE -> NIFTY, 4AUG, 24000, CE
+    """
+    raw = str(tradingsymbol or "").upper().strip()
+    m1 = re.match(r"^([A-Z]+)(\d{1,2}[A-Z]{3}\d{2})(\d{4,5})(CE|PE)$", raw)
+    if m1:
+        return {"underlying": m1.group(1), "expiry": m1.group(2), "strike": m1.group(3), "option_type": m1.group(4), "raw": raw}
+    m2 = re.match(r"^([A-Z]+)(\d{2}[A-Z]{3})(\d{4,5})(CE|PE)$", raw)
+    if m2:
+        return {"underlying": m2.group(1), "expiry": m2.group(2), "strike": m2.group(3), "option_type": m2.group(4), "raw": raw}
+    m3 = re.match(r"^([A-Z]+)(\d{1,2}[A-Z]{3})(\d{4,5})(CE|PE)$", raw)
+    if m3:
+        return {"underlying": m3.group(1), "expiry": m3.group(2), "strike": m3.group(3), "option_type": m3.group(4), "raw": raw}
+    m_compact = re.match(r"^([A-Z]+)(\d{2}[1-9OND]\d{2})(\d{4,5})(CE|PE)$", raw)
+    if m_compact:
+        return {"underlying": m_compact.group(1), "expiry": m_compact.group(2), "strike": m_compact.group(3), "option_type": m_compact.group(4), "raw": raw}
+    m4 = re.match(r"^(.*?)(\d+)(CE|PE)$", raw)
+    if m4:
+        return {"underlying": m4.group(1), "expiry": "UNKNOWN", "strike": m4.group(2), "option_type": m4.group(3), "raw": raw}
+    return {"underlying": raw[:10] if raw else "UNKNOWN", "expiry": "UNKNOWN", "strike": "0", "option_type": "UNKNOWN", "raw": raw}
+
+
+def contract_match_status(
+    parsed_or_symbol: Union[Dict[str, Any], str],
+    target_strike: Union[int, float, str],
+    target_opt_type: str,
+    target_expiry: Optional[Union[str, date, datetime]] = None,
+    target_underlying: str = "NIFTY",
+) -> Optional[bool]:
+    """
+    Compare contract identity, returning None when the available identity is ambiguous.
+    """
+    if isinstance(parsed_or_symbol, dict):
+        raw = parsed_or_symbol
+        symbol = str(raw.get("tradingsymbol") or raw.get("trading_symbol") or "")
+        det = parse_tradingsymbol(symbol) if symbol else {}
+        det["underlying"] = raw.get("underlying") or det.get("underlying")
+        det["strike"] = raw.get("strike") or raw.get("strike_price") or raw.get("strikeprice") or det.get("strike")
+        det["option_type"] = raw.get("option_type") or raw.get("optiontype") or det.get("option_type")
+        det["expiry"] = raw.get("expiry") or raw.get("expiry_date") or det.get("expiry")
+    else:
+        det = parse_tradingsymbol(str(parsed_or_symbol))
+
+    underlying = str(det.get("underlying") or "").upper().strip()
+    if not underlying:
+        return None
+    if target_underlying and underlying != target_underlying.upper().strip():
+        return False
+
+    try:
+        strike_val = int(float(det.get("strike") or 0))
+        target_strike_val = int(float(target_strike or 0))
+        if strike_val <= 0 or target_strike_val <= 0:
+            return None
+        if strike_val != target_strike_val:
+            return False
+    except (ValueError, TypeError):
+        return None
+
+    opt = str(det.get("option_type") or "").upper().strip()
+    if not opt:
+        return None
+    if opt != str(target_opt_type or "").upper().strip():
+        return False
+
+    if target_expiry:
+        from common.fno_keys import normalize_expiry
+        norm_target_exp = normalize_expiry(target_expiry)
+        if norm_target_exp == "UNKNOWN":
+            return None
+
+        det_exp = det.get("expiry")
+        if not det_exp or str(det_exp).strip().upper() in {"UNKNOWN", "NONE", "N/A"}:
+            return None
+
+        norm_det_exp = normalize_expiry(det_exp, active_expiry=norm_target_exp)
+        if norm_det_exp == "UNKNOWN":
+            return None
+        if norm_det_exp != norm_target_exp:
+            return False
+
+    return True
+
+
+def contract_matches(
+    parsed_or_symbol: Union[Dict[str, Any], str],
+    target_strike: Union[int, float, str],
+    target_opt_type: str,
+    target_expiry: Optional[Union[str, date, datetime]] = None,
+    target_underlying: str = "NIFTY",
+) -> bool:
+    """Return whether the supplied identity is a verified exact contract match."""
+    return contract_match_status(
+        parsed_or_symbol,
+        target_strike,
+        target_opt_type,
+        target_expiry=target_expiry,
+        target_underlying=target_underlying,
+    ) is True
+
+
+def parse_positions(raw: Any, include_closed: bool = False) -> Union[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]]:
     """
     Parse Upstox or AngelOne positions response into normalized records.
-    Returns: (long_positions, short_positions)
+    Returns: (long_positions, short_positions) or (long_positions, short_positions, closed_positions)
     """
     if not isinstance(raw, dict):
         raise ValueError("Unexpected positions response: expected a JSON object")
@@ -109,6 +216,7 @@ def parse_positions(raw: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]
 
     long_positions = []
     short_positions = []
+    closed_positions = []
     for p in source_positions:
         if isinstance(p, dict):
             norm_p = dict(p)
@@ -137,6 +245,10 @@ def parse_positions(raw: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]
                     long_positions.append(norm_p)
                 elif qty < 0:
                     short_positions.append(norm_p)
+                else:
+                    closed_positions.append(norm_p)
+    if include_closed:
+        return long_positions, short_positions, closed_positions
     return long_positions, short_positions
 
 

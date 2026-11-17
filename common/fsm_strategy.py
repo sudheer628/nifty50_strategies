@@ -455,9 +455,13 @@ def evaluate_fsm_tick(
     # Realized P&L from closed legs
     realized_pts = 0.0
     if not c_active:
-        realized_pts += c_leg.get("realized_pnl", 0.0)
+        c_pnl = c_leg.get("realized_pnl")
+        if c_pnl is not None:
+            realized_pts += float(c_pnl)
     if not p_active:
-        realized_pts += p_leg.get("realized_pnl", 0.0)
+        p_pnl = p_leg.get("realized_pnl")
+        if p_pnl is not None:
+            realized_pts += float(p_pnl)
 
     # Unrealized P&L from still-active legs
     unrealized_pts = 0.0

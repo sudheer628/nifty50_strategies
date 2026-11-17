@@ -16,9 +16,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 def normalize_cycle(cycle: str) -> str:
     """Normalize strategy cycle name to 3-letter shorthand ('tue' or 'thu')."""
     c = str(cycle or "").lower().strip()
-    if c.startswith("tu") or "5day" in c or "weekly" in c:
+    if c.startswith("tu") or "5day" in c or "weekly" in c or c.startswith("we") or "wed" in c:
         return "tue"
-    if c.startswith("th") or "3day" in c:
+    if c.startswith("th") or "3day" in c or c.startswith("fr") or "fri" in c:
         return "thu"
     return c
 

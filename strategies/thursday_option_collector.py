@@ -49,6 +49,7 @@ from common.expiry import (
 from common.calendar_utils import (
     check_nse_holiday,
     is_thursday_strategy_start_day,
+    is_thursday_extension_day,
     is_thursday_strategy_active_day,
     is_strategy_closing_day,
 )
@@ -126,8 +127,11 @@ def _ensure_thursday_db(week_start: date, expiry_date: date) -> str:
 
 
 def _parse_file_date(value: str) -> date:
-    """Parse a snapshot date stored in YYYYMMDD format."""
-    return datetime.strptime(value, "%Y%m%d").date()
+    """Parse a snapshot date stored in YYYYMMDD or YYYY-MM-DD format."""
+    v = str(value or "").strip()
+    if "-" in v:
+        return datetime.strptime(v, "%Y-%m-%d").date()
+    return datetime.strptime(v, "%Y%m%d").date()
 
 
 def _thursday_cycle_start_for_day(d: date) -> date:
@@ -144,7 +148,7 @@ def _thursday_cycle_start_for_day(d: date) -> date:
     return thu
 
 
-def _active_cycle(snapshot: dict, today: date) -> dict:
+def _active_cycle(snapshot: dict, today: date, is_start_day: Optional[bool] = None) -> dict:
     """Validate and normalize a snapshot that may be active today for the Thursday track."""
     if not snapshot:
         return {}
@@ -174,7 +178,8 @@ def _active_cycle(snapshot: dict, today: date) -> dict:
         return {}
 
     # If today is a new Thursday start day, prior cycle is retired
-    if is_thursday_strategy_start_day(today) and week_start != today:
+    effective_start = is_thursday_strategy_start_day(today) if is_start_day is None else is_start_day
+    if effective_start and week_start != today:
         return {}
     if week_start > today or expiry_date < today:
         return {}
@@ -249,6 +254,12 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         except Exception as alert_retry_exc:
             logger.warning("[Thursday Track] Failed to retry pending order alerts: %s", alert_retry_exc)
 
+    try:
+        from scripts.auto_record_manual_exit import reconcile_broker_positions_with_snapshot
+        reconcile_broker_positions_with_snapshot(track="3day_strategy")
+    except Exception as recon_exc:
+        logger.warning("[3day_strategy] Position reconciliation failed: %s", recon_exc)
+
     today = _today_ist()
 
     # Gate 1: Check market holiday or weekend
@@ -262,10 +273,38 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     today, today.strftime("%A"))
         return True
 
-    is_first_run_of_week = is_thursday_strategy_start_day(today)
+    is_standard_start_day = is_thursday_strategy_start_day(today)
+    is_extension_day = is_thursday_extension_day(today)
     today_str = format_expiry_file(today)
 
     active = load_active_snapshot(filepath=THURSDAY_SNAPSHOT_FILE)
+
+    is_friday_extension_start = False
+    if is_extension_day and not is_standard_start_day:
+        from config import get_config_bool
+        env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_THURSDAY", default=False)
+        is_live_enabled = env_live_buy if execute_buy is None else bool(execute_buy)
+
+        if is_live_enabled:
+            if active and (str(active.get("cycle_id", "")).startswith("CYCLE-FRI-") or active.get("week_start_date") == today_str) and active.get("entry_status") == "FILLED":
+                logger.info("[Friday Extension] Cycle for today (%s) already entered and active: %s", today_str, active.get("cycle_id"))
+            else:
+                from scripts.auto_record_manual_exit import check_prior_cycle_open_positions
+                has_open, is_safe, reason = check_prior_cycle_open_positions(
+                    track="3day_strategy",
+                    active_snapshot=active,
+                    check_cross_track_overlap=True,
+                )
+                if has_open:
+                    logger.info("[Friday Extension] %s. Skipping fresh entry and holding existing Thursday cycle.", reason)
+                elif not is_safe:
+                    logger.warning("[Friday Extension] Broker check unverified (%s). Skipping fresh entry for safety (fail-closed).", reason)
+                else:
+                    logger.info("[Friday Extension] %s. Treating Friday as fresh cycle start day.", reason)
+                    is_friday_extension_start = True
+
+    is_first_run_of_week = is_standard_start_day or is_friday_extension_start
+
     if active and active.get("week_start_date") == today_str:
         entry_st = active.get("entry_status")
         if entry_st in TERMINAL_ENTRY_ABORT_STATUSES or (entry_st and entry_st not in ("FILLED", "PAPER_ENTRY")):
@@ -274,7 +313,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 today_str, entry_st
             )
             return True
-    active_cycle = _active_cycle(active, today)
+    active_cycle = _active_cycle(active, today, is_start_day=is_first_run_of_week)
 
     # ------------------------------------------------------------------
     # Determine expiry, strikes, and spot data
@@ -293,7 +332,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     expiry_date = master_expiry
             except (TypeError, ValueError):
                 pass
-        week_start = _thursday_cycle_start_for_day(today)
+        week_start = today if is_friday_extension_start else _thursday_cycle_start_for_day(today)
 
     expiry_angelone = format_expiry_angelone(expiry_date)
     expiry_file = format_expiry_file(expiry_date)
@@ -467,7 +506,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 )
                 return True
 
-        cycle_id = f"CYCLE-THU-{start_str}"
+        cycle_id = f"CYCLE-FRI-{start_str}" if is_friday_extension_start else f"CYCLE-THU-{start_str}"
 
         # Check if live MARKET BUY entry is enabled (broker per THURSDAY_BROKER)
         from config import get_config_bool
