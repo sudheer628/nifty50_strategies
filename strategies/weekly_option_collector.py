@@ -11,6 +11,8 @@ Simplified weekly cycle model:
       The old snapshot is archived; the new one becomes active.
     - Wednesday through Monday:  Collection continues for the same
       active cycle using the Tuesday buy prices.
+    - Explicitly closed cycles remain terminal and are not replaced by
+      mid-cycle fallback snapshots.
 
 Usage (cron):
     # Every hour from 9:30 AM to 3:30 PM IST, Monday-Friday
@@ -318,12 +320,27 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
     # Determine whether Wednesday extension applies
     is_wednesday_extension_start = False
     if is_extension_day and not is_standard_start_day:
+        is_today_cycle = bool(
+            active
+            and (
+                str(active.get("cycle_id", "")).startswith("CYCLE-WED-")
+                or active.get("week_start_date") == today_str
+            )
+        )
+        if is_today_cycle and active.get("status") == "closed":
+            logger.info(
+                "[Wednesday Extension] Cycle for today (%s) is already closed: %s. "
+                "Skipping another entry.",
+                today_str, active.get("cycle_id")
+            )
+            return True
+
         from config import get_config_bool
         env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_TUESDAY", default=False)
         is_live_enabled = env_live_buy if execute_buy is None else bool(execute_buy)
 
         if is_live_enabled:
-            if active and (str(active.get("cycle_id", "")).startswith("CYCLE-WED-") or active.get("week_start_date") == today_str) and active.get("entry_status") == "FILLED":
+            if is_today_cycle and active.get("entry_status") in ("FILLED", "PAPER_ENTRY"):
                 logger.info("[Wednesday Extension] Cycle for today (%s) already entered and active: %s", today_str, active.get("cycle_id"))
             else:
                 from scripts.auto_record_manual_exit import check_prior_cycle_open_positions
@@ -337,6 +354,13 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     is_wednesday_extension_start = True
 
     is_first_run_of_week = is_standard_start_day or is_wednesday_extension_start
+
+    if active and active.get("status") == "closed" and not is_first_run_of_week:
+        logger.info(
+            "Active cycle %s is closed; skipping mid-cycle fallback snapshot.",
+            active.get("cycle_id", "unknown")
+        )
+        return True
 
     if active and active.get("week_start_date") == today_str:
         entry_st = active.get("entry_status")

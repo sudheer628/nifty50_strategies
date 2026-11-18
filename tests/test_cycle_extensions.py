@@ -164,6 +164,117 @@ def test_wednesday_extension_enters_fresh_cycle_when_broker_positions_zero(monke
     assert snap["put_order_id"] == "WED_PUT_001"
 
 
+@pytest.mark.parametrize("entry_status", ["FILLED", "PAPER_ENTRY", None])
+def test_closed_wednesday_cycle_does_not_start_another_entry(monkeypatch, entry_status):
+    wed = date(2026, 11, 18)
+    monkeypatch.setattr(weekly_collector, "_today_ist", lambda: wed)
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_TUESDAY", "true")
+    closed_snapshot = {
+        "cycle_id": "CYCLE-WED-20261118",
+        "week_start_date": "20261118",
+        "expiry_date": "2026-11-23",
+        "call_strike": 25300,
+        "put_strike": 25400,
+        "call_buy_price": 186.05,
+        "put_buy_price": 230.40,
+        "entry_status": entry_status,
+        "status": "closed",
+    }
+
+    with patch("scripts.auto_record_manual_exit.reconcile_broker_positions_with_snapshot"), \
+         patch("strategies.weekly_option_collector.load_active_snapshot", return_value=closed_snapshot), \
+         patch("strategies.weekly_option_collector.get_nifty_spot") as get_spot, \
+         patch("strategies.weekly_option_collector.save_active_snapshot") as save_snapshot, \
+         patch("common.entry_order_manager.execute_paired_market_buy") as paired_buy:
+        assert weekly_collector.collect_once(dry_run=True)
+
+    get_spot.assert_not_called()
+    save_snapshot.assert_not_called()
+    paired_buy.assert_not_called()
+
+
+def test_closed_cycle_does_not_create_midweek_fallback(monkeypatch):
+    thu = date(2026, 11, 19)
+    monkeypatch.setattr(weekly_collector, "_today_ist", lambda: thu)
+    closed_snapshot = {
+        "cycle_id": "CYCLE-WED-20261118",
+        "week_start_date": "20261118",
+        "expiry_date": "2026-11-23",
+        "call_strike": 25300,
+        "put_strike": 25400,
+        "call_buy_price": 186.05,
+        "put_buy_price": 230.40,
+        "entry_status": "FILLED",
+        "status": "closed",
+    }
+
+    with patch("scripts.auto_record_manual_exit.reconcile_broker_positions_with_snapshot"), \
+         patch("strategies.weekly_option_collector.load_active_snapshot", return_value=closed_snapshot), \
+         patch("strategies.weekly_option_collector.get_nifty_spot") as get_spot, \
+         patch("strategies.weekly_option_collector.save_active_snapshot") as save_snapshot:
+        assert weekly_collector.collect_once(dry_run=True)
+
+    get_spot.assert_not_called()
+    save_snapshot.assert_not_called()
+
+
+@pytest.mark.parametrize("entry_status", ["FILLED", "PAPER_ENTRY", None])
+def test_closed_friday_cycle_does_not_start_another_entry(monkeypatch, entry_status):
+    fri = date(2026, 11, 6)
+    monkeypatch.setattr(thursday_collector, "_today_ist", lambda: fri)
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_THURSDAY", "true")
+    closed_snapshot = {
+        "cycle_id": "CYCLE-FRI-20261106",
+        "week_start_date": "20261106",
+        "expiry_date": "2026-11-10",
+        "call_strike": 25300,
+        "put_strike": 25400,
+        "call_buy_price": 186.05,
+        "put_buy_price": 230.40,
+        "entry_status": entry_status,
+        "status": "closed",
+    }
+
+    with patch("scripts.auto_record_manual_exit.reconcile_broker_positions_with_snapshot"), \
+         patch("strategies.thursday_option_collector.load_active_snapshot", return_value=closed_snapshot), \
+         patch("strategies.thursday_option_collector.get_nifty_spot") as get_spot, \
+         patch("strategies.thursday_option_collector.save_active_snapshot") as save_snapshot, \
+         patch("common.entry_order_manager.execute_paired_market_buy") as paired_buy:
+        assert thursday_collector.collect_once(dry_run=True)
+
+    get_spot.assert_not_called()
+    save_snapshot.assert_not_called()
+    paired_buy.assert_not_called()
+
+
+def test_closed_friday_cycle_does_not_create_later_fallback(monkeypatch):
+    mon = date(2026, 11, 9)
+    monkeypatch.setattr(thursday_collector, "_today_ist", lambda: mon)
+    monkeypatch.setattr(thursday_collector, "check_nse_holiday", lambda _: False)
+    monkeypatch.setattr(thursday_collector, "is_thursday_strategy_active_day", lambda _: True)
+    monkeypatch.setattr(thursday_collector, "is_thursday_strategy_start_day", lambda _: False)
+    closed_snapshot = {
+        "cycle_id": "CYCLE-FRI-20261106",
+        "week_start_date": "20261106",
+        "expiry_date": "2026-11-10",
+        "call_strike": 25300,
+        "put_strike": 25400,
+        "call_buy_price": 186.05,
+        "put_buy_price": 230.40,
+        "entry_status": "FILLED",
+        "status": "closed",
+    }
+
+    with patch("scripts.auto_record_manual_exit.reconcile_broker_positions_with_snapshot"), \
+         patch("strategies.thursday_option_collector.load_active_snapshot", return_value=closed_snapshot), \
+         patch("strategies.thursday_option_collector.get_nifty_spot") as get_spot, \
+         patch("strategies.thursday_option_collector.save_active_snapshot") as save_snapshot:
+        assert thursday_collector.collect_once(dry_run=True)
+
+    get_spot.assert_not_called()
+    save_snapshot.assert_not_called()
+
+
 def test_friday_extension_skips_when_broker_positions_open(monkeypatch):
     fri = date(2026, 11, 6)
     monkeypatch.setattr(thursday_collector, "_today_ist", lambda: fri)

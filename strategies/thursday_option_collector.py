@@ -8,6 +8,7 @@ Parallel strategy track:
       CALL/PUT strikes are selected from Thursday's first-trigger NIFTY LTP, and buy prices are captured.
       The previous 3-day snapshot is archived; the new one becomes active in current_thursday_buy.json.
     - Friday through Monday: Collection continues for this 3-day cycle using the Thursday buy prices.
+    - Explicitly closed cycles remain terminal and cannot trigger another Friday entry.
 
 All strike selection, entry-gate, FSM, and peak-profit logic is reused 1:1 from the tested
 master modules (entry_gate, fsm_strategy, profit_monitor) using their
@@ -281,12 +282,27 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
 
     is_friday_extension_start = False
     if is_extension_day and not is_standard_start_day:
+        is_today_cycle = bool(
+            active
+            and (
+                str(active.get("cycle_id", "")).startswith("CYCLE-FRI-")
+                or active.get("week_start_date") == today_str
+            )
+        )
+        if is_today_cycle and active.get("status") == "closed":
+            logger.info(
+                "[Friday Extension] Cycle for today (%s) is already closed: %s. "
+                "Skipping another entry.",
+                today_str, active.get("cycle_id")
+            )
+            return True
+
         from config import get_config_bool
         env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_THURSDAY", default=False)
         is_live_enabled = env_live_buy if execute_buy is None else bool(execute_buy)
 
         if is_live_enabled:
-            if active and (str(active.get("cycle_id", "")).startswith("CYCLE-FRI-") or active.get("week_start_date") == today_str) and active.get("entry_status") == "FILLED":
+            if is_today_cycle and active.get("entry_status") in ("FILLED", "PAPER_ENTRY"):
                 logger.info("[Friday Extension] Cycle for today (%s) already entered and active: %s", today_str, active.get("cycle_id"))
             else:
                 from scripts.auto_record_manual_exit import check_prior_cycle_open_positions
@@ -304,6 +320,13 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     is_friday_extension_start = True
 
     is_first_run_of_week = is_standard_start_day or is_friday_extension_start
+
+    if active and active.get("status") == "closed" and not is_first_run_of_week:
+        logger.info(
+            "[Thursday Track] Active cycle %s is closed; skipping mid-cycle processing.",
+            active.get("cycle_id", "unknown")
+        )
+        return True
 
     if active and active.get("week_start_date") == today_str:
         entry_st = active.get("entry_status")
