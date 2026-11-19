@@ -56,6 +56,14 @@ from common.unified_strategy_store import update_locked_prices, load_active_stra
 # Test Fixtures & Helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def isolate_broker_reconciliation():
+    with patch("scripts.auto_record_manual_exit.reconcile_broker_positions_with_snapshot", return_value={"reconciled": True}), \
+         patch("strategies.weekly_option_collector.retry_pending_order_alerts"), \
+         patch("strategies.thursday_option_collector.retry_pending_order_alerts"):
+        yield
+
+
 @pytest.fixture
 def sample_contracts():
     call_contract_upstox = {

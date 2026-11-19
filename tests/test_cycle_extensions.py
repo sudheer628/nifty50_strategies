@@ -13,6 +13,8 @@ from common.calendar_utils import is_tuesday_extension_day, is_thursday_extensio
 import strategies.weekly_option_collector as weekly_collector
 import strategies.thursday_option_collector as thursday_collector
 
+config._config_redis_state["unavailable"] = True
+
 
 def test_calendar_extension_days():
     # Wednesday: 2026-11-04 is Wednesday (weekday 2)
@@ -34,7 +36,7 @@ def test_calendar_extension_days():
 def test_wednesday_extension_skips_when_broker_positions_open(monkeypatch):
     wed = date(2026, 11, 4)
     monkeypatch.setattr(weekly_collector, "_today_ist", lambda: wed)
-    monkeypatch.setenv("LIVE_BUY_TRIGGER_TUESDAY", "true")
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_WEDNESDAY", "true")
     monkeypatch.setenv("MOCK_BROKER", "true")
     monkeypatch.setenv("TEST_MODE", "true")
     monkeypatch.setenv("MOCK_BROKER", "true")
@@ -94,7 +96,7 @@ def test_wednesday_extension_skips_when_broker_positions_open(monkeypatch):
 def test_wednesday_extension_enters_fresh_cycle_when_broker_positions_zero(monkeypatch):
     wed = date(2026, 11, 4)
     monkeypatch.setattr(weekly_collector, "_today_ist", lambda: wed)
-    monkeypatch.setenv("LIVE_BUY_TRIGGER_TUESDAY", "true")
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_WEDNESDAY", "true")
     monkeypatch.setenv("MOCK_BROKER", "true")
     monkeypatch.setenv("TEST_MODE", "true")
 
@@ -168,7 +170,7 @@ def test_wednesday_extension_enters_fresh_cycle_when_broker_positions_zero(monke
 def test_closed_wednesday_cycle_does_not_start_another_entry(monkeypatch, entry_status):
     wed = date(2026, 11, 18)
     monkeypatch.setattr(weekly_collector, "_today_ist", lambda: wed)
-    monkeypatch.setenv("LIVE_BUY_TRIGGER_TUESDAY", "true")
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_WEDNESDAY", "true")
     closed_snapshot = {
         "cycle_id": "CYCLE-WED-20261118",
         "week_start_date": "20261118",
@@ -222,7 +224,7 @@ def test_closed_cycle_does_not_create_midweek_fallback(monkeypatch):
 def test_closed_friday_cycle_does_not_start_another_entry(monkeypatch, entry_status):
     fri = date(2026, 11, 6)
     monkeypatch.setattr(thursday_collector, "_today_ist", lambda: fri)
-    monkeypatch.setenv("LIVE_BUY_TRIGGER_THURSDAY", "true")
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_FRIDAY", "true")
     closed_snapshot = {
         "cycle_id": "CYCLE-FRI-20261106",
         "week_start_date": "20261106",
@@ -278,7 +280,7 @@ def test_closed_friday_cycle_does_not_create_later_fallback(monkeypatch):
 def test_friday_extension_skips_when_broker_positions_open(monkeypatch):
     fri = date(2026, 11, 6)
     monkeypatch.setattr(thursday_collector, "_today_ist", lambda: fri)
-    monkeypatch.setenv("LIVE_BUY_TRIGGER_THURSDAY", "true")
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_FRIDAY", "true")
     monkeypatch.setenv("MOCK_BROKER", "true")
     monkeypatch.setenv("TEST_MODE", "true")
 
@@ -336,7 +338,7 @@ def test_friday_extension_skips_when_broker_positions_open(monkeypatch):
 def test_friday_extension_enters_fresh_cycle_when_broker_positions_zero(monkeypatch):
     fri = date(2026, 11, 6)
     monkeypatch.setattr(thursday_collector, "_today_ist", lambda: fri)
-    monkeypatch.setenv("LIVE_BUY_TRIGGER_THURSDAY", "true")
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_FRIDAY", "true")
     monkeypatch.setenv("MOCK_BROKER", "true")
     monkeypatch.setenv("TEST_MODE", "true")
 
@@ -407,11 +409,12 @@ def test_friday_extension_enters_fresh_cycle_when_broker_positions_zero(monkeypa
 
 
 def test_orders_live_gate_alone_does_not_authorize_buy_entry(monkeypatch):
-    """P1 Verification: Setting ORDERS_LIVE_TUE=1 must NOT trigger a live fresh BUY if LIVE_BUY_TRIGGER_TUESDAY is false."""
+    """P1 Verification: Setting ORDERS_LIVE_TUE=1 must NOT trigger a live fresh BUY if LIVE_BUY_TRIGGER_WEDNESDAY is false."""
     wed = date(2026, 11, 4)
     monkeypatch.setattr(weekly_collector, "_today_ist", lambda: wed)
     monkeypatch.setenv("ORDERS_LIVE_TUE", "1")
     monkeypatch.delenv("LIVE_BUY_TRIGGER_TUESDAY", raising=False)
+    monkeypatch.delenv("LIVE_BUY_TRIGGER_WEDNESDAY", raising=False)
     monkeypatch.setenv("MOCK_BROKER", "true")
     monkeypatch.setenv("TEST_MODE", "true")
 
@@ -423,7 +426,7 @@ def test_orders_live_gate_alone_does_not_authorize_buy_entry(monkeypatch):
         ok = weekly_collector.collect_once(dry_run=True)
         assert ok is True
 
-    # Critical: paired buy was NOT executed because LIVE_BUY_TRIGGER_TUESDAY was not enabled
+    # Critical: paired buy was NOT executed because LIVE_BUY_TRIGGER_WEDNESDAY was not enabled
     paired_buy_mock.assert_not_called()
 
 
@@ -431,7 +434,7 @@ def test_broker_fetch_error_skips_extension_fail_closed(monkeypatch):
     """P1 Verification: When broker position check fails with an error, the extension must fail closed (skip fresh entry)."""
     wed = date(2026, 11, 4)
     monkeypatch.setattr(weekly_collector, "_today_ist", lambda: wed)
-    monkeypatch.setenv("LIVE_BUY_TRIGGER_TUESDAY", "true")
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_WEDNESDAY", "true")
     monkeypatch.setenv("MOCK_BROKER", "true")
     monkeypatch.setenv("TEST_MODE", "true")
 

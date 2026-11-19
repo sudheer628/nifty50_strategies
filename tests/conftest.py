@@ -37,7 +37,9 @@ _ISOLATED_ENV = {
     "LIVE_EXIT_TRIGGER_TUESDAY": "false",
     "LIVE_EXIT_TRIGGER_THURSDAY": "false",
     "LIVE_BUY_TRIGGER_TUESDAY": "false",
+    "LIVE_BUY_TRIGGER_WEDNESDAY": "false",
     "LIVE_BUY_TRIGGER_THURSDAY": "false",
+    "LIVE_BUY_TRIGGER_FRIDAY": "false",
     "EXIT_IMMEDIATELY_TUESDAY": "false",
     "EXIT_IMMEDIATELY_THURSDAY": "false",
     # Pin strike grid to canonical 50-pt NIFTY default so tests never depend on live .env
@@ -45,3 +47,10 @@ _ISOLATED_ENV = {
 }
 
 os.environ.update(_ISOLATED_ENV)
+
+# Mark Redis as unavailable so test suite doesn't wait on connection attempts when Redis is offline
+try:
+    import config
+    config._config_redis_state["unavailable"] = True
+except Exception:
+    pass

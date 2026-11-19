@@ -785,6 +785,7 @@ def check_prior_cycle_open_positions(
     broker: Optional[str] = None,
     redis_client=None,
     check_cross_track_overlap: bool = False,
+    broker_wide: bool = False,
 ) -> Tuple[bool, bool, str]:
     """
     Check if the broker currently holds any open positions or open orders
@@ -805,32 +806,58 @@ def check_prior_cycle_open_positions(
     track = uss.normalize_track(track)
     snapshot_file = ACTIVE_SNAPSHOT_FILE if track == "5day_strategy" else THURSDAY_SNAPSHOT_FILE
 
-    snap = active_snapshot or load_active_snapshot(filepath=snapshot_file)
+    snap = active_snapshot or (
+        {} if broker_wide else load_active_snapshot(filepath=snapshot_file)
+    )
 
-    contracts_to_check = _snapshot_cycle_contracts(snap, f"{track}_prior")
-    if contracts_to_check is None:
-        return False, False, (
-            f"Prior cycle snapshot at {snapshot_file} is missing or has incomplete contract identity. "
-            "Entry blocked (fail-closed)."
-        )
-
-    # Friday must also verify Tuesday contracts, even if the local Tuesday snapshot says closed.
-    if check_cross_track_overlap or track == "3day_strategy":
-        try:
-            tue_snap = load_active_snapshot(filepath=ACTIVE_SNAPSHOT_FILE)
-        except Exception as e:
-            logger.warning("[%s] Could not load Tuesday snapshot for overlap check: %s", track, e)
-            return False, False, f"Tuesday overlap snapshot could not be verified: {e} (fail-closed)"
-
-        tue_contracts = _snapshot_cycle_contracts(tue_snap, "tuesday_cycle")
-        if tue_contracts is None:
+    contracts_to_check = []
+    if not broker_wide:
+        contracts_to_check = _snapshot_cycle_contracts(snap, f"{track}_prior")
+        if contracts_to_check is None:
             return False, False, (
-                "Tuesday overlap snapshot is missing or has incomplete contract identity. "
+                f"Prior cycle snapshot at {snapshot_file} is missing or has incomplete contract identity. "
                 "Entry blocked (fail-closed)."
             )
-        contracts_to_check.extend(tue_contracts)
 
-    active_broker = (broker or (snap.get("broker") if snap else None) or os.getenv("TUESDAY_BROKER" if track == "5day_strategy" else "THURSDAY_BROKER") or ("upstox" if track == "5day_strategy" else "angelone")).lower().strip()
+        # Contract-scoped Friday checks also need the Tuesday contracts.
+        if check_cross_track_overlap or track == "3day_strategy":
+            try:
+                tue_snap = load_active_snapshot(filepath=ACTIVE_SNAPSHOT_FILE)
+            except Exception as e:
+                logger.warning("[%s] Could not load Tuesday snapshot for overlap check: %s", track, e)
+                return False, False, f"Tuesday overlap snapshot could not be verified: {e} (fail-closed)"
+
+            tue_contracts = _snapshot_cycle_contracts(tue_snap, "tuesday_cycle")
+            if tue_contracts is None:
+                return False, False, (
+                    "Tuesday overlap snapshot is missing or has incomplete contract identity. "
+                    "Entry blocked (fail-closed)."
+                )
+            contracts_to_check.extend(tue_contracts)
+
+    if broker_wide:
+        try:
+            from config import get_broker_for_track, normalize_broker_name
+            active_broker = normalize_broker_name(
+                broker or get_broker_for_track(track, redis_client=redis_client)
+            )
+            if track == "3day_strategy":
+                tuesday_broker = get_broker_for_track("5day_strategy", redis_client=redis_client)
+                if active_broker != tuesday_broker:
+                    return False, False, (
+                        "Friday broker-wide check requires Tuesday and Thursday tracks to use the same broker; "
+                        f"configured brokers differ ({tuesday_broker} vs {active_broker})."
+                    )
+        except Exception as e:
+            logger.warning("[%s] Could not resolve configured broker for broker-wide check: %s", track, e)
+            return False, False, f"Could not resolve configured broker: {e} (fail-closed)"
+    else:
+        active_broker = (
+            broker
+            or (snap.get("broker") if snap else None)
+            or os.getenv("TUESDAY_BROKER" if track == "5day_strategy" else "THURSDAY_BROKER")
+            or ("upstox" if track == "5day_strategy" else "angelone")
+        ).lower().strip()
 
     # 1. Fetch broker token (Fail-closed on error)
     try:
@@ -869,6 +896,19 @@ def check_prior_cycle_open_positions(
 
     # Check open positions (both long and short: any abs(qty) > 0 is open exposure)
     all_positions = list(long_pos or []) + list(short_pos or [])
+    if broker_wide:
+        for pos in all_positions:
+            qty = _position_quantity(pos)
+            if abs(qty) > 0:
+                sym = pos.get("tradingsymbol") or pos.get("trading_symbol") or "position"
+                return True, False, f"Broker has open exposure on {sym} (qty={qty})"
+
+        for o in orders:
+            st = normalize_order_status(o.get("status") or o.get("orderstatus"))
+            if st in OPEN_ORDER_STATUSES:
+                sym = o.get("tradingsymbol") or o.get("trading_symbol") or f"order {o.get('order_id')}"
+                return True, False, f"Broker has open order {o.get('order_id')} on {sym} (status={st})"
+
     for pos in all_positions:
         qty = _position_quantity(pos)
         if abs(qty) <= 0:
@@ -909,7 +949,8 @@ def check_prior_cycle_open_positions(
                 if match_status:
                     return True, False, f"Broker has open order {o.get('order_id')} for {c['source']} {c['strike']}{c['opt_type']} (status={st})"
 
-    return False, True, "0 open positions or open orders found at broker for relevant contracts"
+    scope = "broker" if broker_wide else "relevant contracts"
+    return False, True, f"0 open positions or open orders found at broker for {scope}"
 
 
 if __name__ == "__main__":

@@ -233,8 +233,8 @@ def get_redis_client():
 # to .env. If Redis is unreachable, or the key is missing/empty/invalid, the .env value
 # is used, then the hardcoded default.
 REDIS_CONFIG_KEYS = (
-    "LIVE_EXIT_TRIGGER_TUESDAY", "EXIT_IMMEDIATELY_TUESDAY", "LIVE_BUY_TRIGGER_TUESDAY",
-    "LIVE_EXIT_TRIGGER_THURSDAY", "EXIT_IMMEDIATELY_THURSDAY", "LIVE_BUY_TRIGGER_THURSDAY",
+    "LIVE_EXIT_TRIGGER_TUESDAY", "EXIT_IMMEDIATELY_TUESDAY", "LIVE_BUY_TRIGGER_TUESDAY", "LIVE_BUY_TRIGGER_WEDNESDAY",
+    "LIVE_EXIT_TRIGGER_THURSDAY", "EXIT_IMMEDIATELY_THURSDAY", "LIVE_BUY_TRIGGER_THURSDAY", "LIVE_BUY_TRIGGER_FRIDAY",
     "LOTS_TUESDAY", "LOTS_THURSDAY", "NIFTY_LOT_SIZE", "STRATEGY_BUY_QTY",
 )
 _TRUE_VALUES = ("true", "1", "yes", "on")
@@ -319,6 +319,25 @@ def get_config_int(key: str, default: int, redis_client=None, min_value: int = 1
         _log_config(key, val, source)
         return val
     return int(default)
+
+
+def set_config_value(key: str, value: str, redis_client=None) -> bool:
+    """
+    Write a configuration value to Redis (remote runtime override).
+
+    Returns True if successfully written to Redis, False otherwise.
+    """
+    r = _config_redis(redis_client)
+    if r is None:
+        logger.warning("Cannot set config key %s in Redis: Redis client unavailable", key)
+        return False
+    try:
+        r.set(key, str(value).strip())
+        logger.info("Config set in Redis: %s=%s", key, value)
+        return True
+    except Exception as exc:
+        logger.warning("Failed to set config key %s in Redis: %s", key, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------

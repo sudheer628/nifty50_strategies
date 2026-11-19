@@ -31,7 +31,8 @@ This strategy:
 
 - **Broker-Segregated Live F&O Trailing Stop-Loss Order Execution**: Dedicated exit managers (`Tuesday-Fno-Exit-Orders-V1.py` on Upstox and `Thursday-Fno-Exit-Orders-V1.py` on the Thursday broker, currently Upstox via `THURSDAY_BROKER`) managing Stop-Loss Market (SL-M) orders, triggered strictly when Alpha FSM exit signals trigger in `sentinel-hermes`
 - **Automated Paired MARKET BUY Strategy Entry**: Collectors (`weekly_option_collector.py` for Tuesday via Upstox, `thursday_option_collector.py` for Thursday via the Thursday broker, currently Upstox) execute paired MARKET BUY orders at strategy start. Includes broker preflight margin checks, back-to-back MARKET submissions, atomic cancel-and-SELL rollback on partial or failed fills, fill price vs reference LTP tracking, and cycle idempotency without Redis dependency.
-- **Wednesday & Friday Cycle Extensions**: Master weekly track extends to Wednesday (`CYCLE-WED-YYYYMMDD`) when `LIVE_BUY_TRIGGER_TUESDAY=true` and the broker is verified to have zero open positions and zero open orders from Tuesday. Parallel 3-day track extends to Friday (`CYCLE-FRI-YYYYMMDD`) when `LIVE_BUY_TRIGGER_THURSDAY=true` and Thursday contracts (plus Tuesday cross-track overlap) have zero open broker exposure.
+- **Wednesday & Friday Cycle Extensions**: Master weekly track extends to Wednesday (`CYCLE-WED-YYYYMMDD`) when `LIVE_BUY_TRIGGER_WEDNESDAY=true` and the broker is verified to have zero open positions and zero open orders broker-wide. Parallel 3-day track extends to Friday (`CYCLE-FRI-YYYYMMDD`) when `LIVE_BUY_TRIGGER_FRIDAY=true` and the broker is verified to have zero open positions and zero open orders broker-wide (plus Tuesday cross-track overlap verification).
+- **Intra-Day Duplicate BUY Elimination & Post-Market Trigger Re-Arm**: When paired MARKET BUY fills (`entry_status == "FILLED"`), the respective day's trigger flag (`LIVE_BUY_TRIGGER_<DAY>`) is immediately auto-disarmed to `"false"` in Redis to prevent same-day duplicates. A dedicated post-market script (`scripts/reset_daily_buy_triggers.py`) running at 15:45 IST re-arms the day's flag to `"true"` for the next cycle (Option A: Tue -> Tue, Wed -> Wed, Thu -> Thu, Fri -> Fri). Mid-day re-arming during market hours (09:15–15:30 IST) is strictly locked out.
 - **Broker Manual-Exit Auto-Reconciliation & Manual Exit Tracking**: Automatically synchronizes trader manual square-offs performed on broker apps into `MANUAL_CLOSED` FSM states via `scripts/auto_record_manual_exit.py` (and CLI `scripts/mark_manual_exit.py`), purges Redis keys, updates unified store/MongoDB, marks cycles closed when all legs terminate, and disarms exit gates (`ORDERS_LIVE_* = 0`). Suppresses false Alpha exit alerts in `sentinel-hermes`.
 
 ### Out of scope
@@ -735,12 +736,15 @@ The active snapshot persists the current cycle's entry buy prices, FSM state (`a
 
 - [x] Wednesday cycle extension for Tuesday master track (`CYCLE-WED-YYYYMMDD`)
 - [x] Friday cycle extension for Thursday 3-day track (`CYCLE-FRI-YYYYMMDD`)
-- [x] Fail-closed broker open exposure and order-book verification (`check_prior_cycle_open_positions`)
+- [x] Fail-closed broker-wide open exposure and order-book verification (`check_prior_cycle_open_positions(..., broker_wide=True)`)
+- [x] 4 distinct day-specific live buy trigger flags (`LIVE_BUY_TRIGGER_TUESDAY`, `LIVE_BUY_TRIGGER_WEDNESDAY`, `LIVE_BUY_TRIGGER_THURSDAY`, `LIVE_BUY_TRIGGER_FRIDAY`)
+- [x] Auto-disarm on fill (`LIVE_BUY_TRIGGER_* = false`) & collector same-day idempotency barrier
+- [x] Post-market daily trigger reset orchestrator (`scripts/reset_daily_buy_triggers.py`) at 15:45 IST with market-hours lockout
 - [x] Strict entry gate separation (entry requires `LIVE_BUY_TRIGGER_*`; `ORDERS_LIVE_*` is exit-only)
 - [x] Always-on broker position auto-reconciliation (`auto_record_manual_exit.py`)
 - [x] Alpha FSM manual close state (`MANUAL_CLOSED`) with full terminal cycle close & exit gate disarm
 - [x] CLI manual exit recording (`scripts/mark_manual_exit.py`)
-- [x] Full test suite: 520+ automated pytest unit tests across 33 test suites passing 100%
+- [x] Full test suite: 540+ automated pytest unit tests across 34 test suites passing 100%
 ---
 
 ## 12. Setup & Running
@@ -901,7 +905,10 @@ All runtime execution gates, sizing, and order mode switches are controlled **ex
 
 | Redis Key | Used by | Description | Default |
 |---|---|---|---|
-| `LIVE_BUY_TRIGGER_TUESDAY` / `LIVE_BUY_TRIGGER_THURSDAY` | Collectors | Live paired MARKET BUY entry (`true`) vs paper simulation (`false`); CLI `--execute-buy` / `--no-execute-buy` still take precedence | `false` |
+| `LIVE_BUY_TRIGGER_TUESDAY` | Tuesday Collector | Live paired MARKET BUY entry for Tuesday master cycle (`true`) vs paper simulation (`false`). Auto-disarmed to `false` upon fill. | `false` |
+| `LIVE_BUY_TRIGGER_WEDNESDAY` | Wednesday Collector | Live paired MARKET BUY entry for Wednesday extension cycle (`true`) vs paper simulation (`false`). Auto-disarmed to `false` upon fill. | `false` |
+| `LIVE_BUY_TRIGGER_THURSDAY` | Thursday Collector | Live paired MARKET BUY entry for Thursday 3-day cycle (`true`) vs paper simulation (`false`). Auto-disarmed to `false` upon fill. | `false` |
+| `LIVE_BUY_TRIGGER_FRIDAY` | Friday Collector | Live paired MARKET BUY entry for Friday extension cycle (`true`) vs paper simulation (`false`). Auto-disarmed to `false` upon fill. | `false` |
 | `LIVE_EXIT_TRIGGER_TUESDAY` / `LIVE_EXIT_TRIGGER_THURSDAY` | Exit managers | Live exit order placement on broker (`true`) vs forced dry-run / manual mode (`false`) | `false` |
 | `EXIT_IMMEDIATELY_TUESDAY` / `EXIT_IMMEDIATELY_THURSDAY` | Exit managers | Instant MARKET square-off mode (`true`) vs trailing SL-M orders (`false`); CLI `--exit-immediately` also forces immediate mode | `false` |
 | `ORDERS_LIVE_TUE` / `ORDERS_LIVE_THU` | Exit managers | Fast 1-millisecond Redis gate: `1` (or `true`) allows exit loop to inspect positions; `0` sleeps in 1ms | `0` (tripped to `1` on entry) |
@@ -911,20 +918,27 @@ All runtime execution gates, sizing, and order mode switches are controlled **ex
 #### Operational Quick Reference (redis-cli):
 
 ```bash
-# --- Tuesday Cycle Controls ---
-redis-cli SET LIVE_BUY_TRIGGER_TUESDAY true      # Enable automated BUY entry at 09:31 IST
+# --- 1. Tuesday Master Track Controls ---
+redis-cli SET LIVE_BUY_TRIGGER_TUESDAY true      # Arm Tuesday paired BUY entry (09:31 IST; auto-disarms on fill)
 redis-cli SET LIVE_EXIT_TRIGGER_TUESDAY true     # Enable live automated EXIT manager
 redis-cli SET EXIT_IMMEDIATELY_TUESDAY true      # Force immediate MARKET exits (skip trailing SL-M)
 redis-cli SET ORDERS_LIVE_TUE 1                  # Manually activate exit gate (set to 0 to idle)
 
-# --- Thursday Cycle Controls ---
-redis-cli SET LIVE_BUY_TRIGGER_THURSDAY true     # Enable automated BUY entry on Thursday
+# --- 2. Wednesday Extension Track Controls ---
+redis-cli SET LIVE_BUY_TRIGGER_WEDNESDAY true    # Arm Wednesday extension paired BUY (09:31 IST; auto-disarms on fill)
+
+# --- 3. Thursday 3-Day Track Controls ---
+redis-cli SET LIVE_BUY_TRIGGER_THURSDAY true     # Arm Thursday paired BUY entry (09:32 IST; auto-disarms on fill)
 redis-cli SET LIVE_EXIT_TRIGGER_THURSDAY true    # Enable live automated Thursday EXIT manager
 redis-cli SET EXIT_IMMEDIATELY_THURSDAY true     # Force immediate MARKET exits on Thursday
 redis-cli SET ORDERS_LIVE_THU 1                  # Manually activate Thursday exit gate
 
-# --- Check Full Runtime Status ---
-redis-cli MGET LIVE_BUY_TRIGGER_TUESDAY LIVE_EXIT_TRIGGER_TUESDAY EXIT_IMMEDIATELY_TUESDAY ORDERS_LIVE_TUE
+# --- 4. Friday Extension Track Controls ---
+redis-cli SET LIVE_BUY_TRIGGER_FRIDAY true       # Arm Friday extension paired BUY (09:32 IST; auto-disarms on fill)
+
+# --- 5. Inspect Runtime Status Across All Cycles ---
+redis-cli MGET LIVE_BUY_TRIGGER_TUESDAY LIVE_BUY_TRIGGER_WEDNESDAY LIVE_BUY_TRIGGER_THURSDAY LIVE_BUY_TRIGGER_FRIDAY
+redis-cli MGET LIVE_EXIT_TRIGGER_TUESDAY LIVE_EXIT_TRIGGER_THURSDAY EXIT_IMMEDIATELY_TUESDAY EXIT_IMMEDIATELY_THURSDAY ORDERS_LIVE_TUE ORDERS_LIVE_THU
 ```
 
 - **Clean Decoupling**: Deleting these dynamic execution keys from `.env` guarantees that runtime behavior is managed dynamically from Redis without modifying files on disk or restarting cron jobs.
@@ -974,6 +988,14 @@ All production crontab schedules execute in **UTC** on AWS EC2:
 
 # 5. Tuesday 09:08 IST (03:38 UTC) - Deferred Close Guard (Only runs if Monday was an NSE Holiday)
 38 3 * * 2 cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/run_thursday_close.py --morning-holiday-check >> /home/ubuntu/logs/nifty50_strategies_thursday_close_$(date +\%F).log 2>&1
+
+# ==============================================================================
+# POST-MARKET DAILY BUY TRIGGER RE-ARM (Tue-Fri 15:45 IST = 10:15 UTC)
+# Re-arms the current day's LIVE_BUY_TRIGGER_<DAY> back to 'true' in Redis (Option A)
+# Enforces market-hours lockout (09:15-15:30 IST) to prevent accidental mid-day re-arming
+# ==============================================================================
+15 10 * * 2-5 cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/reset_daily_buy_triggers.py >> /home/ubuntu/logs/reset_buy_triggers_$(date +\%F).log 2>&1
+
 
 # ============================================================================
 # BROKER-SEGREGATED LIVE F&O TRAILING STOP-LOSS EXIT MANAGERS (Every 1 Minute, UTC)
@@ -1171,12 +1193,16 @@ Automated paired MARKET BUY execution runs at the fresh strategy entry point man
 ### 17.1. Activation Flags & Broker Routing
 
 Live BUY execution requires explicit activation via Redis Cloud or CLI flag:
-- **Tuesday**: `LIVE_BUY_TRIGGER_TUESDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_TUESDAY true`) OR `--execute-buy` CLI flag. Broker per `TUESDAY_BROKER` (currently **Upstox**).
-- **Thursday**: `LIVE_BUY_TRIGGER_THURSDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_THURSDAY true`) OR `--execute-buy` CLI flag. Broker per `THURSDAY_BROKER` (currently **Upstox**).
+- **Tuesday Master Cycle**: `LIVE_BUY_TRIGGER_TUESDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_TUESDAY true`) OR `--execute-buy` CLI flag. Broker per `TUESDAY_BROKER` (currently **Upstox**).
+- **Wednesday Extension Cycle**: `LIVE_BUY_TRIGGER_WEDNESDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_WEDNESDAY true`) OR `--execute-buy` CLI flag. Broker per `TUESDAY_BROKER` (currently **Upstox**). Requires zero broker-wide open positions or orders.
+- **Thursday 3-Day Cycle**: `LIVE_BUY_TRIGGER_THURSDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_THURSDAY true`) OR `--execute-buy` CLI flag. Broker per `THURSDAY_BROKER` (currently **Upstox**).
+- **Friday Extension Cycle**: `LIVE_BUY_TRIGGER_FRIDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_FRIDAY true`) OR `--execute-buy` CLI flag. Broker per `THURSDAY_BROKER` (currently **Upstox**). Requires zero broker-wide open positions or orders (plus Tuesday overlap checks).
+- **Auto-Disarm on Fill**: When paired MARKET BUY orders fill (`entry_status == "FILLED"`), the respective trigger key in Redis is immediately disarmed to `"false"` via `set_config_value()`. This prevents intra-day duplicate executions on subsequent cron ticks (e.g., at 10:01 / 10:02 IST). Smart Entry Gate deferral leaves the flag `true` so deferred ticks can retry; only an actual fill flips it to `false`.
+- **Post-Market Re-Arm**: At 15:45 IST (`15 10 * * 2-5` UTC), `scripts/reset_daily_buy_triggers.py` re-arms the day's trigger key back to `"true"` for the following week's cycle (Option A: Tue -> Tue, Wed -> Wed, Thu -> Thu, Fri -> Fri). Mid-day re-arming is blocked during market hours (09:15–15:30 IST).
 - **CLI Precedence**:
   - `--execute-buy`: Explicitly forces live broker BUY placement regardless of Redis state.
   - `--no-execute-buy`: Explicitly forces paper mode regardless of Redis state.
-  - Flag omitted: Automatically defers to `LIVE_BUY_TRIGGER_TUESDAY` / `LIVE_BUY_TRIGGER_THURSDAY` in Redis Cloud (default: `false`).
+  - Flag omitted: Automatically defers to `LIVE_BUY_TRIGGER_<DAY>` in Redis Cloud (default: `false`).
 - **Alert Decoupling**: Passing `--no-alert` (Tuesday) or `--dry-run` (Thursday) suppresses external Discord milestone notifications only; it does **not** suppress live broker order placement.
 
 ```bash
@@ -1185,6 +1211,10 @@ python strategies/weekly_option_collector.py --execute-buy
 
 # Thursday Live Paired Entry
 python strategies/thursday_option_collector.py --execute-buy
+
+# Status and Dry-Run of Buy Triggers
+python scripts/reset_daily_buy_triggers.py --status
+python scripts/reset_daily_buy_triggers.py --dry-run
 ```
 
 ### 17.2. Preflight Margin Verification
@@ -1268,15 +1298,15 @@ Strategy cycles can now dynamically extend to Wednesday and Friday when prior cy
   Extension Day Trigger       Wednesday (Tuesday track) or Friday (Thursday track)
                                                   │
                                                   ▼
-  Live Buy Authorization?     Is LIVE_BUY_TRIGGER_TUESDAY / THURSDAY true in Redis/.env?
+  Live Buy Authorization?     Is LIVE_BUY_TRIGGER_WEDNESDAY (Wed) or
+                              LIVE_BUY_TRIGGER_FRIDAY (Fri) true in Redis/.env?
                               (ORDERS_LIVE_* is exit-only; does NOT authorize entry)
                                          ├── NO ──► Skip extension (paper mode)
                                          └── YES
                                                   │
                                                   ▼
-  Broker Exposure Guard       check_prior_cycle_open_positions(track)
-                              • Fetches live derivative positions from broker
-                              • Fetches live order book for open/pending orders
+  Broker Exposure Guard       check_prior_cycle_open_positions(track, broker_wide=True)
+                              • Enforces broker-wide check (ANY open position or pending order)
                               • Friday also checks Tuesday cross-track overlap
                                          ├── POSITIONS/ORDERS OPEN ──► Skip entry (hold prior)
                                          ├── UNVERIFIED / ERROR   ──► Skip entry (fail-closed)
@@ -1286,9 +1316,16 @@ Strategy cycles can now dynamically extend to Wednesday and Friday when prior cy
   Fresh Cycle Entry           • Generates CYCLE-WED-YYYYMMDD or CYCLE-FRI-YYYYMMDD
                               • Selects ITM1 strikes at extension day trigger
                               • Submits paired MARKET BUY orders
+                              • Auto-disarms LIVE_BUY_TRIGGER_<DAY>=false in Redis upon fill
                               • Arms Alpha FSM tracking for remainder of week
+                                                  │
+                                                  ▼
+  Post-Market EoD Re-Arm      • scripts/reset_daily_buy_triggers.py at 15:45 IST
+                              • Re-arms the day's trigger back to true for the next cycle
 ```
 
 - **Fail-Closed Safety Guard**: If broker tokens, positions, or order books cannot be verified, `is_safe_to_enter` returns `False`. Fresh entry never proceeds on unverified broker state.
+- **Broker-Wide Check (`broker_wide=True`)**: Verifies that zero open positions (`abs(qty) > 0`) and zero open orders (`OPEN_ORDER_STATUSES`) exist across the entire broker account before allowing extension entry.
 - **Strict Gate Separation**: Entry consent strictly requires `LIVE_BUY_TRIGGER_*`. Exit gate `ORDERS_LIVE_*` never authorizes entry.
+- **Auto-Disarm on Fill**: Successful entry immediately sets `LIVE_BUY_TRIGGER_<DAY>=false` in Redis to eliminate duplicate intra-day submissions.
 - **Exact Contract Matching**: `contract_matches()` verifies underlying (`NIFTY`), strike, option type (`CE`/`PE`), and resolved expiry date. Normalizes statuses with spaces (`"Partially Filled"`, `"Trigger Pending"`) to match open order statuses.

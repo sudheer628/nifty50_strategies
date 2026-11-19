@@ -336,7 +336,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             return True
 
         from config import get_config_bool
-        env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_TUESDAY", default=False)
+        env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_WEDNESDAY", default=False)
         is_live_enabled = env_live_buy if execute_buy is None else bool(execute_buy)
 
         if is_live_enabled:
@@ -344,7 +344,11 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 logger.info("[Wednesday Extension] Cycle for today (%s) already entered and active: %s", today_str, active.get("cycle_id"))
             else:
                 from scripts.auto_record_manual_exit import check_prior_cycle_open_positions
-                has_open, is_safe, reason = check_prior_cycle_open_positions(track="5day_strategy", active_snapshot=active)
+                has_open, is_safe, reason = check_prior_cycle_open_positions(
+                    track="5day_strategy",
+                    active_snapshot=active,
+                    broker_wide=True,
+                )
                 if has_open:
                     logger.info("[Wednesday Extension] %s. Skipping fresh entry and holding existing cycle.", reason)
                 elif not is_safe:
@@ -355,12 +359,13 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
 
     is_first_run_of_week = is_standard_start_day or is_wednesday_extension_start
 
-    if active and active.get("status") == "closed" and not is_first_run_of_week:
-        logger.info(
-            "Active cycle %s is closed; skipping mid-cycle fallback snapshot.",
-            active.get("cycle_id", "unknown")
-        )
-        return True
+    if active and active.get("status") == "closed":
+        if not is_first_run_of_week or active.get("week_start_date") == today_str:
+            logger.info(
+                "Active cycle %s is closed; skipping mid-cycle processing and preventing duplicate entry.",
+                active.get("cycle_id", "unknown")
+            )
+            return True
 
     if active and active.get("week_start_date") == today_str:
         entry_st = active.get("entry_status")
@@ -545,7 +550,19 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             insert_buy_snapshot(db_path, active_cycle)
         else:
             if active and active.get("week_start_date") == today_str:
+                if active.get("status") == "closed":
+                    logger.info(
+                        "Cycle for today (%s) is already closed. Aborting duplicate entry.",
+                        today_str
+                    )
+                    return True
                 entry_st = active.get("entry_status")
+                if entry_st in ("FILLED", "PAPER_ENTRY"):
+                    logger.info(
+                        "Cycle for today (%s) already entered with entry_status='%s'. Aborting duplicate entry.",
+                        today_str, entry_st
+                    )
+                    return True
                 if entry_st in TERMINAL_ENTRY_ABORT_STATUSES or (entry_st and entry_st not in ("FILLED", "PAPER_ENTRY")):
                     logger.info(
                         "Cycle already aborted/skipped for today (%s) with entry_status='%s'. Aborting duplicate entry.",
@@ -557,9 +574,10 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             db_path = _ensure_db(week_start, expiry_date)
             cycle_id = f"CYCLE-WED-{start_str}" if is_wednesday_extension_start else generate_cycle_id(start_str)
 
-            # Check if live MARKET BUY entry is enabled (Tuesday is strictly Upstox)
+            # Check if live MARKET BUY entry is enabled (Tuesday or Wednesday flag)
+            buy_trigger_key = "LIVE_BUY_TRIGGER_WEDNESDAY" if is_wednesday_extension_start else "LIVE_BUY_TRIGGER_TUESDAY"
             from config import get_config_bool
-            env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_TUESDAY", default=False)
+            env_live_buy = get_config_bool(buy_trigger_key, default=False)
             is_live_buy = env_live_buy if execute_buy is None else bool(execute_buy)
 
             call_ref_ltp = call_ltp
@@ -687,6 +705,18 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 put_order_id = buy_res.get("put_order_id")
                 entry_status = "FILLED"
                 broker_name = track_broker
+                try:
+                    from config import set_config_value
+                    if set_config_value(buy_trigger_key, "false"):
+                        logger.info("[Auto-Disarm] Disarmed %s=false in Redis after paired buy fill", buy_trigger_key)
+                    else:
+                        logger.critical(
+                            "[Auto-Disarm] Could not disarm %s after paired buy fill; "
+                            "same-day duplicate prevention now depends on saving the filled cycle snapshot.",
+                            buy_trigger_key,
+                        )
+                except Exception as disarm_exc:
+                    logger.warning("[Auto-Disarm] Failed to auto-disarm %s in Redis: %s", buy_trigger_key, disarm_exc)
             else:
                 call_buy_price = call_ltp
                 put_buy_price = put_ltp

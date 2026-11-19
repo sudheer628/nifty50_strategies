@@ -58,6 +58,8 @@ class CycleSnapshotTests(unittest.TestCase):
             patch("common.unified_strategy_store.append_telemetry_log_to_mongodb"),
             patch("common.unified_strategy_store.reset_cycle_live_logs_in_mongodb"),
             patch("strategies.weekly_option_collector.update_active_fsm_state"),
+            patch("scripts.auto_record_manual_exit.reconcile_broker_positions_with_snapshot"),
+            patch("strategies.weekly_option_collector.retry_pending_order_alerts"),
         )
         for item in patches:
             item.start()
