@@ -791,8 +791,7 @@ def check_prior_cycle_open_positions(
     Check if the broker currently holds any open positions or open orders
     for the exact contracts of the prior cycle (and optionally cross-track overlap).
 
-    Used by Wednesday and Friday cycle extensions to ensure no positions remain
-    before initiating a fresh cycle.
+    Used to ensure zero broker exposure before initiating fresh cycles.
 
     Returns:
         (has_open_exposure: bool, is_safe_to_enter: bool, reason_str: str)
@@ -819,7 +818,7 @@ def check_prior_cycle_open_positions(
                 "Entry blocked (fail-closed)."
             )
 
-        # Contract-scoped Friday checks also need the Tuesday contracts.
+        # Contract-scoped cross-track checks also include Tuesday contracts.
         if check_cross_track_overlap or track == "3day_strategy":
             try:
                 tue_snap = load_active_snapshot(filepath=ACTIVE_SNAPSHOT_FILE)
@@ -845,7 +844,7 @@ def check_prior_cycle_open_positions(
                 tuesday_broker = get_broker_for_track("5day_strategy", redis_client=redis_client)
                 if active_broker != tuesday_broker:
                     return False, False, (
-                        "Friday broker-wide check requires Tuesday and Thursday tracks to use the same broker; "
+                        "Cross-track broker-wide check requires Tuesday and Thursday tracks to use the same broker; "
                         f"configured brokers differ ({tuesday_broker} vs {active_broker})."
                     )
         except Exception as e:

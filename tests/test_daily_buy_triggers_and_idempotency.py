@@ -416,7 +416,7 @@ def test_broker_wide_check_uses_broker_data_without_local_snapshot():
     assert "broker" in reason.lower()
 
 
-def test_friday_broker_wide_check_fails_closed_when_track_brokers_differ():
+def test_cross_track_broker_wide_check_fails_closed_when_track_brokers_differ():
     with patch("config.get_broker_for_track", side_effect=lambda track, **_: {
         "5day_strategy": "upstox",
         "3day_strategy": "angelone",

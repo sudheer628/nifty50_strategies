@@ -422,7 +422,7 @@ def test_order_book_fetch_failure_aborts_manual_reconciliation(mock_snapshot):
         assert any("order book" in err.lower() for err in rec["errors"])
 
 
-def test_unresolved_open_position_fails_closed_in_extension_guard(mock_snapshot):
+def test_unresolved_open_position_fails_closed_in_exposure_guard(mock_snapshot):
     mock_adapter = MagicMock()
     mock_adapter.fetch_positions.return_value = {
         "status": "success",
@@ -456,7 +456,7 @@ def test_unresolved_open_position_aborts_manual_exit_reconciliation(mock_snapsho
     assert any("identity" in error.lower() for error in result["errors"])
 
 
-def test_unresolved_pending_order_fails_closed_in_extension_guard(mock_snapshot):
+def test_unresolved_pending_order_fails_closed_in_exposure_guard(mock_snapshot):
     adapter = MagicMock()
     adapter.fetch_positions.return_value = {"status": "success", "data": []}
     adapter.fetch_order_book.return_value = {
@@ -547,7 +547,7 @@ def test_snapshot_missing_one_leg_fails_closed_with_open_put(mock_snapshot):
     assert "incomplete" in reason.lower()
 
 
-def test_friday_guard_fails_closed_without_tuesday_snapshot(mock_snapshot):
+def test_cross_track_overlap_fails_closed_without_tuesday_snapshot(mock_snapshot):
     thursday_snapshot = {
         "cycle_id": "CYCLE-THU-20261105",
         "expiry_date": "2026-11-10",
@@ -573,7 +573,7 @@ def test_friday_guard_fails_closed_without_tuesday_snapshot(mock_snapshot):
     assert "tuesday overlap snapshot" in reason.lower()
 
 
-def test_friday_guard_checks_tuesday_contracts_even_when_snapshot_says_closed(mock_snapshot):
+def test_cross_track_overlap_checks_tuesday_contracts_even_when_snapshot_says_closed(mock_snapshot):
     thursday_snapshot = {
         "cycle_id": "CYCLE-THU-20261105",
         "expiry_date": "2026-11-10",
