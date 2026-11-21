@@ -19,7 +19,7 @@ Act as a disciplined senior trading systems engineer working inside the `nifty50
 - **Prohibited Flags & Commands**:
   - NEVER run `scripts/Tuesday-Fno-Exit-Orders-V1.py` or `scripts/Thursday-Fno-Exit-Orders-V1.py` with `--execute` or without `--mock`/`--dry-run`.
   - NEVER run `common/entry_order_manager.py` against live broker endpoints.
-  - NEVER set or export live trading flags: `LIVE_EXIT_TRIGGER_TUESDAY=true`, `LIVE_EXIT_TRIGGER_THURSDAY=true`, `LIVE_BUY_TRIGGER_TUESDAY=true`, `LIVE_BUY_TRIGGER_WEDNESDAY=true`, `LIVE_BUY_TRIGGER_THURSDAY=true`, `LIVE_BUY_TRIGGER_FRIDAY=true`, `ORDERS_LIVE_TUE=1`, `ORDERS_LIVE_THU=1`, `ORDERS_LIVE=1`, or `--force-live`.
+  - NEVER set or export live trading flags: `LIVE_EXIT_TRIGGER_TUESDAY=true`, `LIVE_EXIT_TRIGGER_THURSDAY=true`, `LIVE_BUY_TRIGGER_TUESDAY=true`, `LIVE_BUY_TRIGGER_THURSDAY=true`, `ORDERS_LIVE_TUE=1`, `ORDERS_LIVE_THU=1`, `ORDERS_LIVE=1`, or `--force-live`.
   - NEVER alter Redis fast gate keys (`ORDERS_LIVE_TUE`, `ORDERS_LIVE_THU`, `LIVE_BUY_TRIGGER_*`) to trigger live execution.
 - **Testing Standard**: Validate logic exclusively using automated pytest unit tests (`.venv/bin/pytest`) or mock execution fixtures. Live API credentials must never be invoked for testing.
 
@@ -31,21 +31,19 @@ Before making any diagnoses or code edits, inspect the active production runtime
 
 ### Step 2.1: Inspect Crontab Jobs (`crontab -l`)
 Run `crontab -l` in bash to determine which scripts are currently active and their execution cadence:
-- **Master Weekly Track (Tuesday–Monday + Wednesday Extension)**:
+- **Master Weekly Track (Tuesday–Monday 5-Day Strategy)**:
   - `strategies/weekly_option_collector.py` (:01 and :31 past every hour, 04:01–10:01 UTC = 09:31–15:31 IST)
     - Starts standard weekly cycle on Tuesday (`CYCLE-TUE-YYYYMMDD`) when `LIVE_BUY_TRIGGER_TUESDAY=true`. Auto-disarms to `false` in Redis immediately upon fill.
-    - Evaluates Wednesday cycle extension (`CYCLE-WED-YYYYMMDD`) when `LIVE_BUY_TRIGGER_WEDNESDAY=true` and broker is verified to have 0 open positions and 0 pending orders broker-wide. Auto-disarms to `false` in Redis immediately upon fill.
   - `strategies/peak_profit_monitor.py` (:16 and :46 past every hour, 03:46–09:46 UTC)
   - `strategies/monday_gamma_sniper.py` (Mondays every 10m, 07:00–09:50 UTC)
   - `scripts/run_weekly_close.py` (Mondays 10:07 UTC / Tue 03:37 UTC deferred)
-- **Parallel 3-Day Track (Thursday–Monday + Friday Extension)**:
+- **Parallel 3-Day Track (Thursday–Monday 3-Day Strategy)**:
   - `strategies/thursday_option_collector.py` (:02 and :32 past every hour on Mon, Thu, Fri, 04:02–10:02 UTC = 09:32–15:32 IST)
     - Starts standard 3-day cycle on Thursday (`CYCLE-THU-YYYYMMDD`) when `LIVE_BUY_TRIGGER_THURSDAY=true`. Auto-disarms to `false` in Redis immediately upon fill.
-    - Evaluates Friday cycle extension (`CYCLE-FRI-YYYYMMDD`) when `LIVE_BUY_TRIGGER_FRIDAY=true` and broker is verified to have 0 open positions and 0 pending orders broker-wide (and no Tuesday overlap). Auto-disarms to `false` in Redis immediately upon fill.
   - `strategies/peak_profit_monitor.py --track thursday` (:17 and :47 past every hour)
   - `scripts/run_thursday_close.py` (Mondays 10:08 UTC / Tue 03:38 UTC deferred)
 - **Daily Post-Market Buy Trigger Reset Orchestrator (`scripts/reset_daily_buy_triggers.py`)**:
-  - Runs at 15:45 IST (`15 10 * * 2-5` UTC): re-arms the day's buy trigger flag back to `true` in Redis for the next cycle (Option A: Tue -> Tue, Wed -> Wed, Thu -> Thu, Fri -> Fri).
+  - Runs at 15:45 IST (`15 10 * * 2,4` UTC): re-arms the day's buy trigger flag back to `true` in Redis for the next cycle (Tuesday re-arms `LIVE_BUY_TRIGGER_TUESDAY`, Thursday re-arms `LIVE_BUY_TRIGGER_THURSDAY`).
   - Enforces market-hours lockout (09:15-15:30 IST) to block accidental mid-day re-arming.
 - **Live Exit Managers & Broker Manual-Exit Auto-Reconciliation**:
   - `scripts/Tuesday-Fno-Exit-Orders-V1.py` (Every 1 min during market hours)
@@ -124,27 +122,20 @@ AI models often become excessively cautious about rare or extreme failure scenar
 - **No Defensive Bloat**: Never introduce local queue synchronizers, secondary fallback broker adapters, emergency offline stores, or redundant connection pools to guard against catastrophic cloud outages unless the user prompt explicitly requests them.
 - **Focus on Core Trading Logic**: Dedicate engineering effort to signal accuracy, correct strike math, accurate P&L tracking, and fulfilling the user's specific prompt rather than speculating on catastrophic cloud-provider outages.
 
-### Step 4.3: Manual Square-Off & Cycle Extension Invariants
+### Step 4.3: Manual Square-Off & Auto-Disarm Invariants
 - **Broker-Authoritative Manual Exit Sync**:
   - Traders may manually square off one or both strategy legs directly on the broker app at any time.
   - Position reconciliation (`scripts/auto_record_manual_exit.py`) runs at every collector execution (even if `ORDERS_LIVE_*` is 0). It detects zero net position with same-day sell quantity, marks the leg `MANUAL_CLOSED` in Alpha FSM, purges Redis authorization/trailing keys, updates `active_strategies.json`, and syncs MongoDB.
   - When all legs reach terminal states (`HARVESTED_CLOSED`, `TRAILING_STOP_CLOSED`, `SALVAGED_CLOSED`, `MANUAL_CLOSED`), the cycle snapshot is marked `status="closed"`, and exit gates (`ORDERS_LIVE_TUE=0` / `fno:orders_live:tuesday=0` or `ORDERS_LIVE_THU=0` / `fno:orders_live:thursday=0`) are disarmed.
   - In `sentinel-hermes`, exit alerts are strictly suppressed on `MANUAL_CLOSED` legs to prevent bogus alerts for already-closed positions.
-- **Wednesday & Friday Extension Guard (Fail-Closed Policy)**:
-  - Fresh entry on extension days strictly requires its day-specific trigger: `LIVE_BUY_TRIGGER_WEDNESDAY=true` (Wednesday) or `LIVE_BUY_TRIGGER_FRIDAY=true` (Friday). `ORDERS_LIVE_*` is an exit gate and must NEVER authorize buy entry.
-  - `check_prior_cycle_open_positions(track, broker_wide=True)` strictly enforces a **broker-wide** exposure check: ANY open position (`abs(qty) > 0`) or ANY open/pending order (`OPEN_ORDER_STATUSES`) at the broker causes the guard to return `has_open=True, is_safe=False` (fail-closed), skipping fresh extension entry.
-  - If token fetch fails, position fetch fails, order book fetch fails, contract identity is missing, or unverified exposure exists, the guard returns `is_safe_to_enter=False` (fail-closed). Entry proceeds ONLY when zero open exposure and zero open orders are confirmed across the entire broker account.
-  - Friday extensions also verify Tuesday cross-track overlap contracts.
 - **Auto-Disarm on Fill & Collector Idempotency (Elimination of Intra-Day Duplicate BUY Orders)**:
   - When paired MARKET BUY fills (`entry_status == "FILLED"`):
     - For Tuesday cycle: `LIVE_BUY_TRIGGER_TUESDAY` is immediately auto-disarmed to `"false"` in Redis via `set_config_value()`.
-    - For Wednesday extension: `LIVE_BUY_TRIGGER_WEDNESDAY` is immediately auto-disarmed to `"false"` in Redis.
     - For Thursday cycle: `LIVE_BUY_TRIGGER_THURSDAY` is immediately auto-disarmed to `"false"` in Redis.
-    - For Friday extension: `LIVE_BUY_TRIGGER_FRIDAY` is immediately auto-disarmed to `"false"` in Redis.
   - Subsequent cron runs on the same day (e.g. 10:01 / 10:02 IST) see the flag as `false` and skip entry.
   - Collector hard code guard: Both collectors enforce an idempotency barrier before entering: if `week_start_date == today_str and (entry_status in ("FILLED", "PAPER_ENTRY") or status == "closed")`, buy placement is strictly blocked regardless of CLI flags or Redis status.
   - Smart Entry Gate deferral leaves the trigger flag `true` so deferred 10:01/10:31 IST ticks can enter; only an actual `FILLED` status auto-disarms the flag.
-  - Post-market EoD script (`scripts/reset_daily_buy_triggers.py`) re-arms the day's flag to `"true"` at 15:45 IST for the next cycle (Option A: Tue -> Tue, Wed -> Wed, Thu -> Thu, Fri -> Fri). Mid-day re-arming is blocked during market hours (09:15–15:30 IST) unless `--force` is used.
+  - Post-market EoD script (`scripts/reset_daily_buy_triggers.py`) re-arms the day's flag to `"true"` at 15:45 IST on Tuesday (`LIVE_BUY_TRIGGER_TUESDAY`) and Thursday (`LIVE_BUY_TRIGGER_THURSDAY`) for next week's cycles. Mid-day re-arming is blocked during market hours (09:15–15:30 IST) unless `--force` is used.
 - **Exact Contract Matching**:
   - `contract_matches()` enforces matching of underlying (`NIFTY`), strike, option type (`CE`/`PE`), and resolved expiry. Symbols without expiry (e.g. `NIFTY24000CE`) must reject to prevent cross-expiry position confusion.
   - Order statuses with spaces or mixed case (e.g., `"Partially Filled"`, `"Trigger Pending"`) must be normalized using `normalize_order_status()`.

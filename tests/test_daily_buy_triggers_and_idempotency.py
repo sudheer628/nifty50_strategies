@@ -36,9 +36,9 @@ IST = pytz.timezone("Asia/Kolkata")
 
 def test_day_key_mapping():
     assert DAY_KEY_MAP["tuesday"] == "LIVE_BUY_TRIGGER_TUESDAY"
-    assert DAY_KEY_MAP["wednesday"] == "LIVE_BUY_TRIGGER_WEDNESDAY"
     assert DAY_KEY_MAP["thursday"] == "LIVE_BUY_TRIGGER_THURSDAY"
-    assert DAY_KEY_MAP["friday"] == "LIVE_BUY_TRIGGER_FRIDAY"
+    assert "wednesday" not in DAY_KEY_MAP
+    assert "friday" not in DAY_KEY_MAP
 
 
 def test_market_hours_check():
@@ -92,7 +92,7 @@ def test_reset_triggers_dry_run_does_not_call_redis():
     dt_post = datetime(2026, 11, 19, 15, 45, tzinfo=IST)
     with patch("scripts.reset_daily_buy_triggers._now_ist", return_value=dt_post), \
          patch("scripts.reset_daily_buy_triggers.set_config_value") as mock_set:
-        ok = reset_triggers_for_day("wednesday", dry_run=True, force=False)
+        ok = reset_triggers_for_day("thursday", dry_run=True, force=False)
         assert ok is True
         mock_set.assert_not_called()
 
@@ -103,7 +103,7 @@ def test_reset_triggers_all_post_market():
          patch("scripts.reset_daily_buy_triggers.set_config_value", return_value=True) as mock_set:
         ok = reset_triggers_all(dry_run=False, force=False)
         assert ok is True
-        assert mock_set.call_count == 4
+        assert mock_set.call_count == 2
         set_keys = [call[0][0] for call in mock_set.call_args_list]
         assert set_keys == ALL_BUY_KEYS
 
@@ -252,6 +252,67 @@ def test_thursday_collector_blocks_duplicate_buy_when_already_filled_today(monke
          patch("common.entry_order_manager.execute_paired_market_buy", paired_buy_mock):
 
         ok = thursday_collector.collect_once(execute_buy=True)
+        assert ok is True
+        paired_buy_mock.assert_not_called()
+
+
+def test_weekly_collector_blocks_duplicate_buy_when_already_filled_today(monkeypatch):
+    """If current_week_buy.json has entry_status=FILLED for today's start date, fresh buy is strictly blocked."""
+    tue = date(2026, 11, 17)
+    monkeypatch.setattr(weekly_collector, "_today_ist", lambda: tue)
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_TUESDAY", "true")
+
+    filled_snapshot = {
+        "strategy_name": "nifty50_weekly_option_collector",
+        "cycle_id": "CYCLE-TUE-20261117",
+        "week_start_date": "20261117",
+        "expiry_date": "2026-11-24",
+        "call_strike": 25200,
+        "put_strike": 25400,
+        "call_buy_price": 150.0,
+        "put_buy_price": 160.0,
+        "entry_status": "FILLED",
+        "status": "ongoing",
+    }
+
+    paired_buy_mock = MagicMock()
+    with patch("scripts.auto_record_manual_exit.reconcile_broker_positions_with_snapshot"), \
+         patch("strategies.weekly_option_collector.load_active_snapshot", return_value=filled_snapshot), \
+         patch("strategies.weekly_option_collector._active_cycle", return_value={}), \
+         patch("strategies.weekly_option_collector.get_nifty_spot", return_value={"ltp": 25300.0, "open": 25250.0, "close": 25200.0}), \
+         patch("strategies.weekly_option_collector.get_nifty_option_chain", return_value={"call": {"ltp": 150.0}, "put": {"ltp": 160.0}}), \
+         patch("common.entry_order_manager.execute_paired_market_buy", paired_buy_mock):
+
+        ok = weekly_collector.collect_once(execute_buy=True)
+        assert ok is True
+        paired_buy_mock.assert_not_called()
+
+
+def test_weekly_collector_blocks_duplicate_buy_when_cycle_closed_today(monkeypatch):
+    """If current_week_buy.json was started today and closed today, fresh buy is strictly blocked."""
+    tue = date(2026, 11, 17)
+    monkeypatch.setattr(weekly_collector, "_today_ist", lambda: tue)
+    monkeypatch.setenv("LIVE_BUY_TRIGGER_TUESDAY", "true")
+
+    closed_snapshot = {
+        "strategy_name": "nifty50_weekly_option_collector",
+        "cycle_id": "CYCLE-TUE-20261117",
+        "week_start_date": "20261117",
+        "expiry_date": "2026-11-24",
+        "call_strike": 25200,
+        "put_strike": 25400,
+        "call_buy_price": 150.0,
+        "put_buy_price": 160.0,
+        "entry_status": "FILLED",
+        "status": "closed",
+    }
+
+    paired_buy_mock = MagicMock()
+    with patch("scripts.auto_record_manual_exit.reconcile_broker_positions_with_snapshot"), \
+         patch("strategies.weekly_option_collector.load_active_snapshot", return_value=closed_snapshot), \
+         patch("common.entry_order_manager.execute_paired_market_buy", paired_buy_mock):
+
+        ok = weekly_collector.collect_once(execute_buy=True)
         assert ok is True
         paired_buy_mock.assert_not_called()
 

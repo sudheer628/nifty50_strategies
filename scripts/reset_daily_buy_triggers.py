@@ -1,12 +1,10 @@
 """
 Post-Market Daily Paired BUY Trigger Re-arm Script.
 
-Runs at 15:45 IST on trading days (Tue-Fri) to re-arm the daily paired BUY trigger
-in Redis for the next cycle (Option A):
+Runs at 15:45 IST on trading days (Tue & Thu) to re-arm the daily paired BUY trigger
+in Redis for the next cycle:
     - Tuesday 15:45 IST:   Sets LIVE_BUY_TRIGGER_TUESDAY=true (for next Tuesday)
-    - Wednesday 15:45 IST: Sets LIVE_BUY_TRIGGER_WEDNESDAY=true (for next Wednesday)
     - Thursday 15:45 IST:  Sets LIVE_BUY_TRIGGER_THURSDAY=true (for next Thursday)
-    - Friday 15:45 IST:    Sets LIVE_BUY_TRIGGER_FRIDAY=true (for next Friday)
 
 Safety Guards:
     - Fails closed if invoked during live market hours (09:15-15:30 IST) unless --force is supplied.
@@ -35,9 +33,7 @@ MARKET_CLOSE = time(15, 30)
 
 DAY_KEY_MAP = {
     "tuesday": "LIVE_BUY_TRIGGER_TUESDAY",
-    "wednesday": "LIVE_BUY_TRIGGER_WEDNESDAY",
     "thursday": "LIVE_BUY_TRIGGER_THURSDAY",
-    "friday": "LIVE_BUY_TRIGGER_FRIDAY",
 }
 
 ALL_BUY_KEYS = list(DAY_KEY_MAP.values())
@@ -129,10 +125,10 @@ def reset_triggers_all(
 
 def main():
     parser = argparse.ArgumentParser(description="Post-Market Daily Paired BUY Trigger Re-arm Script")
-    parser.add_argument("--day", choices=["tuesday", "wednesday", "thursday", "friday", "tue", "wed", "thu", "fri"],
+    parser.add_argument("--day", choices=["tuesday", "thursday", "tue", "thu"],
                         help="Specific day to re-arm (defaults to today's weekday in IST)")
-    parser.add_argument("--all", action="store_true", help="Re-arm all 4 daily buy triggers (Tue, Wed, Thu, Fri)")
-    parser.add_argument("--status", action="store_true", help="Display current status of all 4 daily buy triggers")
+    parser.add_argument("--all", action="store_true", help="Re-arm both daily buy triggers (Tue & Thu)")
+    parser.add_argument("--status", action="store_true", help="Display current status of both daily buy triggers")
     parser.add_argument("--dry-run", action="store_true", help="Simulate without writing to Redis")
     parser.add_argument("--force", action="store_true", help="Force reset even during market hours")
     args = parser.parse_args()
@@ -151,14 +147,14 @@ def main():
 
     if args.day:
         normalized_day = {
-            "tue": "tuesday", "wed": "wednesday", "thu": "thursday", "fri": "friday"
+            "tue": "tuesday", "thu": "thursday"
         }.get(args.day.lower(), args.day.lower())
     else:
         now_ist = _now_ist()
         normalized_day = now_ist.strftime("%A").lower()
 
     if normalized_day not in DAY_KEY_MAP:
-        logger.info("[Trigger Reset] Today (%s) is not an active strategy buy day (Tue-Fri only). No action taken.", normalized_day.capitalize())
+        logger.info("[Trigger Reset] Today (%s) is not an active strategy buy day (Tue & Thu only). No action taken.", normalized_day.capitalize())
         return 0
 
     ok = reset_triggers_for_day(normalized_day, dry_run=args.dry_run, force=args.force, redis_client=r)

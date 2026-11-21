@@ -50,7 +50,6 @@ from common.expiry import (
 from common.calendar_utils import (
     check_nse_holiday,
     is_thursday_strategy_start_day,
-    is_thursday_extension_day,
     is_thursday_strategy_active_day,
     is_strategy_closing_day,
 )
@@ -274,53 +273,10 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     today, today.strftime("%A"))
         return True
 
-    is_standard_start_day = is_thursday_strategy_start_day(today)
-    is_extension_day = is_thursday_extension_day(today)
+    is_first_run_of_week = is_thursday_strategy_start_day(today)
     today_str = format_expiry_file(today)
 
     active = load_active_snapshot(filepath=THURSDAY_SNAPSHOT_FILE)
-
-    is_friday_extension_start = False
-    if is_extension_day and not is_standard_start_day:
-        is_today_cycle = bool(
-            active
-            and (
-                str(active.get("cycle_id", "")).startswith("CYCLE-FRI-")
-                or active.get("week_start_date") == today_str
-            )
-        )
-        if is_today_cycle and active.get("status") == "closed":
-            logger.info(
-                "[Friday Extension] Cycle for today (%s) is already closed: %s. "
-                "Skipping another entry.",
-                today_str, active.get("cycle_id")
-            )
-            return True
-
-        from config import get_config_bool
-        env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_FRIDAY", default=False)
-        is_live_enabled = env_live_buy if execute_buy is None else bool(execute_buy)
-
-        if is_live_enabled:
-            if is_today_cycle and active.get("entry_status") in ("FILLED", "PAPER_ENTRY"):
-                logger.info("[Friday Extension] Cycle for today (%s) already entered and active: %s", today_str, active.get("cycle_id"))
-            else:
-                from scripts.auto_record_manual_exit import check_prior_cycle_open_positions
-                has_open, is_safe, reason = check_prior_cycle_open_positions(
-                    track="3day_strategy",
-                    active_snapshot=active,
-                    check_cross_track_overlap=True,
-                    broker_wide=True,
-                )
-                if has_open:
-                    logger.info("[Friday Extension] %s. Skipping fresh entry and holding existing Thursday cycle.", reason)
-                elif not is_safe:
-                    logger.warning("[Friday Extension] Broker check unverified (%s). Skipping fresh entry for safety (fail-closed).", reason)
-                else:
-                    logger.info("[Friday Extension] %s. Treating Friday as fresh cycle start day.", reason)
-                    is_friday_extension_start = True
-
-    is_first_run_of_week = is_standard_start_day or is_friday_extension_start
 
     if active and active.get("status") == "closed":
         if not is_first_run_of_week or active.get("week_start_date") == today_str:
@@ -357,7 +313,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     expiry_date = master_expiry
             except (TypeError, ValueError):
                 pass
-        week_start = today if is_friday_extension_start else _thursday_cycle_start_for_day(today)
+        week_start = _thursday_cycle_start_for_day(today)
 
     expiry_angelone = format_expiry_angelone(expiry_date)
     expiry_file = format_expiry_file(expiry_date)
@@ -543,10 +499,10 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                 )
                 return True
 
-        cycle_id = f"CYCLE-FRI-{start_str}" if is_friday_extension_start else f"CYCLE-THU-{start_str}"
+        cycle_id = f"CYCLE-THU-{start_str}"
 
-        # Check if live MARKET BUY entry is enabled (Thursday or Friday flag)
-        buy_trigger_key = "LIVE_BUY_TRIGGER_FRIDAY" if is_friday_extension_start else "LIVE_BUY_TRIGGER_THURSDAY"
+        # Check if live MARKET BUY entry is enabled (Thursday flag)
+        buy_trigger_key = "LIVE_BUY_TRIGGER_THURSDAY"
         from config import get_config_bool
         env_live_buy = get_config_bool(buy_trigger_key, default=False)
         is_live_buy = env_live_buy if execute_buy is None else bool(execute_buy)

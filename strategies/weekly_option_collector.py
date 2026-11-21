@@ -59,7 +59,6 @@ from common.expiry import (
 from common.calendar_utils import (
     check_nse_holiday,
     is_strategy_start_day,
-    is_tuesday_extension_day,
     is_strategy_closing_day,
     get_strategy_cycle_role,
 )
@@ -311,53 +310,10 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         logger.info("Today (%s) is an NSE market holiday or weekend. Skipping data collection.", today)
         return True
 
-    is_standard_start_day = is_strategy_start_day(today)
-    is_extension_day = is_tuesday_extension_day(today)
+    is_first_run_of_week = is_strategy_start_day(today)
     today_str = format_expiry_file(today)
 
     active = load_active_snapshot()
-
-    # Determine whether Wednesday extension applies
-    is_wednesday_extension_start = False
-    if is_extension_day and not is_standard_start_day:
-        is_today_cycle = bool(
-            active
-            and (
-                str(active.get("cycle_id", "")).startswith("CYCLE-WED-")
-                or active.get("week_start_date") == today_str
-            )
-        )
-        if is_today_cycle and active.get("status") == "closed":
-            logger.info(
-                "[Wednesday Extension] Cycle for today (%s) is already closed: %s. "
-                "Skipping another entry.",
-                today_str, active.get("cycle_id")
-            )
-            return True
-
-        from config import get_config_bool
-        env_live_buy = get_config_bool("LIVE_BUY_TRIGGER_WEDNESDAY", default=False)
-        is_live_enabled = env_live_buy if execute_buy is None else bool(execute_buy)
-
-        if is_live_enabled:
-            if is_today_cycle and active.get("entry_status") in ("FILLED", "PAPER_ENTRY"):
-                logger.info("[Wednesday Extension] Cycle for today (%s) already entered and active: %s", today_str, active.get("cycle_id"))
-            else:
-                from scripts.auto_record_manual_exit import check_prior_cycle_open_positions
-                has_open, is_safe, reason = check_prior_cycle_open_positions(
-                    track="5day_strategy",
-                    active_snapshot=active,
-                    broker_wide=True,
-                )
-                if has_open:
-                    logger.info("[Wednesday Extension] %s. Skipping fresh entry and holding existing cycle.", reason)
-                elif not is_safe:
-                    logger.warning("[Wednesday Extension] Broker check unverified (%s). Skipping fresh entry for safety (fail-closed).", reason)
-                else:
-                    logger.info("[Wednesday Extension] %s. Treating Wednesday as fresh cycle start day.", reason)
-                    is_wednesday_extension_start = True
-
-    is_first_run_of_week = is_standard_start_day or is_wednesday_extension_start
 
     if active and active.get("status") == "closed":
         if not is_first_run_of_week or active.get("week_start_date") == today_str:
@@ -385,7 +341,7 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         week_start = active_cycle["week_start"]
     else:
         expiry_date = get_next_weekly_expiry(today)
-        week_start = today if is_wednesday_extension_start else _cycle_start_for_day(today)
+        week_start = _cycle_start_for_day(today)
 
     expiry_angelone = format_expiry_angelone(expiry_date)
     expiry_file = format_expiry_file(expiry_date)
@@ -572,10 +528,10 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
 
             # --- Genuinely fresh cycle: capture new buy prices ---
             db_path = _ensure_db(week_start, expiry_date)
-            cycle_id = f"CYCLE-WED-{start_str}" if is_wednesday_extension_start else generate_cycle_id(start_str)
+            cycle_id = generate_cycle_id(start_str)
 
-            # Check if live MARKET BUY entry is enabled (Tuesday or Wednesday flag)
-            buy_trigger_key = "LIVE_BUY_TRIGGER_WEDNESDAY" if is_wednesday_extension_start else "LIVE_BUY_TRIGGER_TUESDAY"
+            # Check if live MARKET BUY entry is enabled (Tuesday flag)
+            buy_trigger_key = "LIVE_BUY_TRIGGER_TUESDAY"
             from config import get_config_bool
             env_live_buy = get_config_bool(buy_trigger_key, default=False)
             is_live_buy = env_live_buy if execute_buy is None else bool(execute_buy)

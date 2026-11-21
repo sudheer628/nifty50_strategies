@@ -253,25 +253,3 @@ def get_thursday_strategy_cycle_role(target_date: Optional[date] = None) -> str:
         return "REGULAR_DAY"
 
     return "OFF_CYCLE"
-
-
-def is_tuesday_extension_day(target_date: Optional[date] = None) -> bool:
-    """
-    Returns True if target_date is Wednesday (weekday 2) and not an exchange holiday.
-    This serves as the extension day for the Tuesday 5-day cycle.
-    """
-    today = target_date if target_date else date.today()
-    if check_nse_holiday(today):
-        return False
-    return today.weekday() == 2
-
-
-def is_thursday_extension_day(target_date: Optional[date] = None) -> bool:
-    """
-    Returns True if target_date is Friday (weekday 4) and not an exchange holiday.
-    This serves as the extension day for the Thursday 3-day cycle.
-    """
-    today = target_date if target_date else date.today()
-    if check_nse_holiday(today):
-        return False
-    return today.weekday() == 4

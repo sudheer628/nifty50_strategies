@@ -37,9 +37,7 @@ _ISOLATED_ENV = {
     "LIVE_EXIT_TRIGGER_TUESDAY": "false",
     "LIVE_EXIT_TRIGGER_THURSDAY": "false",
     "LIVE_BUY_TRIGGER_TUESDAY": "false",
-    "LIVE_BUY_TRIGGER_WEDNESDAY": "false",
     "LIVE_BUY_TRIGGER_THURSDAY": "false",
-    "LIVE_BUY_TRIGGER_FRIDAY": "false",
     "EXIT_IMMEDIATELY_TUESDAY": "false",
     "EXIT_IMMEDIATELY_THURSDAY": "false",
     # Pin strike grid to canonical 50-pt NIFTY default so tests never depend on live .env
