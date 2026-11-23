@@ -186,7 +186,7 @@ def auto_record_manual_exit(
     result["fsm_status_before"] = current_status
     result["fsm_buy_price"] = fsm_leg.get("buy_price")
 
-    if current_status in ("HARVESTED_CLOSED", "TRAILING_STOP_CLOSED", "SALVAGED_CLOSED", "MANUAL_CLOSED"):
+    if current_status in ("HARVESTED_CLOSED", "TRAILING_STOP_CLOSED", "SALVAGED_CLOSED", "MANUAL_CLOSED", "PROFIT_TARGET_CLOSED"):
         result["info"] = f"Leg already closed with status {current_status}"
         logger.info("[%s] %s %s already closed (%s)", track, strike, option_type, current_status)
         result["success"] = True  # Already handled
@@ -352,7 +352,7 @@ def auto_record_manual_exit(
             # Check if both legs are closed
             c_st = new_fsm.get("call_leg", {}).get("status")
             p_st = new_fsm.get("put_leg", {}).get("status")
-            terminal_statuses = ("HARVESTED_CLOSED", "TRAILING_STOP_CLOSED", "SALVAGED_CLOSED", "MANUAL_CLOSED")
+            terminal_statuses = ("HARVESTED_CLOSED", "TRAILING_STOP_CLOSED", "SALVAGED_CLOSED", "MANUAL_CLOSED", "PROFIT_TARGET_CLOSED")
             both_legs_closed = (c_st in terminal_statuses and p_st in terminal_statuses)
             if both_legs_closed:
                 strat["status"] = "closed"
@@ -390,7 +390,7 @@ def auto_record_manual_exit(
 
             c_st = new_fsm.get("call_leg", {}).get("status")
             p_st = new_fsm.get("put_leg", {}).get("status")
-            terminal_statuses = ("HARVESTED_CLOSED", "TRAILING_STOP_CLOSED", "SALVAGED_CLOSED", "MANUAL_CLOSED")
+            terminal_statuses = ("HARVESTED_CLOSED", "TRAILING_STOP_CLOSED", "SALVAGED_CLOSED", "MANUAL_CLOSED", "PROFIT_TARGET_CLOSED")
             both_legs_closed = (c_st in terminal_statuses and p_st in terminal_statuses)
 
             if (not remaining) or both_legs_closed:

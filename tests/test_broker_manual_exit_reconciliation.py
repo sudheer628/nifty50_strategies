@@ -607,3 +607,31 @@ def test_cross_track_overlap_checks_tuesday_contracts_even_when_snapshot_says_cl
     assert has_open is True
     assert is_safe is False
     assert "tuesday_cycle_call" in reason
+
+
+def test_auto_record_manual_exit_ignores_profit_target_closed_legs(mock_snapshot):
+    snap_file, active_file = mock_snapshot
+    with open(snap_file, "r") as f:
+        snap = json.load(f)
+    snap["alpha_fsm"]["call_leg"]["status"] = "PROFIT_TARGET_CLOSED"
+    snap["alpha_fsm"]["call_leg"]["exit_price"] = 180.0
+    with open(snap_file, "w") as f:
+        json.dump(snap, f)
+
+    res = auto_record_manual_exit(
+        track="5day_strategy",
+        broker="upstox",
+        strike=24000,
+        option_type="CE",
+        expiry_iso="2026-11-03",
+        sell_price=180.0,
+        sell_ts=1793682800,
+        sell_qty=65,
+        redis_client=MockRedis(),
+    )
+    assert res["success"] is True
+    assert "already closed with status PROFIT_TARGET_CLOSED" in res["info"]
+    with open(snap_file, "r") as f:
+        updated_snap = json.load(f)
+    assert updated_snap["alpha_fsm"]["call_leg"]["status"] == "PROFIT_TARGET_CLOSED"
+

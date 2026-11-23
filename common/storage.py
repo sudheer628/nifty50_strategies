@@ -719,15 +719,32 @@ def update_snapshot_for_profit_target_exit(
     call_leg = alpha_fsm.setdefault("call_leg", {})
     put_leg = alpha_fsm.setdefault("put_leg", {})
 
+    call_buy = call_leg.get("buy_price") or snapshot.get("call_buy_price")
+    put_buy = put_leg.get("buy_price") or snapshot.get("put_buy_price")
+
     call_leg["status"] = "PROFIT_TARGET_CLOSED"
     if call_exit_price is not None:
         call_leg["exit_price"] = round(float(call_exit_price), 2)
+        if call_buy is not None:
+            call_leg["realized_pnl"] = round(float(call_exit_price) - float(call_buy), 2)
 
     put_leg["status"] = "PROFIT_TARGET_CLOSED"
     if put_exit_price is not None:
         put_leg["exit_price"] = round(float(put_exit_price), 2)
+        if put_buy is not None:
+            put_leg["realized_pnl"] = round(float(put_exit_price) - float(put_buy), 2)
+
+    c_pnl = call_leg.get("realized_pnl") or 0.0
+    p_pnl = put_leg.get("realized_pnl") or 0.0
+    total_pnl = round(float(c_pnl) + float(p_pnl), 2)
 
     alpha_fsm["state"] = "FLAT"
+    alpha_fsm["realized_pnl_pts"] = total_pnl
+    alpha_fsm["unrealized_pnl_pts"] = 0.0
+    alpha_fsm["total_gainloss"] = total_pnl
+    cost = float(call_buy or 0.0) + float(put_buy or 0.0)
+    if cost > 0:
+        alpha_fsm["roi_pct"] = round((total_pnl / cost) * 100.0, 2)
     snapshot["status"] = "closed"
     snapshot["closed_at"] = int(datetime.now(timezone.utc).timestamp())
     snapshot["close_reason"] = "PROFIT_TARGET_20PCT"

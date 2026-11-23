@@ -215,8 +215,12 @@ class ProfitTargetExitTests(unittest.TestCase):
             put_leg = reloaded_snap["alpha_fsm"]["put_leg"]
             self.assertEqual(call_leg["status"], "PROFIT_TARGET_CLOSED")
             self.assertEqual(call_leg["exit_price"], 190.0)
+            self.assertEqual(call_leg["realized_pnl"], 40.0)
             self.assertEqual(put_leg["status"], "PROFIT_TARGET_CLOSED")
             self.assertEqual(put_leg["exit_price"], 170.0)
+            self.assertEqual(put_leg["realized_pnl"], 20.0)
+            self.assertEqual(reloaded_snap["alpha_fsm"]["realized_pnl_pts"], 60.0)
+            self.assertEqual(reloaded_snap["alpha_fsm"]["state"], "FLAT")
 
     @patch("common.profit_monitor.send_peak_alert_discord", return_value=True)
     @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
