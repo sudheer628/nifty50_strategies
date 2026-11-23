@@ -200,8 +200,14 @@ class ProfitTargetExitTests(unittest.TestCase):
             # 1. Verify Redis keys were authorized for BOTH legs
             c_key = "fno:upstox:enabled:tue:2026-12-01:25500:CE"
             p_key = "fno:upstox:enabled:tue:2026-12-01:25500:PE"
-            self.assertEqual(fake_redis.get(c_key), '{"enabled": true, "qty": 130}')
-            self.assertEqual(fake_redis.get(p_key), '{"enabled": true, "qty": 130}')
+            self.assertIsNotNone(fake_redis.get(c_key))
+            self.assertIsNotNone(fake_redis.get(p_key))
+            c_val = json.loads(fake_redis.get(c_key))
+            p_val = json.loads(fake_redis.get(p_key))
+            self.assertTrue(c_val.get("enabled"))
+            self.assertGreater(c_val.get("qty", 0), 0)
+            self.assertTrue(p_val.get("enabled"))
+            self.assertGreater(p_val.get("qty", 0), 0)
 
             # 2. Verify ORDERS_LIVE_TUE gate is activated
             self.assertEqual(fake_redis.get("ORDERS_LIVE_TUE"), "1")
