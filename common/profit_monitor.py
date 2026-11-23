@@ -23,6 +23,7 @@ import requests
 from config import (
     NIFTY_LOT_SIZE,
     PEAK_ALERT_MIN_PROFIT_PCT,
+    PROFIT_TARGET_EXIT_PCT,
     PEAK_ALERT_HYSTERESIS_PCT,
     PEAK_ALERT_HYSTERESIS_PTS,
     PEAK_ALERT_ENABLED,
@@ -30,8 +31,9 @@ from config import (
     DISCORD_EXIT_3DAY,
     DISCORD_EXIT_5DAY,
     SQLITE_DIR,
+    get_config_float,
 )
-from common.storage import update_active_peak_state
+from common.storage import update_active_peak_state, update_snapshot_for_profit_target_exit
 
 logger = logging.getLogger("nifty50_strategies.profit_monitor")
 tz_ist = pytz.timezone("Asia/Kolkata")
@@ -240,6 +242,8 @@ def evaluate_peak_profit(
     snapshot_filepath: Optional[str] = None,
     track_label: str = "5-Day Tuesday Strategy",
     track: Optional[str] = None,
+    redis_client: Optional[Any] = None,
+    active_strategies_filepath: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], bool, str]:
     """
     Evaluate current strangle profit against the cycle's high-water mark.
@@ -301,6 +305,9 @@ def evaluate_peak_profit(
 
     call_is_closed = bool(call_leg_data.get("exit_price") is not None or "CLOSED" in call_raw_status)
     put_is_closed = bool(put_leg_data.get("exit_price") is not None or "CLOSED" in put_raw_status)
+    call_is_active = (call_leg_data.get("status") == "ACTIVE") and (call_leg_data.get("exit_price") is None) and (not call_is_closed)
+    put_is_active = (put_leg_data.get("status") == "ACTIVE") and (put_leg_data.get("exit_price") is None) and (not put_is_closed)
+    both_legs_active = call_is_active and put_is_active
 
     effective_call_ltp = float(call_leg_data["exit_price"]) if call_is_closed and call_leg_data.get("exit_price") is not None else call_ltp
     effective_put_ltp = float(put_leg_data["exit_price"]) if put_is_closed and put_leg_data.get("exit_price") is not None else put_ltp
@@ -408,8 +415,9 @@ def evaluate_peak_profit(
     moneyness = str(snapshot.get("moneyness") or ("ITM" if put_strike > call_strike else "OTM")).upper()
     total_extrinsic = float(snapshot.get("total_extrinsic") or 0.0)
     extrinsic_pnl_pct = round((combined_pnl_pts / total_extrinsic) * 100.0, 2) if total_extrinsic > 0 else 0.0
+    profit_target_pct = get_config_float("PROFIT_TARGET_EXIT_PCT", PROFIT_TARGET_EXIT_PCT)
     # Option-A: Strict Total Premium basis (no extrinsic shortcut qualifying early)
-    profit_meets_min = combined_pnl_pct >= PEAK_ALERT_MIN_PROFIT_PCT
+    profit_meets_min = combined_pnl_pct >= profit_target_pct
 
     is_retry_at_peak = (
         combined_pnl_pts >= previous_peak_pts
@@ -441,7 +449,19 @@ def evaluate_peak_profit(
         return (
             peak_state,
             False,
-            f"New peak (+{combined_pnl_pct:.1f}%{ext_note} / +{combined_pnl_pts:.1f} pts) is below minimum {PEAK_ALERT_MIN_PROFIT_PCT:.1f}% threshold",
+            f"New peak (+{combined_pnl_pct:.1f}%{ext_note} / +{combined_pnl_pts:.1f} pts) is below minimum {profit_target_pct:.1f}% threshold",
+        )
+
+    # 20% Profit Target Exit Rule:
+    # Requires BOTH legs to be currently ACTIVE.
+    # If one or both legs have already exited via Alpha FSM or manual square-off,
+    # the 20% profit exit cannot be applied; only Alpha FSM manages the remaining open leg.
+    if not both_legs_active:
+        _persist_peak(peak_state)
+        return (
+            peak_state,
+            False,
+            f"Profit target exit skipped (+{combined_pnl_pct:.1f}% / +{combined_pnl_pts:.1f} pts): one or both legs already exited (Call active={call_is_active}, Put active={put_is_active}). Only Alpha FSM manages remaining leg.",
         )
 
     alerts_today = peak_state.get("alerts_sent_today", 0)
@@ -485,11 +505,17 @@ def evaluate_peak_profit(
         "call_ltp": effective_call_ltp,
         "call_pnl_pts": pnl["call_pnl_pts"],
         "call_is_closed": call_is_closed,
+        "call_is_active": call_is_active,
         "put_strike": put_strike,
         "put_buy": put_buy,
         "put_ltp": effective_put_ltp,
         "put_pnl_pts": pnl["put_pnl_pts"],
         "put_is_closed": put_is_closed,
+        "put_is_active": put_is_active,
+        "both_legs_active": both_legs_active,
+        "snapshot_filepath": snapshot_filepath,
+        "redis_client": redis_client,
+        "active_strategies_filepath": active_strategies_filepath,
         "combined_pnl_pts": combined_pnl_pts,
         "combined_pnl_pct": combined_pnl_pct,
         "combined_pnl_inr": combined_pnl_inr,
@@ -529,36 +555,88 @@ def evaluate_peak_profit(
 
 def on_new_peak(event: Dict[str, Any]) -> bool:
     """
-    Dispatch hook triggered whenever a new peak profit passes all validation filters.
+    Dispatch hook triggered whenever a qualifying profit peak passes all validation filters.
 
-    Phase 1 (Active): Generates and dispatches styled Discord webhook notification.
-    Phase 2 (Future Seam): Connect live broker order placement (Angel One / Upstox)
-                           when ready to automate live futures/options trading.
+    1. Live F&O Exit Authorization: Authorizes full strangle square-off (both CALL + PUT legs)
+       in Redis and syncs to MongoDB & active_strategies.json if both legs are currently ACTIVE.
+    2. Snapshot State Transition: Marks alpha_fsm legs as PROFIT_TARGET_CLOSED and cycle as CLOSED.
+    3. Discord Webhook Notification: Dispatches real-time styled Discord webhook notification.
 
     Returns:
         bool: True if alert dispatch succeeded (or in dry_run), False on failure.
     """
     fsm_info = f" | FSM: {event.get('fsm_state')} ({event.get('fsm_total_gainloss', 0.0):+.2f} pts)" if event.get("fsm_state") else ""
     logger.info(
-        "🚀 [PEAK PROFIT TRIGGER] New Peak: +%.2f%% (+%.2f pts / ₹%.2f) on cycle %s (Alert #%d today%s)",
+        "🚀 [PROFIT TARGET TRIGGER] Qualifying Profit Target: +%.2f%% (+%.2f pts / ₹%.2f) on cycle %s (Alert #%d today%s)",
         event["combined_pnl_pct"],
         event["combined_pnl_pts"],
         event["combined_pnl_inr"],
         event["cycle_id"],
-        event["alerts_sent_today"],
+        event.get("alerts_sent_today", 1),
         fsm_info,
     )
 
-    # 1. Dispatch Discord Alert
+    both_legs_active = bool(event.get("both_legs_active", True))
+    track_slug = event.get("track") or "weekly"
+    strategy_track = "3day_strategy" if track_slug == "thursday" else "5day_strategy"
+
+    # 1. Authorize Live F&O Exit Orders in Redis & sync to unified strategy store
+    # Strictly decoupled from Discord: order authorization happens first so Discord failures never block exits.
+    if both_legs_active:
+        try:
+            from common.unified_strategy_store import record_exit_signal_and_sync_mongo
+            ts = event.get("timestamp") or int(time.time())
+            exit_recorded = record_exit_signal_and_sync_mongo(
+                track=strategy_track,
+                exit_category="peak_20pct",
+                signal_data={
+                    "symbol": "20% PROFIT TARGET ACHIEVED",
+                    "simple_action": "EXIT_BOTH",
+                    "action_raw": "EXIT_BOTH",
+                    "leg": "BOTH",
+                    "peak_pnl_pct": event.get("combined_pnl_pct"),
+                    "peak_pnl_pts": event.get("combined_pnl_pts"),
+                    "peak_pnl_inr": event.get("combined_pnl_inr"),
+                    "timestamp": ts,
+                    "time_ist": _get_ist_date_str(ts),
+                    "details": f"20% Profit Target Achieved: Strangle reached +{event.get('combined_pnl_pct', 0.0):.2f}% (+{event.get('combined_pnl_pts', 0.0):.2f} pts / ₹{event.get('combined_pnl_inr', 0.0):.2f}). Both legs active; full exit authorized.",
+                },
+                filepath=event.get("active_strategies_filepath"),
+                redis_client=event.get("redis_client"),
+            )
+            if exit_recorded:
+                logger.info("✅ Successfully authorized live 20%% profit target exit in Redis and unified strategy store for %s", strategy_track)
+            else:
+                logger.info("ℹ️ Live exit authorization skipped or already recorded for %s", strategy_track)
+        except Exception as e_auth:
+            logger.error("❌ Failed to authorize live exit in unified strategy store: %s", e_auth)
+
+        # 2. Update snapshot alpha_fsm to PROFIT_TARGET_CLOSED and mark cycle closed
+        try:
+            snap_file = event.get("snapshot_filepath")
+            if not snap_file:
+                from config import ACTIVE_SNAPSHOT_FILE, THURSDAY_SNAPSHOT_FILE
+                snap_file = THURSDAY_SNAPSHOT_FILE if track_slug == "thursday" else ACTIVE_SNAPSHOT_FILE
+            update_snapshot_for_profit_target_exit(
+                filepath=snap_file,
+                call_exit_price=event.get("call_ltp"),
+                put_exit_price=event.get("put_ltp"),
+                cycle_id=event.get("cycle_id"),
+            )
+        except Exception as e_snap:
+            logger.error("❌ Failed to update snapshot for profit target exit: %s", e_snap)
+    else:
+        logger.info(
+            "⚠️ [PROFIT TARGET SKIP] Strangle reached +%.2f%%, but one or both legs have already exited (call_closed=%s, put_closed=%s). 20%% profit exit is invalid and suppressed.",
+            event.get("combined_pnl_pct", 0.0), event.get("call_is_closed"), event.get("put_is_closed")
+        )
+
+    # 3. Dispatch Discord Alert
     dispatch_success = True
     if not event.get("dry_run"):
         dispatch_success = send_peak_alert_discord(event)
     else:
         logger.info("  [DRY-RUN] Peak alert Discord dispatch skipped.")
-
-    # 2. Future Live Broker Hook Seam:
-    # if dispatch_success and config.LIVE_EXECUTION_ENABLED:
-    #     broker_execute_order(event)
 
     return dispatch_success
 
@@ -772,26 +850,6 @@ def send_peak_alert_discord(event: Dict[str, Any]) -> bool:
                 "✅ Peak-profit alert Discord notification successfully dispatched (HTTP %d)",
                 response.status_code,
             )
-            # Post-Discord Hook: Persist exit event to MongoDB & active_strategies.json
-            try:
-                from common.unified_strategy_store import record_exit_signal_and_sync_mongo
-                track = "3day_strategy" if event.get("track") == "thursday" else "5day_strategy"
-                record_exit_signal_and_sync_mongo(
-                    track=track,
-                    exit_category="peak_20pct",
-                    signal_data={
-                        "symbol": "20% PEAK PROFIT REACHED",
-                        "simple_action": "20% PEAK PROFIT REACHED",
-                        "peak_pnl_pct": event.get("combined_pnl_pct"),
-                        "peak_pnl_pts": event.get("combined_pnl_pts"),
-                        "peak_pnl_inr": event.get("combined_pnl_inr"),
-                        "timestamp": event.get("timestamp_epoch") or int(time.time()),
-                        "time_ist": event.get("timestamp"),
-                        "details": f"Peak profit reached +{event.get('combined_pnl_pct', 0.0):.2f}% (+{event.get('combined_pnl_pts', 0.0):.2f} pts / ₹{event.get('combined_pnl_inr', 0.0):.2f})",
-                    },
-                )
-            except Exception as e_hook:
-                logger.warning("Failed to record peak exit to unified strategy store: %s", e_hook)
             return True
         else:
             logger.error(

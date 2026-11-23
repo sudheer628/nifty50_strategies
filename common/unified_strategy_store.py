@@ -1125,6 +1125,46 @@ def record_exit_signal_and_sync_mongo(
                     return False
                 entry["call_triggered"] = True
                 entry["put_triggered"] = True
+        elif cat == "peak_20pct":
+            # Single-alert idempotency: if already triggered, skip re-triggering
+            if entry.get("triggered"):
+                logger.info(
+                    "Exit category 'peak_20pct' already triggered for %s cycle %s. Preserving original exit event.",
+                    norm, strat.get("cycle_id")
+                )
+                return False
+            # Peak 20% exit is strictly invalid if Alpha FSM has already exited any leg
+            alpha_fsm_signals = exits.get("alpha_fsm", {})
+            if alpha_fsm_signals.get("call_triggered") or alpha_fsm_signals.get("put_triggered"):
+                logger.info(
+                    "Peak 20%% profit exit rejected for %s cycle %s: Alpha FSM has already triggered an exit (call=%s, put=%s).",
+                    norm, strat.get("cycle_id"), alpha_fsm_signals.get("call_triggered"), alpha_fsm_signals.get("put_triggered")
+                )
+                return False
+            # Check active snapshot: both legs must be ACTIVE and not closed
+            cycle = "tue" if norm == "5day_strategy" else "thu"
+            snap_file = ACTIVE_SNAPSHOT_FILE if cycle == "tue" else THURSDAY_SNAPSHOT_FILE
+            try:
+                if os.path.exists(snap_file):
+                    with open(snap_file, "r", encoding="utf-8") as sf:
+                        snap_data = json.load(sf)
+                    if snap_data and snap_data.get("cycle_id") == strat.get("cycle_id"):
+                        if snap_data.get("status") == "closed":
+                            logger.info("Peak 20%% exit rejected: cycle snapshot %s is already closed.", snap_data.get("cycle_id"))
+                            return False
+                        snap_fsm = snap_data.get("alpha_fsm") or {}
+                        c_leg = snap_fsm.get("call_leg") or {}
+                        p_leg = snap_fsm.get("put_leg") or {}
+                        c_closed = bool(c_leg.get("exit_price") is not None or "CLOSED" in f"{c_leg.get('status', '')} {c_leg.get('state', '')}".upper())
+                        p_closed = bool(p_leg.get("exit_price") is not None or "CLOSED" in f"{p_leg.get('status', '')} {p_leg.get('state', '')}".upper())
+                        if c_closed or p_closed:
+                            logger.info(
+                                "Peak 20%% exit rejected for %s: leg already closed in snapshot (call_closed=%s, put_closed=%s).",
+                                norm, c_closed, p_closed
+                            )
+                            return False
+            except Exception as e_snap:
+                logger.debug("Snapshot check notice in peak_20pct exit: %s", e_snap)
         else:
             # Single-alert idempotency: if already triggered, skip re-triggering
             if entry.get("triggered"):
@@ -1165,8 +1205,8 @@ def record_exit_signal_and_sync_mongo(
 
     sync_active_cycles_to_mongodb(active)
 
-    # Publish Redis exit authorization strictly for Alpha FSM exits
-    if cat == "alpha_fsm":
+    # Publish Redis exit authorization for Alpha FSM exits and qualifying Peak 20% Profit exits
+    if cat in ("alpha_fsm", "peak_20pct"):
         strat_broker = strat.get("broker") or (strat.get("day1_locked_price") or {}).get("broker")
         publish_exit_authorization_to_redis(
             track=norm,

@@ -140,6 +140,7 @@ PUT_IV_SPIKE_THRESHOLD = float(os.getenv("PUT_IV_SPIKE_THRESHOLD", "18.0"))  # I
 # Peak profit alert parameters
 # ---------------------------------------------------------------------------
 PEAK_ALERT_MIN_PROFIT_PCT = float(os.getenv("PEAK_ALERT_MIN_PROFIT_PCT", "20.0"))
+PROFIT_TARGET_EXIT_PCT = float(os.getenv("PROFIT_TARGET_EXIT_PCT", os.getenv("PEAK_ALERT_MIN_PROFIT_PCT", "20.0")))
 PEAK_ALERT_HYSTERESIS_PCT = float(os.getenv("PEAK_ALERT_HYSTERESIS_PCT", "5.0"))
 PEAK_ALERT_HYSTERESIS_PTS = float(os.getenv("PEAK_ALERT_HYSTERESIS_PTS", "10.0"))
 PEAK_ALERT_ENABLED = os.getenv("PEAK_ALERT_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -236,6 +237,7 @@ REDIS_CONFIG_KEYS = (
     "LIVE_EXIT_TRIGGER_TUESDAY", "EXIT_IMMEDIATELY_TUESDAY", "LIVE_BUY_TRIGGER_TUESDAY",
     "LIVE_EXIT_TRIGGER_THURSDAY", "EXIT_IMMEDIATELY_THURSDAY", "LIVE_BUY_TRIGGER_THURSDAY",
     "LOTS_TUESDAY", "LOTS_THURSDAY", "NIFTY_LOT_SIZE", "STRATEGY_BUY_QTY",
+    "PROFIT_TARGET_EXIT_PCT",
 )
 _TRUE_VALUES = ("true", "1", "yes", "on")
 _FALSE_VALUES = ("false", "0", "no", "off")
@@ -319,6 +321,23 @@ def get_config_int(key: str, default: int, redis_client=None, min_value: int = 1
         _log_config(key, val, source)
         return val
     return int(default)
+
+
+def get_config_float(key: str, default: float, redis_client=None, min_value: Optional[float] = None) -> float:
+    """Float setting (percentages / profit targets): Redis first, then .env, then default.
+    Non-float or values below min_value in one tier are logged and the next tier is used."""
+    for raw, source in _config_candidates(key, redis_client):
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid float %s=%r from %s; trying next source", key, raw, source)
+            continue
+        if min_value is not None and val < min_value:
+            logger.warning("Ignoring %s=%r from %s (must be >= %f); trying next source", key, raw, source, min_value)
+            continue
+        _log_config(key, val, source)
+        return val
+    return float(default)
 
 
 def set_config_value(key: str, value: str, redis_client=None) -> bool:

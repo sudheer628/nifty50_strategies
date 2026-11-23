@@ -692,6 +692,54 @@ def update_active_peak_state(peak_data: dict, filepath: Optional[str] = None) ->
     return True
 
 
+def update_snapshot_for_profit_target_exit(
+    filepath: Optional[str] = None,
+    call_exit_price: Optional[float] = None,
+    put_exit_price: Optional[float] = None,
+    cycle_id: Optional[str] = None,
+) -> bool:
+    """
+    Update active snapshot alpha_fsm legs to PROFIT_TARGET_CLOSED and mark cycle closed
+    upon automated 20% strangle profit exit.
+    """
+    target_file = filepath or ACTIVE_SNAPSHOT_FILE
+    snapshot = load_active_snapshot(filepath=target_file)
+    if not snapshot:
+        return False
+
+    expected_cycle = cycle_id or snapshot.get("cycle_id")
+    if cycle_id and snapshot.get("cycle_id") and snapshot.get("cycle_id") != cycle_id:
+        logger.warning(
+            "Cycle ID mismatch in update_snapshot_for_profit_target_exit: snapshot has %s, expected %s. Skipping.",
+            snapshot.get("cycle_id"), cycle_id
+        )
+        return False
+
+    alpha_fsm = snapshot.setdefault("alpha_fsm", {})
+    call_leg = alpha_fsm.setdefault("call_leg", {})
+    put_leg = alpha_fsm.setdefault("put_leg", {})
+
+    call_leg["status"] = "PROFIT_TARGET_CLOSED"
+    if call_exit_price is not None:
+        call_leg["exit_price"] = round(float(call_exit_price), 2)
+
+    put_leg["status"] = "PROFIT_TARGET_CLOSED"
+    if put_exit_price is not None:
+        put_leg["exit_price"] = round(float(put_exit_price), 2)
+
+    alpha_fsm["state"] = "FLAT"
+    snapshot["status"] = "closed"
+    snapshot["closed_at"] = int(datetime.now(timezone.utc).timestamp())
+    snapshot["close_reason"] = "PROFIT_TARGET_20PCT"
+
+    _atomic_write_json(target_file, snapshot)
+    logger.info(
+        "Updated snapshot %s for cycle %s: legs marked PROFIT_TARGET_CLOSED (call_exit=%s, put_exit=%s), cycle marked CLOSED",
+        target_file, expected_cycle, call_exit_price, put_exit_price
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Cycle ID generator
 # ---------------------------------------------------------------------------

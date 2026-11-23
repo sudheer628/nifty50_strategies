@@ -412,8 +412,8 @@ class UnifiedStrategyStoreTests(unittest.TestCase):
             mock_redis.set.assert_any_call(call_key, json.dumps({"enabled": True, "qty": 65}), ex=604800)
 
     @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
-    def test_peak_exit_does_not_publish_redis_authorization(self, mock_mongo):
-        """Verify peak_20pct exit does NOT publish Redis authorization keys or activate safety gates."""
+    def test_peak_exit_publishes_redis_authorization_when_both_legs_active(self, mock_mongo):
+        """Verify peak_20pct exit publishes Redis authorization keys and activates safety gates when both legs are active."""
         mock_redis = MagicMock()
         init_or_rotate_cycle(
             "5day_strategy",
@@ -443,13 +443,60 @@ class UnifiedStrategyStoreTests(unittest.TestCase):
         )
         self.assertTrue(res)
 
-        # Ensure Redis was NEVER called to set keys or activate gates
-        mock_redis.set.assert_not_called()
-        self.assertEqual(len(mock_redis.set.mock_calls), 0)
+        # Ensure Redis was called to set authorized keys and activate ORDERS_LIVE_TUE
+        set_calls = [c[0][0] for c in mock_redis.set.call_args_list]
+        self.assertIn("fno:upstox:enabled:tue:2026-11-03:22900:CE", set_calls)
+        self.assertIn("fno:upstox:enabled:tue:2026-11-03:23100:PE", set_calls)
+        self.assertIn("ORDERS_LIVE_TUE", set_calls)
 
-        # JSON should still reflect the peak exit
+        # JSON should reflect the peak exit
         data = load_active_strategies(filepath=self.test_json)
         self.assertTrue(data["5day_strategy"]["exit_signals"]["peak_20pct"]["triggered"])
+
+    @patch("common.unified_strategy_store.get_mongodb_db", return_value=None)
+    def test_peak_exit_rejected_if_alpha_fsm_already_exited(self, mock_mongo):
+        """Verify peak_20pct exit is rejected if Alpha FSM has already triggered an exit on either leg."""
+        mock_redis = MagicMock()
+        init_or_rotate_cycle(
+            "5day_strategy",
+            {
+                "cycle_id": "CYCLE-TUE-20261027",
+                "call_strike": 22900,
+                "put_strike": 23100,
+                "expiry_date": "2026-11-03",
+            },
+            filepath=self.test_json,
+        )
+
+        # Alpha FSM exits CALL leg first
+        res_fsm = record_exit_signal_and_sync_mongo(
+            "5day_strategy",
+            "alpha_fsm",
+            {
+                "action": "TAKE_PROFIT_CALL",
+                "leg": "CALL",
+                "timestamp": 1700007000,
+            },
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        self.assertTrue(res_fsm)
+        mock_redis.reset_mock()
+
+        # Now peak_20pct tries to trigger
+        res_peak = record_exit_signal_and_sync_mongo(
+            "5day_strategy",
+            "peak_20pct",
+            {
+                "action": "PEAK_20PCT",
+                "peak_pnl_pct": 22.0,
+            },
+            filepath=self.test_json,
+            redis_client=mock_redis,
+        )
+        # Must be rejected because Alpha FSM already exited CALL
+        self.assertFalse(res_peak)
+        mock_redis.set.assert_not_called()
 
     def test_strategy_lock_reentrant(self):
         """Verify strategy_lock is re-entrant and does not self-deadlock."""
