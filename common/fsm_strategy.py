@@ -45,6 +45,11 @@ except ImportError:
     import os
     PUT_IV_SPIKE_THRESHOLD = float(os.getenv("PUT_IV_SPIKE_THRESHOLD", "18.0"))
 
+try:
+    from common.pivot_calculator import get_pivot_zone
+except ImportError:
+    get_pivot_zone = None
+
 
 def fetch_option_surface_iv(
     call_strike: int,
@@ -209,6 +214,7 @@ def init_fsm_state(
             "intrinsic_at_entry": round(float(call_intrinsic), 2),
             "extrinsic_at_entry": round(c_ext, 2),
             "status": "ACTIVE",  # ACTIVE | HARVESTED_CLOSED | TRAILING_STOP_CLOSED | SALVAGED_CLOSED | MANUAL_CLOSED
+            "shadow_status": "ACTIVE",
             "exit_price": None,
             "exit_ts": None,
             "exit_reason": "",
@@ -222,6 +228,7 @@ def init_fsm_state(
             "intrinsic_at_entry": round(float(put_intrinsic), 2),
             "extrinsic_at_entry": round(p_ext, 2),
             "status": "ACTIVE",  # ACTIVE | HARVESTED_CLOSED | SALVAGED_CLOSED | TRAILING_STOP_CLOSED
+            "shadow_status": "ACTIVE",
             "exit_price": None,
             "exit_ts": None,
             "exit_reason": "",
@@ -246,6 +253,10 @@ def evaluate_fsm_tick(
     put_delta: Optional[float] = None,
     put_iv: Optional[float] = None,
     call_iv: Optional[float] = None,
+    nifty_spot: Optional[float] = None,
+    daily_pivots: Optional[Dict[str, float]] = None,
+    pivot_accel_enabled: bool = False,
+    pivot_shadow_mode: bool = True,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """
     Evaluates current option prices against FSM rules and transitions states if triggered.
@@ -293,6 +304,20 @@ def evaluate_fsm_tick(
     else:
         trail_buffer = 0.10  # 10% tight buffer on Expiry Eve/Monday morning (DTE: 1, 0)
 
+    # Detect NIFTY floor pivot zone independently from leg profit eligibility
+    market_zone = None
+    if daily_pivots and nifty_spot is not None and get_pivot_zone is not None:
+        market_zone = get_pivot_zone(nifty_spot, daily_pivots)
+
+    # Variables for shadow tracking
+    c_in_pivot_zone = False
+    c_pivot_zone = market_zone
+    shadow_c_trail_buffer = trail_buffer
+
+    p_in_pivot_zone = False
+    p_pivot_zone = market_zone
+    shadow_p_trail_buffer = trail_buffer
+
     # ------------------------------------------------------------------
     # 1. Evaluate CALL LEG
     # ------------------------------------------------------------------
@@ -310,7 +335,23 @@ def evaluate_fsm_tick(
         if c_profit_qualified and has_c_iv_expansion:
             call_iv_spike = True
 
-        effective_c_trail_buffer = 0.08 if call_iv_spike else trail_buffer
+        # Pivot zone acceleration qualification for Call (R1, R2 resistance zones when profit-qualified)
+        if c_pivot_zone in ("R1", "R2") and c_profit_qualified:
+            c_in_pivot_zone = True
+
+        # Buffer precedence hierarchy (buffers can only tighten, never loosen):
+        # Base buffer (trail_buffer) can be tightened by IV spike (8%) or Pivot acceleration (5%)
+        effective_c_trail_buffer = min(
+            trail_buffer,
+            0.08 if call_iv_spike else 1.0,
+            0.05 if (c_in_pivot_zone and pivot_accel_enabled) else 1.0,
+        )
+
+        shadow_c_trail_buffer = min(
+            trail_buffer,
+            0.08 if call_iv_spike else 1.0,
+            0.05 if c_in_pivot_zone else 1.0,
+        )
 
         # Update dynamic trailing stop once in profit
         # In ITM: arm once gain exceeds 30% of extrinsic risk or 15% of premium
@@ -319,6 +360,32 @@ def evaluate_fsm_tick(
         if c_ltp >= c_arm_threshold:
             candidate_stop = round(c_peak * (1.0 - effective_c_trail_buffer), 2)
             c_leg["trailing_stop"] = max(c_leg.get("trailing_stop", 0.0), candidate_stop)
+
+            # Persistent ratcheting shadow trailing stop (carried forward through cycle)
+            candidate_shadow_stop = round(c_peak * (1.0 - shadow_c_trail_buffer), 2)
+            c_leg["shadow_trailing_stop"] = max(c_leg.get("shadow_trailing_stop", 0.0), candidate_shadow_stop)
+            if c_in_pivot_zone and c_pivot_zone:
+                c_leg["shadow_pivot_zone"] = c_pivot_zone
+
+        # Counterfactual Shadow Breach Evaluation:
+        # Check if the persistent shadow trailing stop would have triggered an exit
+        c_breach_arm = (c_buy + max(35.0, c_ext * 0.40)) if moneyness == "ITM" else (c_buy * 1.40)
+        c_shadow_status = c_leg.get("shadow_status", "ACTIVE")
+        if (
+            c_shadow_status == "ACTIVE"
+            and c_leg.get("shadow_pivot_zone") is not None
+            and c_peak >= c_breach_arm
+            and c_leg.get("shadow_trailing_stop", 0.0) > 0
+        ):
+            if c_ltp <= c_leg["shadow_trailing_stop"]:
+                c_leg["shadow_status"] = "SHADOW_TRAILING_STOP_CLOSED"
+                c_leg["shadow_exit_price"] = c_ltp
+                c_leg["shadow_exit_ts"] = current_ts
+                c_leg["shadow_exit_reason"] = (
+                    f"SHADOW_TRAILING_STOP_HIT (Peak: ₹{c_peak:.2f}, Stop: ₹{c_leg['shadow_trailing_stop']:.2f}, "
+                    f"PivotZone: {c_leg.get('shadow_pivot_zone')})"
+                )
+                c_leg["shadow_realized_pnl"] = round(c_ltp - c_buy, 2)
 
         # Rule 1A: House Money Harvest (covers extrinsic risk or entire strangle cost)
         c_gain = c_ltp - c_buy
@@ -336,16 +403,24 @@ def evaluate_fsm_tick(
             c_leg["exit_ts"] = current_ts
             c_leg["exit_reason"] = f"HOUSE_MONEY_HARVEST (Gain: +{round(c_gain, 1)} pts >= Extrinsic Risk {total_extrinsic_risk} pts)"
             c_leg["realized_pnl"] = round(c_gain, 2)
+            if c_leg.get("shadow_status") == "ACTIVE":
+                c_leg["shadow_status"] = "HARVESTED_CLOSED"
+                c_leg["shadow_exit_price"] = c_ltp
+                c_leg["shadow_exit_ts"] = current_ts
+                c_leg["shadow_exit_reason"] = c_leg["exit_reason"]
+                c_leg["shadow_realized_pnl"] = round(c_gain, 2)
             state["free_roll_active"] = True
             events.append(f"🎉 CALL HARVEST: Closed at ₹{c_ltp:.2f} (+{round(c_gain/c_buy*100, 1)}%). House Money secured! Put is now a 100% Free Roll.")
 
         # Rule 1B: Trailing Stop Breach (protects peak gains from round-tripping)
-        c_breach_arm = (c_buy + max(35.0, c_ext * 0.40)) if moneyness == "ITM" else (c_buy * 1.40)
         if not is_c_harvest and c_peak >= c_breach_arm and c_ltp <= c_leg.get("trailing_stop", 0.0):
             c_leg["status"] = "TRAILING_STOP_CLOSED"
             c_leg["exit_price"] = c_ltp
             c_leg["exit_ts"] = current_ts
-            c_leg["exit_reason"] = f"TRAILING_STOP_HIT (Peak: ₹{c_peak:.2f}, Stop: ₹{c_leg['trailing_stop']:.2f})"
+            if c_in_pivot_zone and pivot_accel_enabled:
+                c_leg["exit_reason"] = f"TRAILING_STOP_HIT (Peak: ₹{c_peak:.2f}, Stop: ₹{c_leg['trailing_stop']:.2f}, PivotZone: {c_pivot_zone}, Buffer: {int(effective_c_trail_buffer*100)}%)"
+            else:
+                c_leg["exit_reason"] = f"TRAILING_STOP_HIT (Peak: ₹{c_peak:.2f}, Stop: ₹{c_leg['trailing_stop']:.2f})"
             c_leg["realized_pnl"] = round(c_ltp - c_buy, 2)
             events.append(f"🛡️ CALL TRAILING STOP: Closed at ₹{c_ltp:.2f} to lock peak profits (Peak: ₹{c_peak:.2f}).")
 
@@ -364,6 +439,12 @@ def evaluate_fsm_tick(
             c_leg["exit_ts"] = current_ts
             c_leg["exit_reason"] = f"SALVAGE_STOP ({round((c_ltp-c_buy)/c_buy*100, 1)}% decay & Delta={call_delta:.2f})"
             c_leg["realized_pnl"] = round(c_ltp - c_buy, 2)
+            if c_leg.get("shadow_status") == "ACTIVE":
+                c_leg["shadow_status"] = "SALVAGED_CLOSED"
+                c_leg["shadow_exit_price"] = c_ltp
+                c_leg["shadow_exit_ts"] = current_ts
+                c_leg["shadow_exit_reason"] = c_leg["exit_reason"]
+                c_leg["shadow_realized_pnl"] = round(c_ltp - c_buy, 2)
             events.append(f"⚠️ CALL SALVAGED: Closed at ₹{c_ltp:.2f} to salvage capital (Loss: {round((c_ltp-c_buy)/c_buy*100, 1)}%).")
 
     # ------------------------------------------------------------------
@@ -383,13 +464,54 @@ def evaluate_fsm_tick(
         if p_profit_qualified and has_iv_expansion:
             put_iv_spike = True
 
-        effective_p_trail_buffer = 0.08 if put_iv_spike else trail_buffer
+        # Pivot zone acceleration qualification for Put (S1, S2 support zones when profit-qualified)
+        if p_pivot_zone in ("S1", "S2") and p_profit_qualified:
+            p_in_pivot_zone = True
+
+        # Buffer precedence hierarchy (buffers can only tighten, never loosen):
+        effective_p_trail_buffer = min(
+            trail_buffer,
+            0.08 if put_iv_spike else 1.0,
+            0.05 if (p_in_pivot_zone and pivot_accel_enabled) else 1.0,
+        )
+
+        shadow_p_trail_buffer = min(
+            trail_buffer,
+            0.08 if put_iv_spike else 1.0,
+            0.05 if p_in_pivot_zone else 1.0,
+        )
 
         # Update dynamic trailing stop once in profit
         p_arm_threshold = (p_buy + max(25.0, p_ext * 0.30)) if moneyness == "ITM" else (p_buy * 1.30)
         if p_ltp >= p_arm_threshold:
             candidate_stop = round(p_peak * (1.0 - effective_p_trail_buffer), 2)
             p_leg["trailing_stop"] = max(p_leg.get("trailing_stop", 0.0), candidate_stop)
+
+            # Persistent ratcheting shadow trailing stop (carried forward through cycle)
+            candidate_shadow_stop = round(p_peak * (1.0 - shadow_p_trail_buffer), 2)
+            p_leg["shadow_trailing_stop"] = max(p_leg.get("shadow_trailing_stop", 0.0), candidate_shadow_stop)
+            if p_in_pivot_zone and p_pivot_zone:
+                p_leg["shadow_pivot_zone"] = p_pivot_zone
+
+        # Counterfactual Shadow Breach Evaluation:
+        # Check if the persistent shadow trailing stop would have triggered an exit
+        p_breach_arm = (p_buy + max(35.0, p_ext * 0.40)) if moneyness == "ITM" else (p_buy * 1.40)
+        p_shadow_status = p_leg.get("shadow_status", "ACTIVE")
+        if (
+            p_shadow_status == "ACTIVE"
+            and p_leg.get("shadow_pivot_zone") is not None
+            and p_peak >= p_breach_arm
+            and p_leg.get("shadow_trailing_stop", 0.0) > 0
+        ):
+            if p_ltp <= p_leg["shadow_trailing_stop"]:
+                p_leg["shadow_status"] = "SHADOW_TRAILING_STOP_CLOSED"
+                p_leg["shadow_exit_price"] = p_ltp
+                p_leg["shadow_exit_ts"] = current_ts
+                p_leg["shadow_exit_reason"] = (
+                    f"SHADOW_TRAILING_STOP_HIT (Peak: ₹{p_peak:.2f}, Stop: ₹{p_leg['shadow_trailing_stop']:.2f}, "
+                    f"PivotZone: {p_leg.get('shadow_pivot_zone')})"
+                )
+                p_leg["shadow_realized_pnl"] = round(p_ltp - p_buy, 2)
 
         # Rule 2A: House Money Harvest (Unrealized gain covers extrinsic risk or total cost)
         p_gain = p_ltp - p_buy
@@ -407,16 +529,24 @@ def evaluate_fsm_tick(
             p_leg["exit_ts"] = current_ts
             p_leg["exit_reason"] = f"HOUSE_MONEY_HARVEST (Gain: +{round(p_gain, 1)} pts >= Extrinsic Risk {total_extrinsic_risk} pts)"
             p_leg["realized_pnl"] = round(p_gain, 2)
+            if p_leg.get("shadow_status") == "ACTIVE":
+                p_leg["shadow_status"] = "HARVESTED_CLOSED"
+                p_leg["shadow_exit_price"] = p_ltp
+                p_leg["shadow_exit_ts"] = current_ts
+                p_leg["shadow_exit_reason"] = p_leg["exit_reason"]
+                p_leg["shadow_realized_pnl"] = round(p_gain, 2)
             state["free_roll_active"] = True
             events.append(f"🎉 PUT HARVEST: Closed at ₹{p_ltp:.2f} (+{round(p_gain/p_buy*100, 1)}%). House Money secured! Call is now a 100% Free Roll.")
 
         # Rule 2B: Trailing Stop Breach (protects peak gains from round-tripping)
-        p_breach_arm = (p_buy + max(35.0, p_ext * 0.40)) if moneyness == "ITM" else (p_buy * 1.40)
         if not is_p_harvest and p_peak >= p_breach_arm and p_ltp <= p_leg.get("trailing_stop", 0.0):
             p_leg["status"] = "TRAILING_STOP_CLOSED"
             p_leg["exit_price"] = p_ltp
             p_leg["exit_ts"] = current_ts
-            p_leg["exit_reason"] = f"TRAILING_STOP_HIT (Peak: ₹{p_peak:.2f}, Stop: ₹{p_leg['trailing_stop']:.2f})"
+            if p_in_pivot_zone and pivot_accel_enabled:
+                p_leg["exit_reason"] = f"TRAILING_STOP_HIT (Peak: ₹{p_peak:.2f}, Stop: ₹{p_leg['trailing_stop']:.2f}, PivotZone: {p_pivot_zone}, Buffer: {int(effective_p_trail_buffer*100)}%)"
+            else:
+                p_leg["exit_reason"] = f"TRAILING_STOP_HIT (Peak: ₹{p_peak:.2f}, Stop: ₹{p_leg['trailing_stop']:.2f})"
             p_leg["realized_pnl"] = round(p_ltp - p_buy, 2)
             events.append(f"🛡️ PUT TRAILING STOP: Closed at ₹{p_ltp:.2f} to lock peak profits (Peak: ₹{p_peak:.2f}).")
 
@@ -435,7 +565,138 @@ def evaluate_fsm_tick(
             p_leg["exit_ts"] = current_ts
             p_leg["exit_reason"] = f"SALVAGE_STOP ({round((p_ltp-p_buy)/p_buy*100, 1)}% decay & Delta={put_delta:.2f})"
             p_leg["realized_pnl"] = round(p_ltp - p_buy, 2)
+            if p_leg.get("shadow_status") == "ACTIVE":
+                p_leg["shadow_status"] = "SALVAGED_CLOSED"
+                p_leg["shadow_exit_price"] = p_ltp
+                p_leg["shadow_exit_ts"] = current_ts
+                p_leg["shadow_exit_reason"] = p_leg["exit_reason"]
+                p_leg["shadow_realized_pnl"] = round(p_ltp - p_buy, 2)
             events.append(f"⚠️ PUT SALVAGED: Closed at ₹{p_ltp:.2f} to salvage capital (Loss: {round((p_ltp-p_buy)/p_buy*100, 1)}%).")
+
+    # ------------------------------------------------------------------
+    # Shadow Telemetry Recording
+    # ------------------------------------------------------------------
+    if pivot_shadow_mode and (daily_pivots is not None or nifty_spot is not None):
+        current_zone = market_zone
+        current_leg = "CALL" if market_zone in ("R1", "R2") else ("PUT" if market_zone in ("S1", "S2") else None)
+        in_proximity = market_zone is not None
+        leg_qualified_for_accel = bool(c_in_pivot_zone or p_in_pivot_zone)
+
+        # Retained / armed zones from earlier touches in this cycle
+        c_armed_zone = c_leg.get("shadow_pivot_zone")
+        p_armed_zone = p_leg.get("shadow_pivot_zone")
+        armed_zone = c_armed_zone or p_armed_zone
+        armed_leg = "CALL" if c_armed_zone else ("PUT" if p_armed_zone else None)
+
+        live_stop = c_leg.get("trailing_stop", 0.0) if market_zone in ("R1", "R2") else (p_leg.get("trailing_stop", 0.0) if market_zone in ("S1", "S2") else 0.0)
+        shadow_stop = c_leg.get("shadow_trailing_stop", 0.0) if market_zone in ("R1", "R2") else (p_leg.get("shadow_trailing_stop", 0.0) if market_zone in ("S1", "S2") else 0.0)
+        delta_pts = round(shadow_stop - live_stop, 2) if (live_stop > 0 and shadow_stop > 0) else 0.0
+
+        c_would_exit = bool(c_leg.get("shadow_status") == "SHADOW_TRAILING_STOP_CLOSED")
+        p_would_exit = bool(p_leg.get("shadow_status") == "SHADOW_TRAILING_STOP_CLOSED")
+        would_exit = c_would_exit or p_would_exit
+
+        try:
+            eval_time_str = datetime.fromtimestamp(current_ts, tz=timezone.utc).astimezone(IST_TZ).strftime("%Y-%m-%d %H:%M:%S IST") if current_ts else ""
+        except Exception:
+            eval_time_str = ""
+
+        # Maintain persistent events list in pivot_shadow
+        prev_shadow = state.get("pivot_shadow") or {}
+        shadow_events = list(prev_shadow.get("events") or [])
+
+        if (
+            c_leg.get("shadow_status") == "SHADOW_TRAILING_STOP_CLOSED"
+            and c_leg.get("shadow_pivot_zone") is not None
+            and not any(e.get("leg") == "CALL" for e in shadow_events)
+        ):
+            shadow_events.append({
+                "leg": "CALL",
+                "status": "SHADOW_TRAILING_STOP_CLOSED",
+                "exit_price": c_leg.get("shadow_exit_price"),
+                "exit_ts": c_leg.get("shadow_exit_ts"),
+                "exit_reason": c_leg.get("shadow_exit_reason"),
+                "realized_pnl": c_leg.get("shadow_realized_pnl"),
+                "peak_ltp": c_leg.get("peak_ltp"),
+                "trailing_stop": c_leg.get("shadow_trailing_stop"),
+                "live_trailing_stop": c_leg.get("trailing_stop"),
+                "spot": nifty_spot,
+                "zone": c_leg.get("shadow_pivot_zone"),
+                "live_fsm_status": c_leg.get("status"),
+            })
+
+        if (
+            p_leg.get("shadow_status") == "SHADOW_TRAILING_STOP_CLOSED"
+            and p_leg.get("shadow_pivot_zone") is not None
+            and not any(e.get("leg") == "PUT" for e in shadow_events)
+        ):
+            shadow_events.append({
+                "leg": "PUT",
+                "status": "SHADOW_TRAILING_STOP_CLOSED",
+                "exit_price": p_leg.get("shadow_exit_price"),
+                "exit_ts": p_leg.get("shadow_exit_ts"),
+                "exit_reason": p_leg.get("shadow_exit_reason"),
+                "realized_pnl": p_leg.get("shadow_realized_pnl"),
+                "peak_ltp": p_leg.get("peak_ltp"),
+                "trailing_stop": p_leg.get("shadow_trailing_stop"),
+                "live_trailing_stop": p_leg.get("trailing_stop"),
+                "spot": nifty_spot,
+                "zone": p_leg.get("shadow_pivot_zone"),
+                "live_fsm_status": p_leg.get("status"),
+            })
+
+        # Open legs holding an armed shadow stop
+        c_shadow_open = (c_leg.get("status") == "ACTIVE" and c_leg.get("shadow_status") == "ACTIVE")
+        p_shadow_open = (p_leg.get("status") == "ACTIVE" and p_leg.get("shadow_status") == "ACTIVE")
+
+        retained_stop_active = bool(
+            (c_shadow_open and c_armed_zone is not None) or
+            (p_shadow_open and p_armed_zone is not None)
+        )
+
+        # Counterfactual terminal exit status (historical completion)
+        c_shadow_closed = (c_leg.get("shadow_status") == "SHADOW_TRAILING_STOP_CLOSED")
+        p_shadow_closed = (p_leg.get("shadow_status") == "SHADOW_TRAILING_STOP_CLOSED")
+        counterfactual_terminal = bool(c_shadow_closed or p_shadow_closed)
+        if c_shadow_closed and p_shadow_closed:
+            counterfactual_terminal_leg = "BOTH"
+        elif c_shadow_closed:
+            counterfactual_terminal_leg = "CALL"
+        elif p_shadow_closed:
+            counterfactual_terminal_leg = "PUT"
+        else:
+            counterfactual_terminal_leg = None
+
+        # has_shadow_activity is True when spot is currently in proximity, or holding an active retained stop on an OPEN leg
+        has_shadow_activity = bool(in_proximity or retained_stop_active)
+
+        state["pivot_shadow"] = {
+            "active": has_shadow_activity,
+            "in_proximity": in_proximity,
+            "retained_stop_active": retained_stop_active,
+            "counterfactual_terminal": counterfactual_terminal,
+            "counterfactual_terminal_leg": counterfactual_terminal_leg,
+            "leg_qualified_for_accel": leg_qualified_for_accel,
+            "leg": current_leg,
+            "zone": current_zone,
+            "armed_zone": armed_zone,
+            "armed_leg": armed_leg,
+            "evaluated_at": eval_time_str,
+            "evaluated_ts": current_ts,
+            "spot": nifty_spot,
+            "live_trail_stop": live_stop,
+            "shadow_trail_stop": shadow_stop,
+            "delta_points": delta_pts,
+            "would_have_exited": counterfactual_terminal,
+            "call_shadow_stop": c_leg.get("shadow_trailing_stop", 0.0),
+            "put_shadow_stop": p_leg.get("shadow_trailing_stop", 0.0),
+            "call_shadow_status": c_leg.get("shadow_status", "ACTIVE"),
+            "put_shadow_status": p_leg.get("shadow_status", "ACTIVE"),
+            "call_shadow_pnl": c_leg.get("shadow_realized_pnl"),
+            "put_shadow_pnl": p_leg.get("shadow_realized_pnl"),
+            "events": shadow_events,
+            "daily_pivots": daily_pivots,
+        }
 
     # ------------------------------------------------------------------
     # 3. Derive Overall Machine State & P&L

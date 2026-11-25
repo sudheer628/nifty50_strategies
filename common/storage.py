@@ -327,6 +327,30 @@ def init_db(db_path: str) -> None:
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pivot_shadow_events (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id            TEXT    NOT NULL,
+            track               TEXT    NOT NULL,
+            trade_date          TEXT    NOT NULL,
+            timestamp           INTEGER NOT NULL,
+            leg                 TEXT    NOT NULL,
+            zone                TEXT,
+            spot                REAL,
+            option_peak         REAL    NOT NULL,
+            option_ltp          REAL    NOT NULL,
+            live_trail_stop     REAL,
+            shadow_trail_stop   REAL    NOT NULL,
+            delta_points        REAL,
+            shadow_exit_price   REAL    NOT NULL,
+            shadow_realized_pnl REAL    NOT NULL,
+            live_fsm_status     TEXT    NOT NULL,
+            exit_reason         TEXT,
+            created_at          INTEGER NOT NULL,
+            UNIQUE(cycle_id, leg, timestamp)
+        )
+    """)
+
     # Migrate gate_deferred_shadows table if columns are missing
     cur.execute("PRAGMA table_info(gate_deferred_shadows)")
     shadow_cols = {row[1] for row in cur.fetchall()}
@@ -485,6 +509,51 @@ def get_timing_shadow_entries(db_path: str, cycle_id: Optional[str] = None) -> l
         conn.close()
 
 
+
+
+def insert_pivot_shadow_event(db_path: str, event_record: dict) -> None:
+    """Insert a counterfactual pivot shadow exit event into append-only cycle storage."""
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    init_db(db_path)
+    cur.execute("PRAGMA table_info(pivot_shadow_events)")
+    cols = {row[1] for row in cur.fetchall()}
+    ins = {k: v for k, v in event_record.items() if k in cols}
+    if "created_at" not in ins:
+        ins["created_at"] = int(datetime.now(timezone.utc).timestamp())
+    col_names = ", ".join(ins.keys())
+    placeholders = ", ".join("?" for _ in ins)
+    cur.execute(
+        f"INSERT OR REPLACE INTO pivot_shadow_events ({col_names}) VALUES ({placeholders})",
+        tuple(ins.values())
+    )
+    conn.commit()
+    conn.close()
+    logger.info(
+        "Recorded pivot shadow exit event [%s] for cycle %s (P&L: %s pts)",
+        event_record.get("leg"), event_record.get("cycle_id"), event_record.get("shadow_realized_pnl")
+    )
+
+
+def get_pivot_shadow_events(db_path: str, cycle_id: Optional[str] = None) -> list:
+    """Retrieve counterfactual pivot shadow exit events from database."""
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    try:
+        if cycle_id:
+            cur.execute("SELECT * FROM pivot_shadow_events WHERE cycle_id = ? ORDER BY id ASC", (cycle_id,))
+        else:
+            cur.execute("SELECT * FROM pivot_shadow_events ORDER BY id ASC")
+        return [dict(r) for r in cur.fetchall()]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
 def get_gamma_sniper_trades(db_path: str) -> list:
     """Retrieve all gamma sniper trade records from a weekly database."""
     if not os.path.exists(db_path):
@@ -499,6 +568,7 @@ def get_gamma_sniper_trades(db_path: str) -> list:
         return []
     finally:
         conn.close()
+
 
 
 def insert_record(db_path: str, record: dict) -> None:
@@ -655,13 +725,37 @@ def update_active_fsm_state(fsm_dict: dict, filepath: Optional[str] = None) -> b
     
     Guarantees that Decoupled Leg state, trailing stops, and realized gains
     persist across 30-minute cron executions without disturbing base snapshot fields.
+    Also syncs alpha_fsm and pivot_shadow to active_strategies.json for downstream unified readers.
     """
     target_file = filepath or ACTIVE_SNAPSHOT_FILE
     snapshot = load_active_snapshot(filepath=target_file)
     if not snapshot:
         return False
     snapshot["alpha_fsm"] = fsm_dict
+    if "pivot_shadow" in fsm_dict:
+        snapshot["pivot_shadow"] = fsm_dict["pivot_shadow"]
     _atomic_write_json(target_file, snapshot)
+
+    # Sync to active_strategies.json for downstream consumers (Hermes / MongoDB / unified store)
+    try:
+        from common.unified_strategy_store import (
+            load_active_strategies,
+            save_active_strategies,
+            strategy_lock,
+            ACTIVE_STRATEGIES_JSON,
+        )
+        target_active = ACTIVE_STRATEGIES_JSON
+        track_name = "3day_strategy" if (filepath and "thursday" in str(filepath).lower()) else "5day_strategy"
+        with strategy_lock(target_active):
+            active = load_active_strategies(filepath=target_active)
+            if active and track_name in active:
+                active[track_name]["alpha_fsm"] = fsm_dict
+                if "pivot_shadow" in fsm_dict:
+                    active[track_name]["pivot_shadow"] = fsm_dict["pivot_shadow"]
+                save_active_strategies(active, filepath=target_active)
+    except Exception as e_active_sync:
+        logger.debug("Failed to sync fsm/pivot_shadow to active_strategies.json: %s", e_active_sync)
+
     return True
 
 

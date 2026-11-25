@@ -789,6 +789,17 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
     put_delta = estimate_option_delta(nifty_ltp, put_strike, days_to_expiry, is_call=False)
     call_iv, put_iv = fetch_option_surface_iv(call_strike, put_strike, sqlite_dir=SQLITE_DIR)
 
+    # Pivot-aware acceleration and counterfactual shadow tracking
+    from common.pivot_calculator import get_or_calculate_daily_pivots
+    from config import get_config_bool
+    pivot_accel_enabled = get_config_bool("PIVOT_ACCEL_ENABLED", default=False)
+    pivot_shadow_mode = get_config_bool("PIVOT_SHADOW_LOGGING", default=True)
+    daily_pivots = None
+    try:
+        daily_pivots = get_or_calculate_daily_pivots()
+    except Exception as piv_err:
+        logger.warning("[Thursday Track] Could not calculate daily pivots: %s", piv_err)
+
     updated_fsm, fsm_events = evaluate_fsm_tick(
         fsm_state=fsm_state,
         current_call_ltp=call_ltp,
@@ -799,12 +810,54 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
         put_delta=put_delta,
         put_iv=put_iv,
         call_iv=call_iv,
+        nifty_spot=nifty_ltp,
+        daily_pivots=daily_pivots,
+        pivot_accel_enabled=pivot_accel_enabled,
+        pivot_shadow_mode=pivot_shadow_mode,
     )
 
     if fsm_events:
         for ev in fsm_events:
             logger.info("[Thursday Track] 🔔 FSM Event: %s", ev)
+    if updated_fsm.get("pivot_shadow", {}).get("active"):
+        ps = updated_fsm["pivot_shadow"]
+        logger.info(
+            "[Thursday Track] 🧭 [PIVOT SHADOW] Zone: %s | Leg: %s | Spot: %s | LiveStop: ₹%s | ShadowStop: ₹%s (Δ %s pts) | WouldExit: %s",
+            ps.get("zone"),
+            ps.get("leg"),
+            ps.get("spot"),
+            ps.get("live_trail_stop"),
+            ps.get("shadow_trail_stop"),
+            ps.get("delta_points"),
+            ps.get("would_have_exited"),
+        )
     update_active_fsm_state(updated_fsm, filepath=THURSDAY_SNAPSHOT_FILE)
+
+    # Persist append-only counterfactual shadow exit events to SQLite
+    if updated_fsm.get("pivot_shadow", {}).get("events"):
+        try:
+            from common.storage import insert_pivot_shadow_event
+            for ev in updated_fsm["pivot_shadow"]["events"]:
+                insert_pivot_shadow_event(db_path, {
+                    "cycle_id": cycle_id,
+                    "track": "3day_strategy",
+                    "trade_date": today_str,
+                    "timestamp": ev.get("exit_ts") or _now_utc_ts(),
+                    "leg": ev.get("leg"),
+                    "zone": ev.get("zone"),
+                    "spot": ev.get("spot"),
+                    "option_peak": ev.get("peak_ltp", 0.0),
+                    "option_ltp": ev.get("exit_price", 0.0),
+                    "live_trail_stop": ev.get("live_trailing_stop"),
+                    "shadow_trail_stop": ev.get("trailing_stop"),
+                    "delta_points": round((ev.get("trailing_stop") or 0.0) - (ev.get("live_trailing_stop") or 0.0), 2),
+                    "shadow_exit_price": ev.get("exit_price", 0.0),
+                    "shadow_realized_pnl": ev.get("realized_pnl", 0.0),
+                    "live_fsm_status": ev.get("live_fsm_status", "ACTIVE"),
+                    "exit_reason": ev.get("exit_reason"),
+                })
+        except Exception as e_sh_db:
+            logger.debug("[Thursday Track] Failed to record pivot shadow event to SQLite: %s", e_sh_db)
 
     fsm_data = {
         "fsm_state": updated_fsm.get("state", "DUAL_LONG"),
