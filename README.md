@@ -30,8 +30,9 @@ This strategy:
 - Automated post-market weekly close orchestration and HTML/chart reporting
 
 - **Broker-Segregated Live F&O Trailing Stop-Loss Order Execution**: Dedicated exit managers (`Tuesday-Fno-Exit-Orders-V1.py` on Upstox and `Thursday-Fno-Exit-Orders-V1.py` on the Thursday broker, currently Upstox via `THURSDAY_BROKER`) managing Stop-Loss Market (SL-M) orders, triggered strictly when Alpha FSM exit signals trigger in `sentinel-hermes`
-- **Automated Paired MARKET BUY Strategy Entry**: Collectors (`weekly_option_collector.py` for Tuesday via Upstox, `thursday_option_collector.py` for Thursday via the Thursday broker, currently Upstox) execute paired MARKET BUY orders at strategy start. Includes broker preflight margin checks, back-to-back MARKET submissions, atomic cancel-and-SELL rollback on partial or failed fills, fill price vs reference LTP tracking, and cycle idempotency without Redis dependency.
-- **Intra-Day Duplicate BUY Elimination & Post-Market Trigger Re-Arm**: When paired MARKET BUY fills (`entry_status == "FILLED"`), the respective day's trigger flag (`LIVE_BUY_TRIGGER_TUESDAY` or `LIVE_BUY_TRIGGER_THURSDAY`) is immediately auto-disarmed to `"false"` in Redis to prevent same-day duplicates. A dedicated post-market script (`scripts/reset_daily_buy_triggers.py`) running at 15:45 IST on Tuesday and Thursday re-arms the day's flag to `"true"` for the following week's cycle. Mid-day re-arming during market hours (09:15–15:30 IST) is strictly locked out.
+- **Deterministic Paired MARKET BUY Strategy Entry (Zero Flag Toggling)**: Collectors (`weekly_option_collector.py` for Tuesday, `thursday_option_collector.py` for Thursday) execute paired MARKET BUY orders at strategy start (09:32 AM). Idempotency is strictly enforced by checking ground truth: local SQLite DB (`strategy_buy_snapshots`), Upstox order book (`TUE-BUY` / `THU-BUY`), and broker net positions. Never repeats at 10:02 AM or later cron iterations without any volatile flag auto-disarming.
+- **Architecture & Decision Flow Documentation**: See [`docs/CYCLE_EXIT_ARCHITECTURE_AND_DECISION_TREE.md`](docs/CYCLE_EXIT_ARCHITECTURE_AND_DECISION_TREE.md) for the complete decision tree, 20% strangle lock vs Alpha FSM hierarchy, manual operator square-off reconciliation, and critical architectural governance rules.
+- **Broker-Segregated Live F&O Trailing Stop-Loss Order Execution**: Dedicated exit managers (`Tuesday-Fno-Exit-Orders-V1.py` on Upstox and `Thursday-Fno-Exit-Orders-V1.py` on Upstox) managing market exits triggered strictly when Alpha FSM or the 20% strangle profit target authorizes them in Redis.
 - **Broker Manual-Exit Auto-Reconciliation & Manual Exit Tracking**: Automatically synchronizes trader manual square-offs performed on broker apps into `MANUAL_CLOSED` FSM states via `scripts/auto_record_manual_exit.py` (and CLI `scripts/mark_manual_exit.py`), purges Redis keys, updates unified store/MongoDB, marks cycles closed when all legs terminate, and disarms exit gates (`ORDERS_LIVE_* = 0`). Suppresses false Alpha exit alerts in `sentinel-hermes`.
 
 ### Out of scope
@@ -734,8 +735,8 @@ The active snapshot persists the current cycle's entry buy prices, FSM state (`a
 ### Phase 8: Intra-Day Duplicate BUY Elimination, Daily Buy Triggers & Broker Manual-Exit Sync (COMPLETE)
 
 - [x] Day-specific live buy trigger flags (`LIVE_BUY_TRIGGER_TUESDAY`, `LIVE_BUY_TRIGGER_THURSDAY`)
-- [x] Auto-disarm on fill (`LIVE_BUY_TRIGGER_* = false`) & collector same-day idempotency barrier (preventing duplicate 10:01 / 10:02 entries)
-- [x] Post-market daily trigger reset orchestrator (`scripts/reset_daily_buy_triggers.py`) at 15:45 IST on Tue & Thu with market-hours lockout
+- [x] Ground-truth BUY idempotency guard (`check_duplicate_entry_guard`) verifying SQLite `strategy_buy_snapshots`, broker order book (`TUE-BUY` / `THU-BUY`), and broker net positions
+- [x] Completely eliminated auto-disarm loop and deprecated `scripts/reset_daily_buy_triggers.py` cron in favor of static ground-truth checks
 - [x] Strict entry gate separation (entry requires `LIVE_BUY_TRIGGER_*`; `ORDERS_LIVE_*` is exit-only)
 - [x] Always-on broker position auto-reconciliation (`auto_record_manual_exit.py`)
 - [x] Alpha FSM manual close state (`MANUAL_CLOSED`) with full terminal cycle close & exit gate disarm
@@ -978,11 +979,11 @@ All production crontab schedules execute in **UTC** on AWS EC2:
 38 3 * * 2 cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/run_thursday_close.py --morning-holiday-check >> /home/ubuntu/logs/nifty50_strategies_thursday_close_$(date +\%F).log 2>&1
 
 # ==============================================================================
-# POST-MARKET DAILY BUY TRIGGER RE-ARM (Tue & Thu 15:45 IST = 10:15 UTC)
-# Re-arms the current day's LIVE_BUY_TRIGGER_<DAY> back to 'true' in Redis
-# Enforces market-hours lockout (09:15-15:30 IST) to prevent accidental mid-day re-arming
+# POST-MARKET DAILY BUY TRIGGER RE-ARM (DEPRECATED - REMOVED)
+# Entry idempotency is now guaranteed deterministically by checking ground truth
+# (SQLite strategy_buy_snapshots + broker order book). No reset cron job needed.
 # ==============================================================================
-15 10 * * 2,4 cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/reset_daily_buy_triggers.py >> /home/ubuntu/logs/reset_buy_triggers_$(date +\%F).log 2>&1
+# (Deprecated cron entry removed)
 
 
 # ============================================================================
@@ -1183,8 +1184,8 @@ Automated paired MARKET BUY execution runs at the fresh strategy entry point man
 Live BUY execution requires explicit activation via Redis Cloud or CLI flag:
 - **Tuesday Master Cycle**: `LIVE_BUY_TRIGGER_TUESDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_TUESDAY true`) OR `--execute-buy` CLI flag. Broker per `TUESDAY_BROKER` (currently **Upstox**).
 - **Thursday 3-Day Cycle**: `LIVE_BUY_TRIGGER_THURSDAY=true` in Redis Cloud (via `redis-cli SET LIVE_BUY_TRIGGER_THURSDAY true`) OR `--execute-buy` CLI flag. Broker per `THURSDAY_BROKER` (currently **Upstox**).
-- **Auto-Disarm on Fill**: When paired MARKET BUY orders fill (`entry_status == "FILLED"`), the respective trigger key in Redis is immediately disarmed to `"false"` via `set_config_value()`. This prevents intra-day duplicate executions on subsequent cron ticks (e.g., at 10:01 / 10:02 IST). Smart Entry Gate deferral leaves the flag `true` so deferred ticks can retry; only an actual fill flips it to `false`.
-- **Post-Market Re-Arm**: At 15:45 IST (`15 10 * * 2,4` UTC), `scripts/reset_daily_buy_triggers.py` re-arms the day's trigger key back to `"true"` on Tuesday and Thursday for the following week's cycle. Mid-day re-arming is blocked during market hours (09:15–15:30 IST).
+- **Deterministic Ground Truth Idempotency**: Rather than auto-disarming Redis flags and relying on reset cron jobs, same-day duplicate entries (e.g. 10:02 AM) are strictly prevented by `check_duplicate_entry_guard()` verifying local SQLite DB (`strategy_buy_snapshots`), broker order books (`TUE-BUY` / `THU-BUY`), and broker net positions.
+- **Static Operational Gates**: `LIVE_BUY_TRIGGER_TUESDAY` and `LIVE_BUY_TRIGGER_THURSDAY` remain statically `"true"` in Redis/.env and are never mutated on fill.
 - **CLI Precedence**:
   - `--execute-buy`: Explicitly forces live broker BUY placement regardless of Redis state.
   - `--no-execute-buy`: Explicitly forces paper mode regardless of Redis state.
@@ -1198,9 +1199,9 @@ python strategies/weekly_option_collector.py --execute-buy
 # Thursday Live Paired Entry
 python strategies/thursday_option_collector.py --execute-buy
 
-# Status and Dry-Run of Buy Triggers
-python scripts/reset_daily_buy_triggers.py --status
-python scripts/reset_daily_buy_triggers.py --dry-run
+# View Real-Time P&L Monitor
+python scripts/cycle_pl_monitor.py --tuesday --table
+python scripts/cycle_pl_monitor.py --thursday --table
 ```
 
 ### 17.2. Preflight Margin Verification
