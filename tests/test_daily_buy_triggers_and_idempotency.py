@@ -112,8 +112,7 @@ def test_reset_triggers_all_post_market():
 # 2. Tests for Auto-Disarm on Paired BUY Fill
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("disarm_success", [True, False])
-def test_thursday_collector_auto_disarms_on_fill(monkeypatch, disarm_success):
+def test_thursday_collector_checks_guard_and_fills(monkeypatch):
     thu = date(2026, 11, 19)
     monkeypatch.setattr(thursday_collector, "_today_ist", lambda: thu)
     monkeypatch.setenv("LIVE_BUY_TRIGGER_THURSDAY", "true")
@@ -122,7 +121,6 @@ def test_thursday_collector_auto_disarms_on_fill(monkeypatch, disarm_success):
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         snap_file = os.path.join(tmp_dir, "current_thursday_buy.json")
-        disarm_calls = []
 
         gate_mock = EntryGateResult(
             should_enter=True,
@@ -152,22 +150,18 @@ def test_thursday_collector_auto_disarms_on_fill(monkeypatch, disarm_success):
              patch("strategies.thursday_option_collector.get_nifty_spot", return_value={"ltp": 25300.0, "open": 25250.0, "close": 25200.0}), \
              patch("strategies.thursday_option_collector.get_nifty_option_chain", return_value={"call": {"ltp": 150.0}, "put": {"ltp": 160.0}}), \
              patch("common.entry_order_manager.resolve_upstox_option_key", return_value="NSE_FO|KEY"), \
+             patch("common.entry_order_manager.check_duplicate_entry_guard", return_value=(False, "Clean")), \
              patch("common.entry_order_manager.execute_paired_market_buy", return_value={
                  "success": True, "status": "FILLED",
                  "call_buy_price": 151.0, "put_buy_price": 161.0,
                  "call_order_id": "THU_C_01", "put_order_id": "THU_P_01",
-             }), \
-             patch("config.set_config_value", side_effect=lambda k, v: disarm_calls.append((k, v)) or disarm_success), \
-             patch("strategies.thursday_option_collector.logger.critical") as critical_log:
+             }):
 
             ok = thursday_collector.collect_once(execute_buy=True)
             assert ok is True
-            assert ("LIVE_BUY_TRIGGER_THURSDAY", "false") in disarm_calls
-            assert critical_log.called is (not disarm_success)
 
 
-@pytest.mark.parametrize("disarm_success", [True, False])
-def test_weekly_collector_auto_disarms_on_tuesday_fill(monkeypatch, disarm_success):
+def test_weekly_collector_checks_guard_and_fills(monkeypatch):
     tue = date(2026, 11, 17)
     monkeypatch.setattr(weekly_collector, "_today_ist", lambda: tue)
     monkeypatch.setenv("LIVE_BUY_TRIGGER_TUESDAY", "true")
@@ -176,7 +170,6 @@ def test_weekly_collector_auto_disarms_on_tuesday_fill(monkeypatch, disarm_succe
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         snap_file = os.path.join(tmp_dir, "current_week_buy.json")
-        disarm_calls = []
 
         gate_mock = EntryGateResult(
             should_enter=True,
@@ -206,18 +199,15 @@ def test_weekly_collector_auto_disarms_on_tuesday_fill(monkeypatch, disarm_succe
              patch("strategies.weekly_option_collector.get_nifty_spot", return_value={"ltp": 25300.0, "open": 25250.0, "close": 25200.0}), \
              patch("strategies.weekly_option_collector.get_nifty_option_chain", return_value={"call": {"ltp": 150.0}, "put": {"ltp": 160.0}}), \
              patch("common.entry_order_manager.resolve_upstox_option_key", return_value="NSE_FO|KEY"), \
+             patch("common.entry_order_manager.check_duplicate_entry_guard", return_value=(False, "Clean")), \
              patch("common.entry_order_manager.execute_paired_market_buy", return_value={
                  "success": True, "status": "FILLED",
                  "call_buy_price": 151.0, "put_buy_price": 161.0,
                  "call_order_id": "TUE_C_01", "put_order_id": "TUE_P_01",
-             }), \
-             patch("config.set_config_value", side_effect=lambda k, v: disarm_calls.append((k, v)) or disarm_success), \
-             patch("strategies.weekly_option_collector.logger.critical") as critical_log:
+             }):
 
             ok = weekly_collector.collect_once(execute_buy=True)
             assert ok is True
-            assert ("LIVE_BUY_TRIGGER_TUESDAY", "false") in disarm_calls
-            assert critical_log.called is (not disarm_success)
 
 
 # ---------------------------------------------------------------------------
@@ -429,3 +419,60 @@ def test_cross_track_broker_wide_check_fails_closed_when_track_brokers_differ():
     assert has_open is False
     assert is_safe is False
     assert "same broker" in reason.lower()
+
+
+def test_check_duplicate_entry_guard_sqlite(tmp_path):
+    from common.entry_order_manager import check_duplicate_entry_guard
+    import sqlite3
+    db_file = str(tmp_path / "test.db")
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("CREATE TABLE buy_snapshots (cycle_id TEXT, week_start_date TEXT, entry_status TEXT)")
+        conn.execute("INSERT INTO buy_snapshots VALUES ('CYCLE-TUE-20261125', '20261125', 'FILLED')")
+
+    is_dup, reason = check_duplicate_entry_guard(
+        broker="upstox",
+        token="SIM_TOKEN",
+        tag="TUE-BUY",
+        start_date_str="20261125",
+        call_contract={"trading_symbol": "CE"},
+        put_contract={"trading_symbol": "PE"},
+        db_path=db_file,
+    )
+    assert is_dup is True
+    assert "Local SQLite DB" in reason
+
+
+def test_check_duplicate_entry_guard_order_book():
+    from common.entry_order_manager import check_duplicate_entry_guard
+    with patch("common.entry_order_manager.fetch_normalized_orders", return_value=[
+        {"transaction_type": "BUY", "tag": "TUE-BUY", "status": "filled", "order_id": "ORD123"}
+    ]):
+        is_dup, reason = check_duplicate_entry_guard(
+            broker="upstox",
+            token="VALID_TOKEN",
+            tag="TUE-BUY",
+            start_date_str="20261125",
+            call_contract={"trading_symbol": "CE"},
+            put_contract={"trading_symbol": "PE"},
+            db_path=None,
+        )
+        assert is_dup is True
+        assert "Broker order book already has TUE-BUY" in reason
+
+
+def test_check_duplicate_entry_guard_clean():
+    from common.entry_order_manager import check_duplicate_entry_guard
+    with patch("common.entry_order_manager.fetch_normalized_orders", return_value=[]), \
+         patch("common.entry_order_manager.fetch_broker_positions", return_value=[]):
+        is_dup, reason = check_duplicate_entry_guard(
+            broker="upstox",
+            token="VALID_TOKEN",
+            tag="TUE-BUY",
+            start_date_str="20261125",
+            call_contract={"trading_symbol": "CE"},
+            put_contract={"trading_symbol": "PE"},
+            db_path=None,
+        )
+        assert is_dup is False
+        assert "Clean" in reason
+

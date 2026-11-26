@@ -124,41 +124,13 @@ def reset_triggers_all(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Post-Market Daily Paired BUY Trigger Re-arm Script")
-    parser.add_argument("--day", choices=["tuesday", "thursday", "tue", "thu"],
-                        help="Specific day to re-arm (defaults to today's weekday in IST)")
-    parser.add_argument("--all", action="store_true", help="Re-arm both daily buy triggers (Tue & Thu)")
-    parser.add_argument("--status", action="store_true", help="Display current status of both daily buy triggers")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate without writing to Redis")
-    parser.add_argument("--force", action="store_true", help="Force reset even during market hours")
-    args = parser.parse_args()
-
-    r = get_redis_client()
-    if args.status:
-        st = get_triggers_status(redis_client=r)
-        print("=== LIVE BUY TRIGGERS (Redis) ===")
-        for k, v in st.items():
-            print(f"  {k:30} : {v}")
-        return 0
-
-    if args.all:
-        ok = reset_triggers_all(dry_run=args.dry_run, force=args.force, redis_client=r)
-        return 0 if ok else 1
-
-    if args.day:
-        normalized_day = {
-            "tue": "tuesday", "thu": "thursday"
-        }.get(args.day.lower(), args.day.lower())
-    else:
-        now_ist = _now_ist()
-        normalized_day = now_ist.strftime("%A").lower()
-
-    if normalized_day not in DAY_KEY_MAP:
-        logger.info("[Trigger Reset] Today (%s) is not an active strategy buy day (Tue & Thu only). No action taken.", normalized_day.capitalize())
-        return 0
-
-    ok = reset_triggers_for_day(normalized_day, dry_run=args.dry_run, force=args.force, redis_client=r)
-    return 0 if ok else 1
+    logger.info(
+        "[DEPRECATED] scripts/reset_daily_buy_triggers.py is decommissioned. "
+        "BUY triggers (LIVE_BUY_TRIGGER_*) are now static in .env, and duplicate entry prevention "
+        "is strictly enforced via local snapshot, SQLite DB, and broker order checks. "
+        "Please remove this script from crontab."
+    )
+    return 0
 
 
 if __name__ == "__main__":

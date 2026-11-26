@@ -103,6 +103,8 @@ def auto_record_manual_exit(
     sell_qty: int,
     redis_client: Optional[Any] = None,
     dry_run: bool = False,
+    exit_reason_override: Optional[str] = None,
+    status_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Automatically record a manual exit detected from broker position data.
@@ -196,7 +198,13 @@ def auto_record_manual_exit(
     buy_price = float(fsm_leg.get("buy_price") or 0.0)
     has_valid_fill = sell_price is not None and float(sell_price) > 0
     qty_str = f"qty={sell_qty}" if (sell_qty and int(sell_qty) > 0) else "qty=unknown"
-    if has_valid_fill and buy_price > 0:
+    leg_status = status_override or "MANUAL_CLOSED"
+    if exit_reason_override:
+        exit_reason = exit_reason_override
+        exit_price_val = round(float(sell_price), 2) if has_valid_fill else None
+        realized_pnl = round(float(sell_price) - buy_price, 2) if (has_valid_fill and buy_price > 0) else None
+        realized_pnl_pct = round((realized_pnl / buy_price) * 100, 2) if (realized_pnl is not None and buy_price > 0) else None
+    elif has_valid_fill and buy_price > 0:
         realized_pnl = round(float(sell_price) - buy_price, 2)
         realized_pnl_pct = round((realized_pnl / buy_price) * 100, 2)
         exit_price_val = round(float(sell_price), 2)
@@ -214,7 +222,7 @@ def auto_record_manual_exit(
 
     if dry_run:
         result["plan"] = {
-            "action": "Would mark MANUAL_CLOSED",
+            "action": f"Would mark {leg_status}",
             "realized_pnl_pts": realized_pnl,
             "realized_pnl_pct": realized_pnl_pct,
             "redis_exited_key": build_exited_qty_key(cycle, expiry_iso, strike, option_type, broker),
@@ -238,7 +246,7 @@ def auto_record_manual_exit(
     new_fsm = copy.deepcopy(fsm)
     new_leg = new_fsm[fsm_leg_key]
     new_leg.update({
-        "status": "MANUAL_CLOSED",
+        "status": leg_status,
         "exit_price": exit_price_val,
         "exit_ts": sell_ts,
         "exit_reason": exit_reason,
@@ -744,21 +752,45 @@ def reconcile_broker_positions_with_snapshot(
                         sell_qty = day_sq
                     break
 
-        # 2. Search order book for completed SELL orders if fill price or quantity still unknown
-        if sell_price is None or sell_qty is None:
-            for o in orders:
-                txn = str(o.get("transaction_type") or "").upper()
-                status = str(o.get("status") or "").lower()
-                if txn == "SELL" and status in ("complete", "completed", "filled"):
-                    if contract_matches(o, target_strike=strike, target_opt_type=opt_type, target_expiry=snap_expiry, target_underlying="NIFTY"):
-                        fill_px = float(o.get("average_price") or o.get("price") or 0.0)
-                        if fill_px > 0 and sell_price is None:
-                            sell_price = fill_px
-                        o_qty = int(_to_float(o.get("quantity") or o.get("filled_quantity") or 0))
-                        if o_qty > 0 and sell_qty is None:
-                            sell_qty = o_qty
-                        if sell_price is not None and sell_qty is not None:
-                            break
+        # 2. Search order book for completed SELL orders and verify bot vs manual attribution
+        cycle_code = "tue" if track == "5day_strategy" else "thu"
+        managed_ids = set()
+        if redis_client:
+            try:
+                m1 = redis_client.smembers(f"fno:{active_broker}:managed_order_ids:{cycle_code}") or set()
+                m2 = redis_client.smembers(f"fno:{active_broker}:managed_order_ids") or set()
+                managed_ids = {str(x) for x in (m1 | m2)}
+            except Exception:
+                pass
+
+        matched_bot_order = None
+        for o in orders:
+            txn = str(o.get("transaction_type") or o.get("transactiontype") or "").upper()
+            status = str(o.get("status") or o.get("orderstatus") or "").lower()
+            if txn == "SELL" and status in ("complete", "completed", "filled"):
+                if contract_matches(o, target_strike=strike, target_opt_type=opt_type, target_expiry=snap_expiry, target_underlying="NIFTY"):
+                    o_tag = str(o.get("tag") or "").upper()
+                    o_id = str(o.get("order_id") or o.get("orderid") or "")
+                    if o_tag in ("TUE-SL", "THU-SL") or (managed_ids and o_id in managed_ids):
+                        matched_bot_order = o
+                    fill_px = float(o.get("average_price") or o.get("price") or 0.0)
+                    if fill_px > 0 and sell_price is None:
+                        sell_price = fill_px
+                    o_qty = int(_to_float(o.get("quantity") or o.get("filled_quantity") or 0))
+                    if o_qty > 0 and sell_qty is None:
+                        sell_qty = o_qty
+                    if sell_price is not None and sell_qty is not None and matched_bot_order is not None:
+                        break
+
+        exit_reason_override = None
+        status_override = None
+        if matched_bot_order is not None:
+            b_tag = matched_bot_order.get("tag") or ("TUE-SL" if cycle_code == "tue" else "THU-SL")
+            b_oid = matched_bot_order.get("order_id") or matched_bot_order.get("orderid") or "unknown"
+            fill_str = f" at ₹{sell_price:.2f}" if sell_price else ""
+            qty_str = f" (qty={sell_qty}, broker={active_broker})" if sell_qty else f" (broker={active_broker})"
+            exit_reason_override = f"AUTO_DETECTED bot exit{fill_str}{qty_str} (tag={b_tag}, order_id={b_oid})"
+            status_override = "TRAILING_STOP_CLOSED"
 
         # Call auto_record_manual_exit with exact fill price and quantity (or None if unavailable)
         rec_res = auto_record_manual_exit(
@@ -772,6 +804,8 @@ def reconcile_broker_positions_with_snapshot(
             sell_qty=sell_qty,
             redis_client=redis_client,
             dry_run=dry_run,
+            exit_reason_override=exit_reason_override,
+            status_override=status_override,
         )
         result["exits_recorded"].append(rec_res)
 

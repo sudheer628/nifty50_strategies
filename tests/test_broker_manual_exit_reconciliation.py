@@ -228,6 +228,65 @@ def test_reconcile_broker_positions_detects_manual_exit(mock_snapshot):
     assert snap["alpha_fsm"]["put_leg"]["status"] == "ACTIVE"
 
 
+def test_reconcile_broker_positions_detects_bot_exit_via_tag(mock_snapshot):
+    snap_file, active_file = mock_snapshot
+    r = MockRedis()
+    r.set("ORDERS_LIVE_TUE", "0")
+    
+    mock_adapter = MagicMock()
+    mock_adapter.fetch_positions.return_value = {
+        "status": "success",
+        "data": [
+            {
+                "tradingsymbol": "NIFTY03NOV2624000CE",
+                "quantity": 0,
+                "day_sell_quantity": 65,
+                "day_sell_price": 145.0,
+                "exchange": "NSE_FO",
+            },
+            {
+                "tradingsymbol": "NIFTY03NOV2624200PE",
+                "quantity": 65,
+                "day_buy_quantity": 65,
+                "exchange": "NSE_FO",
+            },
+        ],
+    }
+    mock_adapter.fetch_order_book.return_value = {
+        "status": "success",
+        "data": [
+            {
+                "tradingsymbol": "NIFTY03NOV2624000CE",
+                "transaction_type": "SELL",
+                "status": "complete",
+                "tag": "TUE-SL",
+                "order_id": "261126000004642",
+                "average_price": 145.0,
+                "quantity": 65,
+            }
+        ],
+    }
+    
+    with patch("common.broker_adapters.get_broker_adapter", return_value=mock_adapter), \
+         patch("common.entry_order_manager.get_broker_token", return_value="MOCK_TOKEN"):
+        rec = reconcile_broker_positions_with_snapshot(track="5day_strategy", redis_client=r)
+        
+    assert rec["reconciled"] is True
+    assert len(rec["exits_recorded"]) == 1
+    assert rec["exits_recorded"][0]["strike"] == 24000
+    assert rec["exits_recorded"][0]["option_type"] == "CE"
+    assert rec["exits_recorded"][0]["sell_price"] == 145.0
+    
+    with open(snap_file, "r") as f:
+        snap = json.load(f)
+    assert snap["alpha_fsm"]["call_leg"]["status"] == "TRAILING_STOP_CLOSED"
+    assert "AUTO_DETECTED bot exit" in snap["alpha_fsm"]["call_leg"]["exit_reason"]
+    assert "tag=TUE-SL" in snap["alpha_fsm"]["call_leg"]["exit_reason"]
+    assert "order_id=261126000004642" in snap["alpha_fsm"]["call_leg"]["exit_reason"]
+    assert snap["alpha_fsm"]["put_leg"]["status"] == "ACTIVE"
+
+
+
 def test_check_prior_cycle_open_positions(mock_snapshot):
     snap_file, _ = mock_snapshot
     mock_adapter = MagicMock()

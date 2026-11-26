@@ -191,6 +191,9 @@ def fetch_nifty_daily_ohlc(
     """
     import requests
 
+    if token == "MOCK_TOKEN" or str(token).startswith("MOCK") or str(token).startswith("SIM") or os.getenv("TEST_MODE") == "true":
+        return []
+
     encoded_key = urllib.parse.quote(instrument_key)
     today = get_today_ist()
     calendar_lookback = max(30, int(lookback_days * 3.5))

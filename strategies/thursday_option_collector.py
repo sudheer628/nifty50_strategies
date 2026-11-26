@@ -545,6 +545,21 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
                     "trading_symbol": f"NIFTY{expiry_angelone}{put_strike}PE",
                 }
 
+            from common.entry_order_manager import check_duplicate_entry_guard, get_broker_token
+            b_token = get_broker_token(track_broker)
+            is_dup, dup_reason = check_duplicate_entry_guard(
+                broker=track_broker,
+                token=b_token,
+                tag="THU-BUY",
+                start_date_str=start_str,
+                call_contract=call_contract,
+                put_contract=put_contract,
+                db_path=db_path,
+            )
+            if is_dup:
+                logger.info("[Thursday Track] %s. Aborting duplicate BUY entry.", dup_reason)
+                return True
+
             buy_res = execute_paired_market_buy(
                 broker=track_broker,
                 call_contract=call_contract,
@@ -631,18 +646,6 @@ def collect_once(force_static: bool = False, force_entry: bool = False, dry_run:
             put_order_id = buy_res.get("put_order_id")
             entry_status = "FILLED"
             broker_name = track_broker
-            try:
-                from config import set_config_value
-                if set_config_value(buy_trigger_key, "false"):
-                    logger.info("[Auto-Disarm] Disarmed %s=false in Redis after paired buy fill", buy_trigger_key)
-                else:
-                    logger.critical(
-                        "[Auto-Disarm] Could not disarm %s after paired buy fill; "
-                        "same-day duplicate prevention now depends on saving the filled cycle snapshot.",
-                        buy_trigger_key,
-                    )
-            except Exception as disarm_exc:
-                logger.warning("[Auto-Disarm] Failed to auto-disarm %s in Redis: %s", buy_trigger_key, disarm_exc)
             logger.info(
                 "[Thursday Track] LIVE BUY FILLED on %s: CALL %d CE @ %.2f (order_id=%s) | PUT %d PE @ %.2f (order_id=%s) | qty=%s",
                 track_broker, call_strike, call_buy_price, call_order_id,

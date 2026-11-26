@@ -837,6 +837,71 @@ def verify_positions_flat(
     }
 
 
+def check_duplicate_entry_guard(
+    broker: str,
+    token: str,
+    tag: str,
+    start_date_str: str,
+    call_contract: dict,
+    put_contract: dict,
+    db_path: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    Check if a cycle entry was already performed or is already in-flight
+    by verifying ground truth from:
+    1. Local SQLite DB buy_snapshots (if db_path is provided).
+    2. Broker order book (looking for completed or open BUY orders with matching tag).
+    3. Broker positions (checking if both contracts are already held with qty > 0).
+
+    Returns:
+        (is_duplicate: bool, reason: str)
+    """
+    # 1. Check local SQLite DB
+    if db_path and os.path.exists(db_path):
+        try:
+            import sqlite3
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT cycle_id, entry_status FROM buy_snapshots WHERE week_start_date = ?",
+                    (start_date_str,)
+                ).fetchone()
+                if row and str(row[1]).upper() in ("FILLED", "PAPER_ENTRY"):
+                    return True, f"Local SQLite DB ({db_path}) already contains entered cycle for week_start={start_date_str} (cycle_id={row[0]}, entry_status={row[1]})"
+        except Exception as exc:
+            logger.debug("[check_duplicate_entry_guard] SQLite check failed: %s", exc)
+
+    if token == MOCK_TOKEN:
+        return False, "Mock token, no broker check needed"
+
+    # 2. Check broker order book
+    try:
+        orders = fetch_normalized_orders(broker, token)
+        for o in orders:
+            raw_order = o.get("raw") or {}
+            o_tag = str(raw_order.get("tag") or o.get("tag") or "").upper()
+            o_txn = str(o.get("transaction_type") or "").upper()
+            o_status = str(o.get("status") or "").lower()
+            if o_txn == "BUY" and o_tag == tag.upper() and o_status in ("filled", "complete", "completed", "open", "submitted", "trigger pending"):
+                oid = o.get("order_id")
+                return True, f"Broker order book already has {tag} order {oid} with status '{o_status}'"
+    except Exception as exc:
+        logger.warning("[check_duplicate_entry_guard] Broker order book check failed: %s", exc)
+
+    # 3. Check broker positions
+    try:
+        positions = fetch_broker_positions(broker, token)
+        is_flat, details = verify_positions_flat(broker, positions, call_contract, put_contract)
+        if not is_flat:
+            call_qty = details.get("call_net", 0)
+            put_qty = details.get("put_net", 0)
+            if call_qty > 0 and put_qty > 0:
+                return True, f"Broker portfolio already holds open paired positions (CALL qty={call_qty}, PUT qty={put_qty})"
+    except Exception as exc:
+        logger.warning("[check_duplicate_entry_guard] Broker positions check failed: %s", exc)
+
+    return False, "Clean: no duplicate entry detected"
+
+
 # ---------------------------------------------------------------------------
 # Emergency Unwind Failure Alerting
 # ---------------------------------------------------------------------------

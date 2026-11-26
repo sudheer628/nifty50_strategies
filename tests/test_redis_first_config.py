@@ -43,10 +43,10 @@ def redis_cfg():
 # ---------------------------------------------------------------------------
 
 def test_redis_value_overrides_env(redis_cfg):
-    redis_cfg.set("EXIT_IMMEDIATELY_THURSDAY", "true")
+    redis_cfg.set("LIVE_EXIT_TRIGGER_THURSDAY", "true")
     redis_cfg.set("LOTS_THURSDAY", "2")
-    with patch.dict(os.environ, {"EXIT_IMMEDIATELY_THURSDAY": "false", "LOTS_THURSDAY": "1"}):
-        assert config.get_config_bool("EXIT_IMMEDIATELY_THURSDAY") is True
+    with patch.dict(os.environ, {"LIVE_EXIT_TRIGGER_THURSDAY": "false", "LOTS_THURSDAY": "1"}):
+        assert config.get_config_bool("LIVE_EXIT_TRIGGER_THURSDAY") is True
         assert config.get_config_int("LOTS_THURSDAY", 1) == 2
         assert config.get_config_flag("LOTS_THURSDAY") == "2"
 
@@ -79,9 +79,9 @@ def test_invalid_redis_value_is_ignored_and_env_used(redis_cfg, caplog):
 
 
 def test_invalid_everywhere_uses_default(redis_cfg):
-    redis_cfg.set("EXIT_IMMEDIATELY_TUESDAY", "maybe")
-    with patch.dict(os.environ, {"EXIT_IMMEDIATELY_TUESDAY": "perhaps"}):
-        assert config.get_config_bool("EXIT_IMMEDIATELY_TUESDAY", default=False) is False
+    redis_cfg.set("LIVE_BUY_TRIGGER_TUESDAY", "maybe")
+    with patch.dict(os.environ, {"LIVE_BUY_TRIGGER_TUESDAY": "perhaps"}):
+        assert config.get_config_bool("LIVE_BUY_TRIGGER_TUESDAY", default=False) is False
 
 
 def test_redis_outage_falls_back_to_env_and_does_not_retry(redis_cfg):
@@ -174,9 +174,9 @@ def test_exit_manager_live_gate_redis_first(module, up, gate, redis_val, env_val
 
 @pytest.mark.parametrize("module,up", [(tue_module, "TUESDAY"), (thu_module, "THURSDAY")])
 def test_exit_manager_lots_and_exit_mode_from_redis(module, up):
-    """LOTS_* and EXIT_IMMEDIATELY_* are resolved from Redis and passed to the order manager."""
+    """LOTS_* is resolved from Redis and passed to the order manager."""
     gate = "ORDERS_LIVE_TUE" if up == "TUESDAY" else "ORDERS_LIVE_THU"
-    r = FakeRedis({gate: "1", f"LOTS_{up}": "3", f"EXIT_IMMEDIATELY_{up}": "true", f"LIVE_EXIT_TRIGGER_{up}": "false"})
+    r = FakeRedis({gate: "1", f"LOTS_{up}": "3", f"LIVE_EXIT_TRIGGER_{up}": "false"})
     captured = {}
 
     def fake_manage(**kwargs):
@@ -193,11 +193,10 @@ def test_exit_manager_lots_and_exit_mode_from_redis(module, up):
          patch.object(module, "fetch_order_book", return_value=[]), \
          patch.object(module, "reconcile_cycle_legs", return_value=[]), \
          patch.object(sys, "argv", [f"{up.title()}-Fno-Exit-Orders-V1.py", "--execute"]), \
-         patch.dict(os.environ, {f"LOTS_{up}": "1", f"EXIT_IMMEDIATELY_{up}": "false", f"LIVE_EXIT_TRIGGER_{up}": "true"}):
+         patch.dict(os.environ, {f"LOTS_{up}": "1", f"LIVE_EXIT_TRIGGER_{up}": "true"}):
         module.main()
     assert captured, "order manager was not invoked"
     assert captured["target_lots"] == 3
-    assert captured["exit_immediately"] is True
     assert captured["execute"] is False  # LIVE_EXIT_TRIGGER from Redis=false forces dry-run
 
 
