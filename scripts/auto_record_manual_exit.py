@@ -755,11 +755,17 @@ def reconcile_broker_positions_with_snapshot(
         # 2. Search order book for completed SELL orders and verify bot vs manual attribution
         cycle_code = "tue" if track == "5day_strategy" else "thu"
         expected_tag = "TUE-SL" if cycle_code == "tue" else "THU-SL"
+        other_tag_prefixes = ("THU-",) if cycle_code == "tue" else ("TUE-",)
+        other_cycle_code = "thu" if cycle_code == "tue" else "tue"
+
         managed_ids = set()
+        other_managed_ids = set()
         if redis_client:
             try:
                 m1 = redis_client.smembers(f"fno:{active_broker}:managed_order_ids:{cycle_code}") or set()
                 managed_ids = {str(x.decode("utf-8") if isinstance(x, bytes) else x) for x in m1}
+                m2 = redis_client.smembers(f"fno:{active_broker}:managed_order_ids:{other_cycle_code}") or set()
+                other_managed_ids = {str(x.decode("utf-8") if isinstance(x, bytes) else x) for x in m2}
             except Exception:
                 pass
 
@@ -771,6 +777,11 @@ def reconcile_broker_positions_with_snapshot(
                 if contract_matches(o, target_strike=strike, target_opt_type=opt_type, target_expiry=snap_expiry, target_underlying="NIFTY"):
                     o_tag = str(o.get("tag") or "").upper()
                     o_id = str(o.get("order_id") or o.get("orderid") or "")
+
+                    # Strictly ignore orders belonging to the other cycle/track
+                    if any(o_tag.startswith(p) for p in other_tag_prefixes) or (other_managed_ids and o_id in other_managed_ids):
+                        continue
+
                     if o_tag == expected_tag or (managed_ids and o_id in managed_ids):
                         matched_bot_order = o
                     fill_px = float(o.get("average_price") or o.get("price") or 0.0)
@@ -781,6 +792,57 @@ def reconcile_broker_positions_with_snapshot(
                         sell_qty = o_qty
                     if sell_price is not None and sell_qty is not None and matched_bot_order is not None:
                         break
+
+        # Check if the contract is shared with the other cycle/track
+        other_track = "3day_strategy" if track == "5day_strategy" else "5day_strategy"
+        other_remaining = 0
+        try:
+            from common.unified_strategy_store import get_track_remaining_owned_qty
+            other_remaining = get_track_remaining_owned_qty(
+                other_track, int(float(strike)), opt_type,
+                snap_expiry, active_broker, redis_client=redis_client
+            )
+        except Exception:
+            other_remaining = 0
+
+        other_snap_file = THURSDAY_SNAPSHOT_FILE if track == "5day_strategy" else ACTIVE_SNAPSHOT_FILE
+        other_has_contract = False
+        try:
+            other_snap = load_active_snapshot(filepath=other_snap_file)
+            if other_snap and other_snap.get("status") != "closed":
+                other_fsm = other_snap.get("alpha_fsm") or {}
+                other_leg = other_fsm.get("call_leg" if opt_type == "CE" else "put_leg") or {}
+                if other_leg.get("status") == "ACTIVE":
+                    other_has_contract = True
+        except Exception:
+            pass
+
+        # If it's a shared contract and there is no matching bot exit order for this track:
+        # the missing broker position may be due to the other track's actions or a shared shortfall.
+        # Fail-closed and alert rather than misattributing to MANUAL_CLOSED.
+        if (other_remaining > 0 or other_has_contract) and matched_bot_order is None:
+            reason = (
+                f"Shared contract {strike} {opt_type}: broker position is 0 but no {expected_tag} exit order "
+                f"found in order book (other track has active/remaining holdings). Reconciliation skipped to avoid "
+                "misattributing cross-track exits or shared shortfall. Operator manual check required."
+            )
+            logger.critical("[%s] %s", track, reason)
+            result["errors"].append(reason)
+            try:
+                from common.entry_order_manager import dispatch_order_failure_discord
+                dispatch_order_failure_discord(
+                    broker=active_broker,
+                    action="SHARED_CONTRACT_RECONCILE_SKIP",
+                    track=track,
+                    symbol=f"NIFTY {strike} {opt_type}",
+                    quantity=int(fsm_leg.get("target_qty") or 65),
+                    error_reason=reason,
+                    redis_client=redis_client,
+                    cooldown_seconds=1800,
+                )
+            except Exception:
+                pass
+            continue
 
         exit_reason_override = None
         status_override = None

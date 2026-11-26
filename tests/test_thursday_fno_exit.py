@@ -1196,7 +1196,7 @@ class MockRedis:
         self.data = {}
     def get(self, key):
         return self.data.get(key)
-    def set(self, key, value):
+    def set(self, key, value, ex=None, **kwargs):
         self.data[key] = str(value)
         return True
     def delete(self, *keys):
@@ -1216,6 +1216,12 @@ class MockRedis:
         if isinstance(s, set):
             for v in values:
                 s.add(str(v))
+        return True
+    def srem(self, key, *values):
+        s = self.data.get(key)
+        if isinstance(s, set):
+            for v in values:
+                s.discard(str(v))
         return True
     def smembers(self, key):
         return self.data.get(key, set())
@@ -2034,4 +2040,88 @@ def test_thursday_breach_dry_run_reports_action_needed():
         assert action["dry_run"] is True
         assert action["action_needed"] is True
         assert action["breached"] is True
+
+
+def test_thursday_partial_slm_cancel_protects_other_track_quantity():
+    """Verify that if Thursday owns 130 and Tuesday owns 65 (shared 195 total),
+    and 65 fills during SL-M cancel, Thursday's market sell sizes at remaining 65, not 130."""
+    mock_redis = MockRedis()
+    keys = thu_module.build_trail_redis_keys("angelone", "NIFTY26NOV22650CE", "53750")
+    mock_redis.set(keys["enabled_canonical"], "1")
+    mock_redis.set(keys["order_id"], "slm_thu_123")
+
+    positions = [{
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "exchange": "NFO",
+        "quantity": 195,
+        "netqty": "195",
+        "_redis_target_qty": 130,
+        "average_price": 100.0,
+        "last_price": 110.0,
+    }]
+    orders = [{
+        "order_id": "slm_thu_123",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transaction_type": "SELL",
+        "status": "trigger_pending",
+        "order_type": "SL-M",
+        "tag": "THU-SL",
+        "quantity": 130,
+        "trigger_price": 80.0,
+    }]
+
+    def mock_cancel(*args, **kwargs):
+        return {"success": True, "order_id": "slm_thu_123"}
+
+    # Fresh positions returned after cancel: 130 remaining (195 - 65 filled = 130)
+    fresh_positions_after_cancel = {
+        "status": "success",
+        "data": [{
+            "tradingsymbol": "NIFTY26NOV22650CE",
+            "symboltoken": "53750",
+            "instrument_token": "53750",
+            "exchange": "NFO",
+            "quantity": 130,
+            "netqty": "130",
+            "average_price": 100.0,
+        }]
+    }
+
+    orders_after_cancel = [{
+        "order_id": "slm_thu_123",
+        "tradingsymbol": "NIFTY26NOV22650CE",
+        "symboltoken": "53750",
+        "instrument_token": "53750",
+        "transaction_type": "SELL",
+        "status": "cancelled",
+        "order_type": "SL-M",
+        "tag": "THU-SL",
+        "quantity": 130,
+        "filled_quantity": 65,
+    }]
+
+    with patch.object(thu_module, "cancel_order", side_effect=mock_cancel) as mock_cancel_call, \
+         patch.object(thu_module, "fetch_order_book", return_value=orders_after_cancel), \
+         patch.object(thu_module, "fetch_positions", return_value=fresh_positions_after_cancel), \
+         patch.object(thu_module, "place_exit_order_market", return_value={"success": True, "order_id": "mkt_remain_thu_456"}) as mock_place_mkt, \
+         patch("common.unified_strategy_store.get_track_remaining_owned_qty", return_value=65):
+
+        res = thu_module.manage_thursday_exit_orders(
+            token="REAL_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            exit_immediately=True,
+            redis_client=mock_redis,
+        )
+
+        mock_cancel_call.assert_called_once()
+        mock_place_mkt.assert_called_once()
+        # Market sell order must be for 65 (not 130)!
+        placed_qty = mock_place_mkt.call_args[0][2]
+        assert placed_qty == 65
 

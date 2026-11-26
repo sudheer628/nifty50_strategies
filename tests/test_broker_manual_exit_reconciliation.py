@@ -695,8 +695,8 @@ def test_auto_record_manual_exit_ignores_profit_target_closed_legs(mock_snapshot
     assert updated_snap["alpha_fsm"]["call_leg"]["status"] == "PROFIT_TARGET_CLOSED"
 
 
-def test_reconcile_broker_positions_rejects_cross_track_tag(mock_snapshot):
-    """Verify Tuesday reconciliation ignores a Thursday bot exit tag (THU-SL)."""
+def test_reconcile_broker_positions_rejects_cross_track_tag(mock_snapshot, tmp_path):
+    """Verify Tuesday reconciliation skips and alerts on a shared contract when only Thursday's tag (THU-SL) is present."""
     snap_file, active_file = mock_snapshot
     from scripts.auto_record_manual_exit import reconcile_broker_positions_with_snapshot
     broker_positions = []
@@ -716,20 +716,30 @@ def test_reconcile_broker_positions_rejects_cross_track_tag(mock_snapshot):
     adapter.fetch_positions.return_value = {"status": "success", "data": broker_positions}
 
     mock_redis = MockRedis()
+    # Mock Thursday snapshot to simulate shared contract
+    thu_snap_file = str(tmp_path / "thursday_snap.json")
+    with open(thu_snap_file, "w") as f:
+        json.dump({
+            "status": "active",
+            "call_strike": 24000,
+            "put_strike": 23500,
+            "alpha_fsm": {"call_leg": {"status": "ACTIVE"}, "put_leg": {"status": "ACTIVE"}}
+        }, f)
 
     with patch("scripts.auto_record_manual_exit.ACTIVE_SNAPSHOT_FILE", snap_file), \
+         patch("scripts.auto_record_manual_exit.THURSDAY_SNAPSHOT_FILE", thu_snap_file), \
          patch("common.broker_adapters.get_broker_adapter", return_value=adapter), \
          patch("common.entry_order_manager.get_broker_token", return_value="SIM_TOKEN"):
         res = reconcile_broker_positions_with_snapshot("5day_strategy", broker="upstox", redis_client=mock_redis)
 
     assert res["reconciled"] is True
-    assert len(res["exits_recorded"]) >= 1
-    call_rec = next((e for e in res["exits_recorded"] if e.get("option_type") == "CE"), None)
-    assert call_rec is not None
-    # Must NOT attribute the exit to bot tag THU-SL because this is Tuesday track!
+    # Must NOT record MANUAL_CLOSED for Tuesday because this is a shared contract with only Thursday's tag!
+    assert len(res["exits_recorded"]) == 0
+    assert any("Shared contract" in err for err in res["errors"])
+
     with open(snap_file, "r") as f:
         updated_snap = json.load(f)
     call_leg = updated_snap["alpha_fsm"]["call_leg"]
-    assert "THU-SL" not in str(call_leg.get("exit_reason"))
-    assert call_leg.get("status") == "MANUAL_CLOSED"
+    # Tuesday leg must remain ACTIVE (not overwritten to MANUAL_CLOSED)
+    assert call_leg.get("status") == "ACTIVE"
 

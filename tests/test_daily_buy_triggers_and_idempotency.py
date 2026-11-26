@@ -589,3 +589,139 @@ def test_carryforward_unauthorized_leg_skipped_by_exit_manager():
     assert action["status"] == "authorization_skipped"
     assert "missing/disabled Redis authorization key" in action["reason"]
 
+
+def test_full_carryforward_lifecycle_wednesday_to_thursday(tmp_path):
+    """
+    Test the full lifecycle of a carry-forward scenario:
+    1. Wednesday holiday makeup entry registered manually (calls/puts ACTIVE in snapshot, but legs NOT pre-authorized in Redis).
+    2. Wednesday intraday: Alpha FSM authorizes CE profit harvest -> published to Redis -> Tuesday manager sells CE at market.
+    3. Wednesday EOD / Thursday morning: PE remains ACTIVE in Alpha FSM and open at broker.
+    4. Thursday morning: Reconciler verifies position intact (no fake MANUAL_CLOSED).
+    5. Thursday 9:32 AM: Thursday cycle places paired BUY orders for Thursday track.
+    6. Thursday 9:33 AM: Tuesday exit manager runs; sees PE at broker, but because PE is NOT authorized in Redis,
+       it skips PE without placing any sell order!
+    """
+    from scripts.register_manual_entry import register_manual_cycle
+    from common.unified_strategy_store import publish_exit_authorization_to_redis
+    from common.fno_keys import build_leg_enabled_key
+    import tests.test_tuesday_fno_exit as tfe
+
+    mock_redis = tfe.MockRedis()
+    snap_dir = tmp_path / "strategies"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    snap_file = str(snap_dir / "current_week_buy.json")
+
+    expiry_iso = "2026-12-01"
+    start_date_iso = "2026-11-25"
+    call_strike = 25800
+    put_strike = 25800
+    broker = "upstox"
+
+    # Step 1: Register Wednesday manual entry
+    with patch("scripts.register_manual_entry.ACTIVE_SNAPSHOT_FILE", snap_file):
+        reg_res = register_manual_cycle(
+            track="5day_strategy",
+            call_strike=call_strike,
+            put_strike=put_strike,
+            call_price=200.0,
+            put_price=236.75,
+            call_order_id="ORD_BUY_CE_101",
+            put_order_id="ORD_BUY_PE_102",
+            expiry_iso=expiry_iso,
+            start_date_iso=start_date_iso,
+            broker=broker,
+            redis_client=mock_redis,
+        )
+
+    assert reg_res["status"] in ("ready", "registered_successfully")
+    # Verify Redis authorization keys are NOT set at entry!
+    ce_auth_key = build_leg_enabled_key("tue", expiry_iso, call_strike, "CE", broker)
+    pe_auth_key = build_leg_enabled_key("tue", expiry_iso, put_strike, "PE", broker)
+    assert mock_redis.get(ce_auth_key) is None
+    assert mock_redis.get(pe_auth_key) is None
+    # Verify LIVE_EXIT_TRIGGER_TUESDAY was not forced to true
+    assert mock_redis.get("LIVE_EXIT_TRIGGER_TUESDAY") is None
+
+    # Step 2: Wednesday intraday - Alpha FSM authorizes CE exit
+    publish_exit_authorization_to_redis(
+        track="5day_strategy",
+        call_exit=True,
+        put_exit=False,
+        strategy_data={
+            "expiry_date": expiry_iso,
+            "call_strike": call_strike,
+            "put_strike": put_strike,
+            "lots": 1,
+            "broker": broker,
+        },
+        redis_client=mock_redis,
+        broker=broker,
+    )
+    # CE is now authorized in Redis with mode immediate
+    ce_auth_val = mock_redis.get(ce_auth_key)
+    assert ce_auth_val is not None
+    assert "immediate" in ce_auth_val
+    # PE is STILL NOT authorized
+    assert mock_redis.get(pe_auth_key) is None
+
+    # Step 3: Tuesday exit manager runs on Wednesday to exit CE
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "tuesday_exit",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "Tuesday-Fno-Exit-Orders-V1.py")
+    )
+    tue_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tue_module)
+
+    ce_pos = {
+        "tradingsymbol": "NIFTY01DEC25800CE",
+        "instrument_token": "TOK_CE_25800",
+        "exchange": "NSE_FO",
+        "quantity": 65,
+        "average_price": 200.0,
+        "last_price": 240.0,
+    }
+    pe_pos = {
+        "tradingsymbol": "NIFTY01DEC25800PE",
+        "instrument_token": "TOK_PE_25800",
+        "exchange": "NSE_FO",
+        "quantity": 65,
+        "average_price": 236.75,
+        "last_price": 210.0,
+    }
+
+    with patch.object(tue_module, "place_exit_order_market", return_value={"success": True, "order_id": "ORD_CE_EXIT_MKT"}) as mock_mkt:
+        tue_res = tue_module.manage_tuesday_exit_orders(
+            token="SIM_TOKEN",
+            positions=[ce_pos, pe_pos],
+            orders=[],
+            execute=True,
+            redis_client=mock_redis,
+        )
+
+    # CE placed market sell order
+    mock_mkt.assert_called_once()
+    ce_action = next((a for a in tue_res["actions"] if "25800CE" in a.get("symbol", "")), None)
+    assert ce_action is not None
+    assert ce_action["status"] == "place_market"
+    assert ce_action["mode"] == "immediate"
+
+    # PE action was SKIPPED because authorization key is absent!
+    pe_action = next((a for a in tue_res["actions"] if "25800PE" in a.get("symbol", "")), None)
+    assert pe_action is not None
+    assert pe_action["status"] == "authorization_skipped"
+
+    # Step 4: Thursday morning - CE is flat, PE is held at broker (65 qty).
+    # Tuesday exit manager runs on Thursday morning:
+    with patch.object(tue_module, "place_exit_order_market") as mock_mkt_thu:
+        thu_res = tue_module.manage_tuesday_exit_orders(
+            token="SIM_TOKEN",
+            positions=[pe_pos],  # only PE position carried forward
+            orders=[],
+            execute=True,
+            redis_client=mock_redis,
+        )
+    # PE is STILL skipped without placing any order!
+    mock_mkt_thu.assert_not_called()
+    assert thu_res["actions"][0]["status"] == "authorization_skipped"
+

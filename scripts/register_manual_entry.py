@@ -354,15 +354,15 @@ def register_manual_cycle(
     put_trail = build_trail_redis_keys(broker, put_sym, put_tok, active_expiry=expiry_iso, cycle=cycle_shorthand)
 
     managed_orders_key = f"fno:{broker}:managed_order_ids:{cycle_shorthand}"
-    live_exit_key = "LIVE_EXIT_TRIGGER_TUESDAY" if is_tue else "LIVE_EXIT_TRIGGER_THURSDAY"
 
     # NOTE: Legs are NOT pre-authorized for exit in Redis at entry time!
     # Alpha FSM is the sole decision maker. Legs are authorized individually
     # only when Alpha FSM generates an exit signal for that specific leg.
+    # LIVE_EXIT_TRIGGER_* is managed by the operator or environment configuration,
+    # and is NOT forced enabled here.
     redis_ops = [
         ("SADD", managed_orders_key, call_order_id),
         ("SADD", managed_orders_key, put_order_id),
-        ("SET", live_exit_key, "true"),
     ]
 
     result = {

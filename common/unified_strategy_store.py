@@ -1021,18 +1021,18 @@ def publish_exit_authorization_to_redis(
         if call_exit and call_strike_raw:
             c_strike = int(call_strike_raw)
             c_key = build_leg_enabled_key(cycle, expiry_iso, c_strike, "CE", broker=broker)
-            c_val = json.dumps({"enabled": True, "qty": target_qty})
+            c_val = json.dumps({"enabled": True, "qty": target_qty, "mode": "immediate"})
             r.set(c_key, c_val, ex=604800)
             published_keys.append(c_key)
-            logger.info("Published Redis authorization key: %s (qty=%d)", c_key, target_qty)
+            logger.info("Published Redis authorization key: %s (qty=%d, mode=immediate)", c_key, target_qty)
 
         if put_exit and put_strike_raw:
             p_strike = int(put_strike_raw)
             p_key = build_leg_enabled_key(cycle, expiry_iso, p_strike, "PE", broker=broker)
-            p_val = json.dumps({"enabled": True, "qty": target_qty})
+            p_val = json.dumps({"enabled": True, "qty": target_qty, "mode": "immediate"})
             r.set(p_key, p_val, ex=604800)
             published_keys.append(p_key)
-            logger.info("Published Redis authorization key: %s (qty=%d)", p_key, target_qty)
+            logger.info("Published Redis authorization key: %s (qty=%d, mode=immediate)", p_key, target_qty)
 
         if published_keys:
             gate_key = "ORDERS_LIVE_TUE" if cycle == "tue" else "ORDERS_LIVE_THU"

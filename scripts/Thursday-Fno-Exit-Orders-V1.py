@@ -1523,13 +1523,22 @@ def manage_thursday_exit_orders(
         if canonical_val is not None:
             # Canonical key is present in Redis and is authoritative (no fall-through)
             enabled, redis_qty = _get_redis_leg_authorization(r, canonical_key)
+            auth_raw = canonical_val
         else:
             # Migration fallback: canonical key not set; check detailed key
             enabled, redis_qty = _get_redis_leg_authorization(r, keys["enabled"])
+            auth_raw = r.get(keys["enabled"]) if (r and keys.get("enabled")) else None
         if force or (token == MOCK_TOKEN) or enabled:
             pos_copy = dict(pos)
             if redis_qty and redis_qty > 0:
                 pos_copy["_redis_target_qty"] = redis_qty
+            if auth_raw:
+                try:
+                    raw_str = auth_raw.decode("utf-8") if isinstance(auth_raw, bytes) else str(auth_raw)
+                    if "immediate" in raw_str.lower():
+                        pos_copy["_redis_mode"] = "immediate"
+                except Exception:
+                    pass
             authorized.append(pos_copy)
             # Refresh TTL safeguard: While position is active & authorized, keep key alive (7 days)
             if r and enabled:
@@ -1647,7 +1656,7 @@ def manage_thursday_exit_orders(
             continue
 
         # Immediate Square-Off Mode check
-        is_immediate = bool(exit_immediately)
+        is_immediate = bool(exit_immediately) or (pos.get("_redis_mode") == "immediate")
         if not is_immediate and r:
             is_immediate = (_redis_text(r, keys["mode"]).lower() == "immediate")
 
@@ -2131,7 +2140,14 @@ def manage_thursday_exit_orders(
                     logger.info("[%s] Position flat after SL-M cancellation. Cleaning up.", symbol)
                     _cleanup_thursday_leg_state(r, keys, broker=broker, symbol=symbol)
                     continue
-                managed_qty = min(remaining_qty, leg_target_qty)
+                # Reserve other track's holdings and cap to this track's own remaining quantity
+                cap_for_this_track = max(0, remaining_qty - other_remaining)
+                remaining_own = max(0, leg_target_qty - own_filled)
+                managed_qty = min(remaining_own, cap_for_this_track)
+                if managed_qty <= 0:
+                    logger.info("[%s] Thursday position flat or reserved for other track after SL-M cancel (remaining=%d, reserved=%d)",
+                                symbol, remaining_qty, other_remaining)
+                    continue
 
             # If no open managed order was found, but a prior managed SL-M order_id is in Redis:
             # verify that the prior SL-M order is explicitly terminal (cancelled/filled) before placing market order
@@ -2680,7 +2696,14 @@ def manage_thursday_exit_orders(
                     logger.info("[%s] Position flat after SL-M cancellation. Cleaning up.", symbol)
                     _cleanup_thursday_leg_state(r, keys, broker=broker, symbol=symbol)
                     continue
-                managed_qty = min(remaining_qty, leg_target_qty)
+                # Reserve other track's holdings and cap to this track's own remaining quantity
+                cap_for_this_track = max(0, remaining_qty - other_remaining)
+                remaining_own = max(0, leg_target_qty - own_filled)
+                managed_qty = min(remaining_own, cap_for_this_track)
+                if managed_qty <= 0:
+                    logger.info("[%s] Thursday position flat or reserved for other track after SL-M cancel (remaining=%d, reserved=%d)",
+                                symbol, remaining_qty, other_remaining)
+                    continue
 
             # Place immediate MARKET exit order on breach
             try:
