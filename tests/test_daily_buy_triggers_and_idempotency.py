@@ -711,8 +711,55 @@ def test_full_carryforward_lifecycle_wednesday_to_thursday(tmp_path):
     assert pe_action is not None
     assert pe_action["status"] == "authorization_skipped"
 
-    # Step 4: Thursday morning - CE is flat, PE is held at broker (65 qty).
-    # Tuesday exit manager runs on Thursday morning:
+    # Step 4: Thursday morning - Reconciler runs before market open.
+    # Broker holds PE (65 qty); CE is closed (0 qty).
+    from scripts.auto_record_manual_exit import reconcile_broker_positions_with_snapshot
+    adapter = MagicMock()
+    # Live broker positions: only PE remains long, CE is closed
+    broker_positions_resp = {
+        "status": "success",
+        "data": [
+            {
+                "tradingsymbol": "NIFTY01DEC25800PE",
+                "instrument_token": "TOK_PE_25800",
+                "exchange": "NSE_FO",
+                "quantity": 65,
+                "average_price": 236.75,
+            }
+        ]
+    }
+    broker_orders = [
+        {
+            "order_id": "ORD_CE_EXIT_MKT",
+            "tag": "TUE-SL",
+            "transaction_type": "SELL",
+            "status": "complete",
+            "tradingsymbol": "NIFTY01DEC25800CE",
+            "instrument_token": "TOK_CE_25800",
+            "average_price": 240.0,
+            "quantity": 65,
+        }
+    ]
+    adapter.fetch_positions.return_value = broker_positions_resp
+    adapter.fetch_order_book.return_value = broker_orders
+
+    with patch("scripts.auto_record_manual_exit.ACTIVE_SNAPSHOT_FILE", snap_file), \
+         patch("common.broker_adapters.get_broker_adapter", return_value=adapter), \
+         patch("common.entry_order_manager.get_broker_token", return_value="SIM_TOKEN"):
+        recon_res = reconcile_broker_positions_with_snapshot("5day_strategy", broker="upstox", redis_client=mock_redis)
+
+    assert recon_res["reconciled"] is True
+    # PE is active at broker -> reconciler must NOT mark PE as manual exit!
+    pe_manual_exits = [e for e in recon_res["exits_recorded"] if e.get("option_type") == "PE"]
+    assert len(pe_manual_exits) == 0
+
+    with open(snap_file, "r") as f:
+        current_snap = json.load(f)
+    assert current_snap["alpha_fsm"]["put_leg"]["status"] == "ACTIVE"
+
+    # Step 5: Thursday 9:33 AM - Tuesday exit manager runs on Thursday morning.
+    # PE is held at broker (65 qty).
+    # Tuesday exit manager runs:
     with patch.object(tue_module, "place_exit_order_market") as mock_mkt_thu:
         thu_res = tue_module.manage_tuesday_exit_orders(
             token="SIM_TOKEN",
@@ -721,7 +768,7 @@ def test_full_carryforward_lifecycle_wednesday_to_thursday(tmp_path):
             execute=True,
             redis_client=mock_redis,
         )
-    # PE is STILL skipped without placing any order!
+    # PE is STILL skipped without placing any order because it is unauthorized!
     mock_mkt_thu.assert_not_called()
     assert thu_res["actions"][0]["status"] == "authorization_skipped"
 

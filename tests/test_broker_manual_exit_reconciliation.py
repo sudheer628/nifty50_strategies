@@ -699,7 +699,14 @@ def test_reconcile_broker_positions_rejects_cross_track_tag(mock_snapshot, tmp_p
     """Verify Tuesday reconciliation skips and alerts on a shared contract when only Thursday's tag (THU-SL) is present."""
     snap_file, active_file = mock_snapshot
     from scripts.auto_record_manual_exit import reconcile_broker_positions_with_snapshot
-    broker_positions = []
+    # PE is still open at broker, CE is flat
+    broker_positions = [{
+        "tradingsymbol": "NIFTY03NOV2624200PE",
+        "instrument_token": "TOK_PE",
+        "exchange": "NSE_FO",
+        "quantity": 65,
+        "average_price": 120.0,
+    }]
     # Thursday bot exit order on shared broker contract
     orders = [{
         "order_id": "ORD_THU_SL_999",
@@ -716,11 +723,13 @@ def test_reconcile_broker_positions_rejects_cross_track_tag(mock_snapshot, tmp_p
     adapter.fetch_positions.return_value = {"status": "success", "data": broker_positions}
 
     mock_redis = MockRedis()
-    # Mock Thursday snapshot to simulate shared contract
+    # Mock Thursday snapshot to simulate shared contract (same broker, expiry, and strike)
     thu_snap_file = str(tmp_path / "thursday_snap.json")
     with open(thu_snap_file, "w") as f:
         json.dump({
             "status": "active",
+            "broker": "upstox",
+            "expiry_date": "2026-11-03",
             "call_strike": 24000,
             "put_strike": 23500,
             "alpha_fsm": {"call_leg": {"status": "ACTIVE"}, "put_leg": {"status": "ACTIVE"}}
@@ -742,4 +751,61 @@ def test_reconcile_broker_positions_rejects_cross_track_tag(mock_snapshot, tmp_p
     call_leg = updated_snap["alpha_fsm"]["call_leg"]
     # Tuesday leg must remain ACTIVE (not overwritten to MANUAL_CLOSED)
     assert call_leg.get("status") == "ACTIVE"
+
+
+def test_reconcile_broker_positions_different_contract_not_treated_as_shared(mock_snapshot, tmp_path):
+    """Verify that if Thursday is active with a DIFFERENT strike, Tuesday is NOT treated as shared and records manual exit."""
+    snap_file, active_file = mock_snapshot
+    from scripts.auto_record_manual_exit import reconcile_broker_positions_with_snapshot
+    # PE is still open at broker, CE is flat
+    broker_positions = [{
+        "tradingsymbol": "NIFTY03NOV2624200PE",
+        "instrument_token": "TOK_PE",
+        "exchange": "NSE_FO",
+        "quantity": 65,
+        "average_price": 120.0,
+    }]
+    # Untagged manual sell order for Tuesday's 24000 CE
+    orders = [{
+        "order_id": "ORD_MANUAL_123",
+        "tag": "",
+        "transaction_type": "SELL",
+        "status": "complete",
+        "trading_symbol": "NIFTY03NOV2624000CE",
+        "instrument_token": "TOK_CE",
+        "average_price": 205.0,
+        "quantity": 65,
+    }]
+    adapter = MagicMock()
+    adapter.fetch_order_book.return_value = orders
+    adapter.fetch_positions.return_value = {"status": "success", "data": broker_positions}
+
+    mock_redis = MockRedis()
+    # Thursday snapshot has a DIFFERENT strike (24500 CE instead of 24000 CE)
+    thu_snap_file = str(tmp_path / "thursday_snap.json")
+    with open(thu_snap_file, "w") as f:
+        json.dump({
+            "status": "active",
+            "broker": "upstox",
+            "expiry_date": "2026-11-03",
+            "call_strike": 24500,
+            "put_strike": 23500,
+            "alpha_fsm": {"call_leg": {"status": "ACTIVE"}, "put_leg": {"status": "ACTIVE"}}
+        }, f)
+
+    with patch("scripts.auto_record_manual_exit.ACTIVE_SNAPSHOT_FILE", snap_file), \
+         patch("scripts.auto_record_manual_exit.THURSDAY_SNAPSHOT_FILE", thu_snap_file), \
+         patch("common.broker_adapters.get_broker_adapter", return_value=adapter), \
+         patch("common.entry_order_manager.get_broker_token", return_value="SIM_TOKEN"):
+        res = reconcile_broker_positions_with_snapshot("5day_strategy", broker="upstox", redis_client=mock_redis)
+
+    assert res["reconciled"] is True
+    assert len(res["exits_recorded"]) == 1
+    call_rec = res["exits_recorded"][0]
+    assert call_rec["success"] is True
+    assert call_rec["sell_price"] == 205.0
+
+    with open(snap_file, "r") as f:
+        updated_snap = json.load(f)
+    assert updated_snap["alpha_fsm"]["call_leg"]["status"] == "MANUAL_CLOSED"
 

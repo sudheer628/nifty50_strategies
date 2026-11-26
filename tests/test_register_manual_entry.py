@@ -142,7 +142,7 @@ def test_register_manual_cycle_dry_run(tmp_path):
     assert res["put_strike"] == 24100
     assert res["week_start_date"] == "20261111"
     assert res["expiry_date"] == "20261117"
-    assert res["redis_ops_count"] > 10
+    assert res["redis_ops_count"] == 2
 
 
 def test_register_manual_cycle_live(tmp_path):
@@ -198,13 +198,13 @@ def test_register_manual_cycle_live(tmp_path):
         assert alpha_fsm["call_leg"]["buy_price"] == 220.50
         assert alpha_fsm["put_leg"]["buy_price"] == 195.00
 
-        # Verify Redis keys
+        # Verify Redis keys: Legs are NOT pre-authorized, and LIVE triggers are NOT mutated
         set_calls = {call[0][0]: call[0][1] for call in mock_redis.set.call_args_list}
-        assert set_calls.get("fno:upstox:enabled:tue:2026-11-17:24300:CE") == "65"
-        assert set_calls.get("fno:upstox:enabled:tue:2026-11-17:24100:PE") == "65"
-        assert set_calls.get("ORDERS_LIVE_TUE") == "1"
-        assert set_calls.get("LIVE_BUY_TRIGGER_TUESDAY") == "false"
-        assert set_calls.get("LIVE_EXIT_TRIGGER_TUESDAY") == "true"
+        assert "fno:upstox:enabled:tue:2026-11-17:24300:CE" not in set_calls
+        assert "fno:upstox:enabled:tue:2026-11-17:24100:PE" not in set_calls
+        assert "ORDERS_LIVE_TUE" not in set_calls
+        assert "LIVE_BUY_TRIGGER_TUESDAY" not in set_calls
+        assert "LIVE_EXIT_TRIGGER_TUESDAY" not in set_calls
 
         # Verify managed order IDs
         sadd_calls = [call[0] for call in mock_redis.sadd.call_args_list]

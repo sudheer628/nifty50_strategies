@@ -813,7 +813,20 @@ def reconcile_broker_positions_with_snapshot(
                 other_fsm = other_snap.get("alpha_fsm") or {}
                 other_leg = other_fsm.get("call_leg" if opt_type == "CE" else "put_leg") or {}
                 if other_leg.get("status") == "ACTIVE":
-                    other_has_contract = True
+                    # Verify EXACT contract identity match: strike, expiry, and broker
+                    o_strike = other_snap.get("call_strike" if opt_type == "CE" else "put_strike")
+                    o_exp = other_snap.get("expiry_date") or other_snap.get("expiry")
+                    o_broker = (other_snap.get("broker") or ("upstox" if other_track == "5day_strategy" else "angelone")).lower().strip()
+
+                    same_strike = (o_strike is not None and int(float(o_strike)) == int(float(strike)))
+                    same_expiry = False
+                    if o_exp and snap_expiry:
+                        from common.fno_keys import normalize_expiry
+                        same_expiry = (normalize_expiry(o_exp) == normalize_expiry(snap_expiry))
+                    same_broker = (o_broker == active_broker)
+
+                    if same_strike and same_expiry and same_broker:
+                        other_has_contract = True
         except Exception:
             pass
 
