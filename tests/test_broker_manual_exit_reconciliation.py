@@ -694,3 +694,42 @@ def test_auto_record_manual_exit_ignores_profit_target_closed_legs(mock_snapshot
         updated_snap = json.load(f)
     assert updated_snap["alpha_fsm"]["call_leg"]["status"] == "PROFIT_TARGET_CLOSED"
 
+
+def test_reconcile_broker_positions_rejects_cross_track_tag(mock_snapshot):
+    """Verify Tuesday reconciliation ignores a Thursday bot exit tag (THU-SL)."""
+    snap_file, active_file = mock_snapshot
+    from scripts.auto_record_manual_exit import reconcile_broker_positions_with_snapshot
+    broker_positions = []
+    # Thursday bot exit order on shared broker contract
+    orders = [{
+        "order_id": "ORD_THU_SL_999",
+        "tag": "THU-SL",
+        "transaction_type": "SELL",
+        "status": "complete",
+        "trading_symbol": "NIFTY03NOV2624000CE",
+        "instrument_token": "TOK_CE",
+        "average_price": 210.0,
+        "quantity": 65,
+    }]
+    adapter = MagicMock()
+    adapter.fetch_order_book.return_value = orders
+    adapter.fetch_positions.return_value = {"status": "success", "data": broker_positions}
+
+    mock_redis = MockRedis()
+
+    with patch("scripts.auto_record_manual_exit.ACTIVE_SNAPSHOT_FILE", snap_file), \
+         patch("common.broker_adapters.get_broker_adapter", return_value=adapter), \
+         patch("common.entry_order_manager.get_broker_token", return_value="SIM_TOKEN"):
+        res = reconcile_broker_positions_with_snapshot("5day_strategy", broker="upstox", redis_client=mock_redis)
+
+    assert res["reconciled"] is True
+    assert len(res["exits_recorded"]) >= 1
+    call_rec = next((e for e in res["exits_recorded"] if e.get("option_type") == "CE"), None)
+    assert call_rec is not None
+    # Must NOT attribute the exit to bot tag THU-SL because this is Tuesday track!
+    with open(snap_file, "r") as f:
+        updated_snap = json.load(f)
+    call_leg = updated_snap["alpha_fsm"]["call_leg"]
+    assert "THU-SL" not in str(call_leg.get("exit_reason"))
+    assert call_leg.get("status") == "MANUAL_CLOSED"
+

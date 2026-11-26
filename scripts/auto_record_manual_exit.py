@@ -754,12 +754,12 @@ def reconcile_broker_positions_with_snapshot(
 
         # 2. Search order book for completed SELL orders and verify bot vs manual attribution
         cycle_code = "tue" if track == "5day_strategy" else "thu"
+        expected_tag = "TUE-SL" if cycle_code == "tue" else "THU-SL"
         managed_ids = set()
         if redis_client:
             try:
                 m1 = redis_client.smembers(f"fno:{active_broker}:managed_order_ids:{cycle_code}") or set()
-                m2 = redis_client.smembers(f"fno:{active_broker}:managed_order_ids") or set()
-                managed_ids = {str(x) for x in (m1 | m2)}
+                managed_ids = {str(x.decode("utf-8") if isinstance(x, bytes) else x) for x in m1}
             except Exception:
                 pass
 
@@ -771,7 +771,7 @@ def reconcile_broker_positions_with_snapshot(
                 if contract_matches(o, target_strike=strike, target_opt_type=opt_type, target_expiry=snap_expiry, target_underlying="NIFTY"):
                     o_tag = str(o.get("tag") or "").upper()
                     o_id = str(o.get("order_id") or o.get("orderid") or "")
-                    if o_tag in ("TUE-SL", "THU-SL") or (managed_ids and o_id in managed_ids):
+                    if o_tag == expected_tag or (managed_ids and o_id in managed_ids):
                         matched_bot_order = o
                     fill_px = float(o.get("average_price") or o.get("price") or 0.0)
                     if fill_px > 0 and sell_price is None:

@@ -862,13 +862,13 @@ def check_duplicate_entry_guard(
             import sqlite3
             with sqlite3.connect(db_path) as conn:
                 row = conn.execute(
-                    "SELECT cycle_id, entry_status FROM buy_snapshots WHERE week_start_date = ?",
+                    "SELECT cycle_id, entry_status FROM strategy_buy_snapshots WHERE week_start_date = ?",
                     (start_date_str,)
                 ).fetchone()
-                if row and str(row[1]).upper() in ("FILLED", "PAPER_ENTRY"):
+                if row and str(row[1]).upper() in ("FILLED", "PAPER_ENTRY", "COMPLETED"):
                     return True, f"Local SQLite DB ({db_path}) already contains entered cycle for week_start={start_date_str} (cycle_id={row[0]}, entry_status={row[1]})"
         except Exception as exc:
-            logger.debug("[check_duplicate_entry_guard] SQLite check failed: %s", exc)
+            logger.warning("[check_duplicate_entry_guard] SQLite check failed: %s", exc)
 
     if token == MOCK_TOKEN:
         return False, "Mock token, no broker check needed"
@@ -894,8 +894,8 @@ def check_duplicate_entry_guard(
         if not is_flat:
             call_qty = details.get("call_net", 0)
             put_qty = details.get("put_net", 0)
-            if call_qty > 0 and put_qty > 0:
-                return True, f"Broker portfolio already holds open paired positions (CALL qty={call_qty}, PUT qty={put_qty})"
+            if call_qty > 0 or put_qty > 0:
+                return True, f"Broker portfolio already holds open contract position(s) (CALL qty={call_qty}, PUT qty={put_qty})"
     except Exception as exc:
         logger.warning("[check_duplicate_entry_guard] Broker positions check failed: %s", exc)
 

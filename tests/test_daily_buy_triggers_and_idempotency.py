@@ -423,11 +423,26 @@ def test_cross_track_broker_wide_check_fails_closed_when_track_brokers_differ():
 
 def test_check_duplicate_entry_guard_sqlite(tmp_path):
     from common.entry_order_manager import check_duplicate_entry_guard
-    import sqlite3
+    from common.storage import init_db, insert_buy_snapshot
     db_file = str(tmp_path / "test.db")
-    with sqlite3.connect(db_file) as conn:
-        conn.execute("CREATE TABLE buy_snapshots (cycle_id TEXT, week_start_date TEXT, entry_status TEXT)")
-        conn.execute("INSERT INTO buy_snapshots VALUES ('CYCLE-TUE-20261125', '20261125', 'FILLED')")
+    init_db(db_file)
+    insert_buy_snapshot(
+        db_file,
+        {
+            "strategy_name": "nifty50_options_strategy",
+            "cycle_id": "CYCLE-TUE-20261125",
+            "week_start_date": "20261125",
+            "expiry_date": "20261201",
+            "call_strike": 24000,
+            "put_strike": 24200,
+            "call_buy_price": 100.0,
+            "put_buy_price": 100.0,
+            "entry_spot": 24100.0,
+            "captured_at": 1700000000,
+            "entry_status": "FILLED",
+            "broker": "upstox",
+        }
+    )
 
     is_dup, reason = check_duplicate_entry_guard(
         broker="upstox",
@@ -440,6 +455,26 @@ def test_check_duplicate_entry_guard_sqlite(tmp_path):
     )
     assert is_dup is True
     assert "Local SQLite DB" in reason
+
+
+def test_check_duplicate_entry_guard_single_leg_held():
+    from common.entry_order_manager import check_duplicate_entry_guard
+    positions = [
+        {"tradingsymbol": "NIFTY26NOV24000CE", "instrument_token": "TOK_CE", "quantity": 65}
+    ]
+    with patch("common.entry_order_manager.fetch_normalized_orders", return_value=[]), \
+         patch("common.entry_order_manager.fetch_broker_positions", return_value=positions):
+        is_dup, reason = check_duplicate_entry_guard(
+            broker="upstox",
+            token="VALID_TOKEN",
+            tag="TUE-BUY",
+            start_date_str="20261125",
+            call_contract={"trading_symbol": "NIFTY26NOV24000CE", "instrument_token": "TOK_CE"},
+            put_contract={"trading_symbol": "NIFTY26NOV24200PE", "instrument_token": "TOK_PE"},
+            db_path=None,
+        )
+        assert is_dup is True
+        assert "Broker portfolio already holds open contract position(s)" in reason
 
 
 def test_check_duplicate_entry_guard_order_book():
@@ -475,4 +510,82 @@ def test_check_duplicate_entry_guard_clean():
         )
         assert is_dup is False
         assert "Clean" in reason
+
+
+def test_register_manual_entry_does_not_preauthorize_legs(tmp_path):
+    """Verify register_manual_cycle does NOT pre-authorize exit keys in Redis or disarm buy flag."""
+    from scripts.register_manual_entry import register_manual_cycle
+    import tests.test_tuesday_fno_exit as tfe
+    mock_redis = tfe.MockRedis()
+    snap_file = str(tmp_path / "current_week_buy.json")
+    db_file = str(tmp_path / "weekly.db")
+
+    with patch("scripts.register_manual_entry.ACTIVE_SNAPSHOT_FILE", snap_file), \
+         patch("scripts.register_manual_entry.build_db_path", return_value=db_file), \
+         patch("scripts.register_manual_entry.init_or_rotate_cycle"), \
+         patch("scripts.register_manual_entry.update_locked_prices"):
+        res = register_manual_cycle(
+            track="5day_strategy",
+            call_strike=24000,
+            put_strike=24200,
+            call_price=150.0,
+            put_price=140.0,
+            call_order_id="ORD_CALL_01",
+            put_order_id="ORD_PUT_01",
+            expiry_iso="2026-12-01",
+            start_date_iso="2026-11-25",
+            broker="upstox",
+            redis_client=mock_redis,
+        )
+
+    assert res["status"] in ("registered_successfully", "ready")
+    # Neither leg should be authorized for exit yet
+    call_key = "fno:leg_enabled:tue:2026-12-01:24000:CE"
+    put_key = "fno:leg_enabled:tue:2026-12-01:24200:PE"
+    assert mock_redis.get(call_key) is None
+    assert mock_redis.get(put_key) is None
+    assert mock_redis.get("ORDERS_LIVE_TUE") is None
+    # Live buy trigger must NOT be set to false
+    assert mock_redis.get("LIVE_BUY_TRIGGER_TUESDAY") is None
+
+
+def test_carryforward_unauthorized_leg_skipped_by_exit_manager():
+    """Verify an active carried-forward leg (e.g. Wednesday entry, PE held on Thursday) is skipped by exit manager."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "tuesday_exit",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "Tuesday-Fno-Exit-Orders-V1.py")
+    )
+    tue_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tue_module)
+    import tests.test_tuesday_fno_exit as tfe
+    mock_redis = tfe.MockRedis()
+    # Ensure neither leg is authorized in Redis
+    positions = [{
+        "tradingsymbol": "NIFTY26DEC25800PE",
+        "instrument_token": "NSE_FO_99999",
+        "exchange": "NSE_FO",
+        "quantity": 65,
+        "average_price": 236.75,
+        "last_price": 194.10,
+    }]
+    orders = []
+
+    with patch.object(tue_module, "place_exit_order_market") as mock_mkt, \
+         patch.object(tue_module, "place_exit_order_slm") as mock_slm:
+        res = tue_module.manage_tuesday_exit_orders(
+            token="SIM_TOKEN",
+            positions=positions,
+            orders=orders,
+            execute=True,
+            redis_client=mock_redis,
+        )
+
+    # Position must be skipped because Redis authorization key is absent
+    assert res.get("authorized_positions") == 0
+    mock_mkt.assert_not_called()
+    mock_slm.assert_not_called()
+    action = res["actions"][0]
+    assert action["status"] == "authorization_skipped"
+    assert "missing/disabled Redis authorization key" in action["reason"]
 

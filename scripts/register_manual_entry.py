@@ -354,32 +354,15 @@ def register_manual_cycle(
     put_trail = build_trail_redis_keys(broker, put_sym, put_tok, active_expiry=expiry_iso, cycle=cycle_shorthand)
 
     managed_orders_key = f"fno:{broker}:managed_order_ids:{cycle_shorthand}"
-    orders_live_key = "ORDERS_LIVE_TUE" if is_tue else "ORDERS_LIVE_THU"
-    live_buy_key = "LIVE_BUY_TRIGGER_TUESDAY" if is_tue else "LIVE_BUY_TRIGGER_THURSDAY"
     live_exit_key = "LIVE_EXIT_TRIGGER_TUESDAY" if is_tue else "LIVE_EXIT_TRIGGER_THURSDAY"
 
+    # NOTE: Legs are NOT pre-authorized for exit in Redis at entry time!
+    # Alpha FSM is the sole decision maker. Legs are authorized individually
+    # only when Alpha FSM generates an exit signal for that specific leg.
     redis_ops = [
-        ("SET", call_auth_key, str(qty)),
-        ("SET", put_auth_key, str(qty)),
         ("SADD", managed_orders_key, call_order_id),
         ("SADD", managed_orders_key, put_order_id),
-        ("SET", orders_live_key, "1"),
-        ("SET", live_buy_key, "false"),
         ("SET", live_exit_key, "true"),
-        # Trailing keys for Call
-        ("SET", call_trail["avg"], str(call_price)),
-        ("SET", call_trail["max"], str(call_price)),
-        ("SET", call_trail["sl"], str(round(call_price * 0.75, 2))),
-        ("SET", call_trail["qty"], str(qty)),
-        ("SET", call_trail["mode"], "slm"),
-        ("SET", call_trail["entry_order_id"], str(call_order_id)),
-        # Trailing keys for Put
-        ("SET", put_trail["avg"], str(put_price)),
-        ("SET", put_trail["max"], str(put_price)),
-        ("SET", put_trail["sl"], str(round(put_price * 0.75, 2))),
-        ("SET", put_trail["qty"], str(qty)),
-        ("SET", put_trail["mode"], "slm"),
-        ("SET", put_trail["entry_order_id"], str(put_order_id)),
     ]
 
     result = {

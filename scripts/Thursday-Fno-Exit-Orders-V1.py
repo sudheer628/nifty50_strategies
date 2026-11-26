@@ -1646,6 +1646,11 @@ def manage_thursday_exit_orders(
             _check_and_reset_orders_live_thu(r, broker=broker)
             continue
 
+        # Immediate Square-Off Mode check
+        is_immediate = bool(exit_immediately)
+        if not is_immediate and r:
+            is_immediate = (_redis_text(r, keys["mode"]).lower() == "immediate")
+
         # Read Redis state
         try:
             old_max = _redis_float(r, keys["max"]) if r else 0.0
@@ -1696,7 +1701,7 @@ def manage_thursday_exit_orders(
                 "symbol": symbol, "instrument_token": token_key, "status": "manual_sell_conflict",
                 "reason": f"an untagged/manual open SELL order exists in {broker.title()}; script leaves it untouched and will not create a duplicate",
                 "manual_order_ids": [o.get("order_id") or o.get("orderid") for o in manual_sells], "redis_keys": keys,
-                "mode": "trailing"
+                "mode": "immediate" if is_immediate else "trailing"
             }
             actions.append(item)
             alerts.append({"severity": "HIGH", **item})
@@ -1785,8 +1790,8 @@ def manage_thursday_exit_orders(
                     "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
                     "instrument_token": token_key, "tag": tag, "quantity": 0,
                     "total_broker_qty": total_broker_qty,
-                    "status": "own_exit_already_filled",
-                    "own_filled_qty": own_filled, "mode": "trailing",
+                    "status": "market_order_already_filled" if is_immediate else "own_exit_already_filled",
+                    "own_filled_qty": own_filled, "mode": "immediate" if is_immediate else "trailing",
                     "success": True,
                     "reason": f"Thursday exit already filled its authorized quantity ({own_filled}/{leg_target_qty}); "
                               f"remaining broker qty {total_broker_qty} is not owned by this track",
@@ -1930,6 +1935,523 @@ def manage_thursday_exit_orders(
             actions.append(item)
             alerts.append({"severity": "CRITICAL", **item})
             logger.critical("[%s] stale %s SELL order %s after new entry", symbol, tag, existing_order_id)
+            continue
+
+        # Immediate Square-Off Mode
+        if is_immediate:
+            if execute and r:
+                try:
+                    r.set(keys["mode"], "immediate")
+                except Exception:
+                    pass
+
+            product_for_position = get_exit_product(pos, broker=broker, cli_product=product)
+            existing_type = str((existing or {}).get("order_type") or (existing or {}).get("ordertype") or "").upper()
+
+            # Case A: Market exit order already in-flight in broker order book
+            if existing and existing_type == "MARKET":
+                base = {
+                    "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                    "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                    "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                    "status": "market_order_in_flight", "order_id": existing_order_id, "mode": "immediate",
+                    "reason": f"Market exit order {existing_order_id} is already in-flight",
+                    "product": product_for_position,
+                }
+                actions.append(base)
+                logger.info("[%s] Market exit order %s is already in-flight", symbol, existing_order_id)
+                continue
+
+            # Case B: Managed SL-M order exists; must cancel before submitting market sell order
+            if existing:
+                if not execute:
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "cancel_slm_for_immediate_exit", "dry_run": True, "action_needed": True,
+                        "order_id": existing_order_id, "mode": "immediate", "product": product_for_position,
+                        "reason": f"Existing {existing_type} order {existing_order_id} must be cancelled before immediate market exit",
+                    }
+                    actions.append(base)
+                    continue
+
+                if token == MOCK_TOKEN:
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "mock_execute_blocked", "reason": "mock token cannot place real orders",
+                        "mode": "immediate", "success": False,
+                    }
+                    actions.append(base)
+                    continue
+
+                if abort_event is not None and abort_event.is_set():
+                    logger.critical("[%s] Distributed lock lost immediately before cancelling SL-M order %s! Aborting.", symbol, existing_order_id)
+                    base = {"status": "lock_lost", "error": "Distributed lock lost before broker mutation", "success": False, "mode": "immediate"}
+                    actions.append(base)
+                    alerts.append({"severity": "CRITICAL", **base})
+                    return {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker,
+                        "positions": len(positions), "authorized_positions": len(authorized),
+                        "actions": actions, "orphan_managed_orders": orphan_managed_orders,
+                        "alerts": alerts, "fatal_error": "lock_lost", "dry_run": not execute,
+                    }
+
+                if not force:
+                    is_open, open_reason = is_market_hours_ist()
+                    if not is_open:
+                        logger.warning("[%s] Market closed (%s) before cancelling SL-M order %s. Aborting.", symbol, open_reason, existing_order_id)
+                        base = {"status": "market_closed", "error": f"Market closed before broker mutation: {open_reason}", "success": False, "mode": "immediate"}
+                        actions.append(base)
+                        alerts.append({"severity": "CRITICAL", **base})
+                        return {
+                            "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker,
+                            "positions": len(positions), "authorized_positions": len(authorized),
+                            "actions": actions, "orphan_managed_orders": orphan_managed_orders,
+                            "alerts": alerts, "fatal_error": "market_closed", "dry_run": not execute,
+                        }
+
+                cancel_res = cancel_order(token, existing_order_id, broker=broker, variety="STOPLOSS")
+                if not cancel_res.get("success"):
+                    cancel_err = cancel_res.get("error")
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="SELL_SLM_CANCEL_FAILED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=f"Failed to cancel existing SL-M order {existing_order_id} before market exit: {cancel_err}",
+                        details={"order_id": existing_order_id, "error": cancel_err, "result": cancel_res},
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "cancel_slm_failed", "order_id": existing_order_id, "mode": "immediate",
+                        "error": cancel_err, "success": False,
+                    }
+                    actions.append(base)
+                    alerts.append({"severity": "CRITICAL", **base})
+                    continue
+
+                # Verify terminal status in orderbook
+                time.sleep(0.5)
+                fresh_orders = fetch_order_book(token, broker=broker)
+                fresh_existing = next((o for o in fresh_orders if str(o.get("order_id") or o.get("orderid") or "") == existing_order_id), None)
+                if fresh_existing is None:
+                    missing_msg = f"SL-M order {existing_order_id} missing from follow-up order book; deferring market order until terminal confirmation"
+                    logger.warning(
+                        "[%s] SL-M %s missing from follow-up order book after cancel. Retaining Redis state and deferring market order.",
+                        symbol, existing_order_id
+                    )
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="IMMEDIATE_EXIT_BLOCKED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=missing_msg,
+                        details={"order_id": existing_order_id, "status": "cancel_slm_missing"},
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "cancel_slm_missing", "order_id": existing_order_id, "mode": "immediate",
+                        "reason": missing_msg,
+                        "success": False,
+                    }
+                    actions.append(base)
+                    alerts.append({"severity": "HIGH", **base})
+                    continue
+
+                fresh_status = normalize_order_status(fresh_existing.get("status"))
+                if fresh_status in OPEN_ORDER_STATUSES:
+                    logger.warning("[%s] SL-M %s cancel requested but still pending (%s). Next cron run will place market order.", symbol, existing_order_id, fresh_status)
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "cancel_slm_pending", "order_id": existing_order_id, "mode": "immediate",
+                        "reason": f"SL-M cancellation in-flight ({fresh_status}); will place market order on next run",
+                        "success": True,
+                    }
+                    actions.append(base)
+                    continue
+                elif fresh_status in TERMINAL_FILLED_STATUSES:
+                    logger.info("[%s] SL-M %s filled before cancellation. Position flat.", symbol, existing_order_id)
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "slm_already_filled", "order_id": existing_order_id, "mode": "immediate", "success": True,
+                    }
+                    actions.append(base)
+                    continue
+                elif fresh_status not in TERMINAL_CANCELLED_STATUSES:
+                    unknown_msg = f"SL-M order {existing_order_id} has unrecognized status '{fresh_status}'; deferring market order until confirmed terminal"
+                    logger.warning(
+                        "[%s] SL-M %s has unknown/unrecognized status '%s'. Retaining Redis state and deferring market order.",
+                        symbol, existing_order_id, fresh_status
+                    )
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="IMMEDIATE_EXIT_BLOCKED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=unknown_msg,
+                        details={"order_id": existing_order_id, "status": "cancel_slm_unknown_status", "broker_status": fresh_status},
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "cancel_slm_unknown_status", "order_id": existing_order_id, "mode": "immediate",
+                        "reason": unknown_msg,
+                        "success": False,
+                    }
+                    actions.append(base)
+                    alerts.append({"severity": "HIGH", **base})
+                    continue
+
+                # Re-fetch positions to determine exact remaining long quantity
+                fresh_positions, _ = parse_positions(fetch_positions(token, broker=broker))
+                fresh_pos = next((p for p in fresh_positions if order_matches_position({"instrument_token": token_key, "tradingsymbol": symbol}, p)), None)
+                remaining_qty = int(_position_quantity(fresh_pos)) if fresh_pos else 0
+                if remaining_qty <= 0:
+                    logger.info("[%s] Position flat after SL-M cancellation. Cleaning up.", symbol)
+                    _cleanup_thursday_leg_state(r, keys, broker=broker, symbol=symbol)
+                    continue
+                managed_qty = min(remaining_qty, leg_target_qty)
+
+            # If no open managed order was found, but a prior managed SL-M order_id is in Redis:
+            # verify that the prior SL-M order is explicitly terminal (cancelled/filled) before placing market order
+            if not existing and stored_order_id:
+                prior_slm = next((o for o in orders if str(o.get("order_id") or o.get("orderid") or "") == stored_order_id), None)
+                if prior_slm is None:
+                    prior_missing_msg = f"Prior managed SL-M {stored_order_id} missing from order book; deferring market order until confirmed terminal"
+                    logger.warning(
+                        "[%s] Prior managed SL-M %s in Redis is missing from broker order book. Retaining Redis state and deferring market order.",
+                        symbol, stored_order_id
+                    )
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="IMMEDIATE_EXIT_BLOCKED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=prior_missing_msg,
+                        details={"order_id": stored_order_id, "status": "cancel_slm_missing"},
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "cancel_slm_missing", "order_id": stored_order_id, "mode": "immediate",
+                        "reason": prior_missing_msg,
+                        "success": False,
+                    }
+                    actions.append(base)
+                    alerts.append({"severity": "HIGH", **base})
+                    continue
+
+                prior_slm_status = normalize_order_status(prior_slm.get("status"))
+                if prior_slm_status in OPEN_ORDER_STATUSES:
+                    logger.warning("[%s] Prior managed SL-M %s is still pending (%s). Deferring market order.", symbol, stored_order_id, prior_slm_status)
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "cancel_slm_pending", "order_id": stored_order_id, "mode": "immediate",
+                        "reason": f"Prior managed SL-M {stored_order_id} is still in-flight ({prior_slm_status}); deferring market order",
+                        "success": True,
+                    }
+                    actions.append(base)
+                    continue
+                elif prior_slm_status in TERMINAL_FILLED_STATUSES:
+                    logger.info("[%s] Prior managed SL-M %s was already filled. Position flat.", symbol, stored_order_id)
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "slm_already_filled", "order_id": stored_order_id, "mode": "immediate", "success": True,
+                    }
+                    actions.append(base)
+                    continue
+                elif prior_slm_status not in TERMINAL_CANCELLED_STATUSES:
+                    prior_unknown_msg = f"Prior managed SL-M {stored_order_id} has unrecognized status '{prior_slm_status}'; deferring market order"
+                    logger.warning(
+                        "[%s] Prior managed SL-M %s has unknown status '%s'. Retaining Redis state and deferring market order.",
+                        symbol, stored_order_id, prior_slm_status
+                    )
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="IMMEDIATE_EXIT_BLOCKED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=prior_unknown_msg,
+                        details={"order_id": stored_order_id, "status": "cancel_slm_unknown_status", "broker_status": prior_slm_status},
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "cancel_slm_unknown_status", "order_id": stored_order_id, "mode": "immediate",
+                        "reason": prior_unknown_msg,
+                        "success": False,
+                    }
+                    actions.append(base)
+                    alerts.append({"severity": "HIGH", **base})
+                    continue
+
+            # Check if a market order was already placed previously and is still in-flight or partially filled
+            stored_market_id = _redis_text(r, keys["market_order_id"]) if r else ""
+            if stored_market_id:
+                managed_ids_set = set(managed_order_ids_in_redis)
+                if stored_market_id:
+                    managed_ids_set.add(stored_market_id)
+
+                managed_market_sells = [
+                    o for o in orders
+                    if order_matches_position(o, pos)
+                    and str(o.get("transaction_type") or o.get("transactiontype") or "").upper() == "SELL"
+                    and str(o.get("order_type") or o.get("ordertype") or "").upper() in ("MARKET", "STOPLOSS_MARKET")
+                    and (
+                        str(o.get("order_id") or o.get("orderid") or "") in managed_ids_set
+                        or order_tag(o).upper() == tag.upper()
+                    )
+                ]
+                prior_order = next((o for o in orders if str(o.get("order_id") or o.get("orderid") or "") == stored_market_id), None)
+                if prior_order and prior_order not in managed_market_sells:
+                    managed_market_sells.append(prior_order)
+
+                # Check if any managed market sell order is currently in-flight
+                in_flight_market = next((o for o in managed_market_sells if is_open_sell_order(o)), None)
+                if in_flight_market:
+                    in_flight_id = str(in_flight_market.get("order_id") or in_flight_market.get("orderid") or "")
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "market_order_in_flight", "order_id": in_flight_id, "mode": "immediate",
+                        "reason": f"Market order {in_flight_id} is already in-flight",
+                        "product": product_for_position,
+                    }
+                    actions.append(base)
+                    logger.info("[%s] Market exit order %s is already in-flight", symbol, in_flight_id)
+                    continue
+
+                # Compute cumulative filled quantity across all managed market sell orders
+                total_market_filled = sum(order_filled_quantity(o) for o in managed_market_sells)
+                if not total_market_filled and prior_order:
+                    total_market_filled = order_filled_quantity(prior_order)
+
+                prior_status = normalize_order_status((prior_order or {}).get("status")) if prior_order else ""
+                remaining_authorized = max(0, leg_target_qty - total_market_filled)
+
+                # Case 1: Prior market order(s) already filled the entire authorized quantity
+                if total_market_filled > 0 and remaining_authorized <= 0:
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "market_order_already_filled", "order_id": stored_market_id,
+                        "mode": "immediate", "success": True,
+                        "reason": f"Market orders already filled authorized quantity ({total_market_filled}/{leg_target_qty} qty); awaiting position settlement",
+                        "product": product_for_position,
+                    }
+                    actions.append(base)
+                    logger.info("[%s] Market orders already filled authorized qty (%d/%d); awaiting flat position confirmation", symbol, total_market_filled, leg_target_qty)
+                    continue
+
+                # Case 2: Prior market order was rejected/cancelled with 0 fills
+                if prior_status in TERMINAL_CANCELLED_STATUSES and total_market_filled == 0:
+                    reject_reason = (
+                        (prior_order or {}).get("text")
+                        or (prior_order or {}).get("rejection_reason")
+                        or (prior_order or {}).get("status_message")
+                        or (prior_order or {}).get("message")
+                        or f"Prior market order {stored_market_id} terminated with status {prior_status}"
+                    )
+                    logger.critical("[%s] In-flight market exit order %s was rejected/cancelled by broker: %s (%s)",
+                                    symbol, stored_market_id, prior_status, reject_reason)
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="SELL_MARKET_TERMINAL_REJECTED",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=f"Order {stored_market_id} ({prior_status}): {reject_reason}",
+                        details={
+                            "order_id": stored_market_id,
+                            "broker_status": prior_status,
+                            "symbol": symbol,
+                            "quantity": managed_qty,
+                            "rejection_reason": reject_reason,
+                            "order_data": prior_order,
+                        },
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+                    base = {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                        "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                        "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                        "status": "market_order_rejected", "order_id": stored_market_id, "mode": "immediate",
+                        "error": f"Prior market order {stored_market_id} was {prior_status}: {reject_reason}", "success": False,
+                        "product": product_for_position,
+                    }
+                    actions.append(base)
+                    alerts.append({"severity": "CRITICAL", **base})
+                    continue
+
+                # Case 3: Partial fill reconciliation (e.g. 40 filled, 25 cancelled)
+                # Reconcile remaining authorized quantity against current available broker position snapshot
+                if total_market_filled > 0:
+                    reconciled_qty = min(managed_qty, remaining_authorized)
+                    if reconciled_qty <= 0:
+                        base = {
+                            "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                            "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                            "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                            "status": "market_order_already_filled", "order_id": stored_market_id,
+                            "mode": "immediate", "success": True,
+                            "reason": f"Market orders already filled authorized quantity ({total_market_filled}/{leg_target_qty} qty); awaiting position settlement",
+                            "product": product_for_position,
+                        }
+                        actions.append(base)
+                        continue
+
+                    if reconciled_qty != managed_qty:
+                        logger.info(
+                            "[%s] Reconciled immediate market exit qty from %d to %d (prior filled: %d, authorized target: %d, broker snapshot: %d)",
+                            symbol, managed_qty, reconciled_qty, total_market_filled, leg_target_qty, total_broker_qty
+                        )
+                        managed_qty = reconciled_qty
+
+            # Dry-run immediate exit
+            if not execute:
+                base = {
+                    "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                    "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                    "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                    "product": product_for_position, "status": "place_market", "dry_run": True,
+                    "action_needed": True, "mode": "immediate",
+                    "reason": f"Authorized leg will be immediately squared off with MARKET order ({managed_qty} qty)",
+                }
+                actions.append(base)
+                continue
+
+            if token == MOCK_TOKEN:
+                mock_oid = f"mock_{int(time.time()*1000)}"
+                if r:
+                    r.set(keys["mode"], "immediate")
+                    r.set(keys["market_order_id"], mock_oid)
+                    r.set(keys["order_id"], mock_oid)
+                    r.sadd(f"fno:{broker}:managed_order_ids:thu", mock_oid)
+                    r.sadd(f"fno:{broker}:managed_order_ids", mock_oid)
+                base = {
+                    "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                    "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                    "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                    "product": product_for_position, "status": "place_market", "order_id": mock_oid,
+                    "success": True, "mode": "immediate",
+                }
+                actions.append(base)
+                continue
+
+            if abort_event is not None and abort_event.is_set():
+                logger.critical("[%s] Distributed lock lost immediately before market order placement! Aborting.", symbol)
+                base = {"status": "lock_lost", "error": "Distributed lock lost before broker mutation", "success": False, "mode": "immediate"}
+                actions.append(base)
+                alerts.append({"severity": "CRITICAL", **base})
+                return {
+                    "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker,
+                    "positions": len(positions), "authorized_positions": len(authorized),
+                    "actions": actions, "orphan_managed_orders": orphan_managed_orders,
+                    "alerts": alerts, "fatal_error": "lock_lost", "dry_run": not execute,
+                }
+
+            if not force:
+                is_open, open_reason = is_market_hours_ist()
+                if not is_open:
+                    logger.warning("[%s] Market closed (%s) before market order placement. Aborting.", symbol, open_reason)
+                    base = {"status": "market_closed", "error": f"Market closed before broker mutation: {open_reason}", "success": False, "mode": "immediate"}
+                    actions.append(base)
+                    alerts.append({"severity": "CRITICAL", **base})
+                    return {
+                        "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker,
+                        "positions": len(positions), "authorized_positions": len(authorized),
+                        "actions": actions, "orphan_managed_orders": orphan_managed_orders,
+                        "alerts": alerts, "fatal_error": "market_closed", "dry_run": not execute,
+                    }
+
+            try:
+                result = place_exit_order_market(token, pos, managed_qty, product=product_for_position, tag=tag, broker=broker)
+                base = {
+                    "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                    "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                    "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                    "product": product_for_position, "status": "place_market", "mode": "immediate",
+                    "result": result, "success": result.get("success", False),
+                }
+                if result.get("success"):
+                    new_market_id = result.get("order_id")
+                    base["order_id"] = new_market_id
+                    if r and new_market_id:
+                        r.set(keys["mode"], "immediate")
+                        r.set(keys["market_order_id"], new_market_id)
+                        r.set(keys["order_id"], new_market_id)
+                        r.sadd(f"fno:{broker}:managed_order_ids:thu", new_market_id)
+                        r.sadd(f"fno:{broker}:managed_order_ids", new_market_id)
+                    logger.info("[%s] Successfully placed immediate MARKET order for %d qty (order_id: %s)", symbol, managed_qty, new_market_id)
+                else:
+                    base["error"] = result.get("error")
+                    logger.error("[%s] Market order placement failed: %s", symbol, result.get("error"))
+                    dispatch_order_failure_discord(
+                        broker=broker,
+                        action="SELL_MARKET",
+                        track=CYCLE_TRACK,
+                        symbol=symbol,
+                        quantity=managed_qty,
+                        error_reason=str(result.get("error")),
+                        details=result,
+                        redis_client=r,
+                        cooldown_seconds=600,
+                    )
+            except Exception as exc:
+                base = {
+                    "cycle": CYCLE_NAME, "track": CYCLE_TRACK, "broker": broker, "symbol": symbol,
+                    "instrument_token": token_key, "tag": tag, "quantity": managed_qty,
+                    "target_quantity": leg_target_qty, "total_broker_qty": total_broker_qty,
+                    "product": product_for_position, "status": "execution_failed", "error": str(exc), "success": False, "mode": "immediate",
+                }
+                logger.error("[%s] Exception during market order placement: %s", symbol, exc)
+                dispatch_order_failure_discord(
+                    broker=broker,
+                    action="SELL_MARKET",
+                    track=CYCLE_TRACK,
+                    symbol=symbol,
+                    quantity=managed_qty,
+                    error_reason=str(exc),
+                    redis_client=r,
+                    cooldown_seconds=600,
+                )
+            actions.append(base)
             continue
 
         # Fetch live LTP
@@ -2359,6 +2881,7 @@ def main() -> int:
     parser.add_argument("--auto-cancel-orphans", action="store_true", default=True, help="Auto-cancel orphan THU-SL orders when position is closed (default: True to prevent naked shorts)")
     parser.add_argument("--no-auto-cancel-orphans", action="store_false", dest="auto_cancel_orphans", help="Disable auto-cancellation of orphan orders (leaves orphan orders open for manual cancel)")
     parser.add_argument("--product", default=None, help="Explicit product fallback (I or D)")
+    parser.add_argument("--exit-immediately", action="store_true", help="Immediately square off authorized legs with MARKET sell orders instead of trailing SL")
     parser.add_argument("--debug", action="store_true", help="Verbose DEBUG logging")
     parser.add_argument("--log-api", action="store_true", help="Enable raw broker API dump")
     args = parser.parse_args()
@@ -2384,6 +2907,7 @@ def main() -> int:
     from config import get_config_bool, get_config_int
     # 1. Master Gate: LIVE_EXIT_TRIGGER_THURSDAY (Redis -> .env -> false)
     live_env_enabled = get_config_bool("LIVE_EXIT_TRIGGER_THURSDAY", default=False, redis_client=r)
+    exit_immediately = bool(args.exit_immediately)
     if args.lots is None:
         args.lots = get_config_int("LOTS_THURSDAY", 1, redis_client=r)
     if args.lot_size is None:
@@ -2526,6 +3050,7 @@ def main() -> int:
             short_positions=short_positions,
             active_expiry=active_expiry,
             abort_event=abort_event,
+            exit_immediately=exit_immediately,
         )
 
         if abort_event.is_set() or summary.get("fatal_error") == "lock_lost":
