@@ -147,6 +147,7 @@ nifty50_strategies/
 | `scripts/Tuesday-Fno-Exit-Orders-V1.py` | Dedicated Tuesday 5-day cycle trailing Stop-Loss Market (SL-M) order manager for Upstox; enforces `tag="TUE-SL"`, cross-process distributed lock (`fno_execution_lock()`) with heartbeat auto-renewal, 15:30:00 IST exact-second cutoff, NSE exchange holiday checks, pre-mutation lock/time validation, asynchronous cancel lifecycle confirmation, and order slicing |
 | `scripts/Thursday-Fno-Exit-Orders-V1.py` | Dedicated Thursday 3-day cycle trailing Stop-Loss Market (SL-M) order manager (broker per `THURSDAY_BROKER`, currently Upstox); enforces `producttype="CARRYFORWARD"`, authoritative Redis `order_id` tracking, `LOTS_THURSDAY=1` (65 qty default), isolated fast gate `ORDERS_LIVE_THU`, cycle-isolated execution lock (`fno:lock:exit_order_manager:thursday`), holiday/market-hours guards, and short-position safeguards |
 | `scripts/auto_record_manual_exit.py` | Auto-detects manual broker app square-offs, reconciles active snapshot FSM legs to `MANUAL_CLOSED`, clears Redis trailing/auth keys, marks cycle closed when all legs end, and resets `ORDERS_LIVE_* = 0` |
+| `scripts/cycle_pl_monitor.py` | Read-only per-cycle P&L monitor (`--tuesday` / `--thursday`, JSON output). With `--profit-exit` it applies the combined 20% profit rule: cancels the cycle's open orders, sells the legs at market, and records the fills (see section 12.8). Dry-run unless `--execute` |
 | `scripts/mark_manual_exit.py` | CLI tool to manually record broker square-offs (CALL or PUT) with fill price into snapshot, Redis, and unified store |
 | `scripts/register_manual_entry.py` | CLI tool to register manual entries into snapshot and Redis for live tracking |
 | `scripts/run_weekly_close.py` | Unified master weekly orchestrator (Mon 15:37 IST / Tue 09:07 deferred): closes active cycle upfront, runs report email, benchmark scoring, SQLite merge, and skill generation |
@@ -896,6 +897,46 @@ python scripts/Thursday-Fno-Exit-Orders-V1.py --execute --lots 1
 python scripts/Thursday-Fno-Exit-Orders-V1.py --mock --force
 ```
 
+#### 8. Cycle P&L Monitor & Combined 20% Profit Exit (`scripts/cycle_pl_monitor.py`)
+
+One cycle at a time (`--tuesday` or `--thursday`). The script never writes to Redis or to the snapshot/DB, except through the existing `auto_record_manual_exit` path described below.
+
+**Read-only usage (default)**
+```bash
+.venv/bin/python scripts/cycle_pl_monitor.py --thursday              # JSON P&L for the latest FILLED cycle
+.venv/bin/python scripts/cycle_pl_monitor.py --thursday --table      # human-readable table
+.venv/bin/python scripts/cycle_pl_monitor.py --thursday --watch 60   # repeat every 60 s
+```
+- BUY legs (order IDs, strikes, buy prices, expiry, broker) come from the local DB (`strategy_buy_snapshots`).
+- Open/sold status, quantities, sold prices and LTP come from the broker (positions, order book, quote API).
+- Legs sold on an earlier day use the local DB FSM exit price (`strategy_hourly_data`). If that is also missing, the script exits with code 2 (insufficient data).
+- Exit codes: 0 ok, 1 error, 2 insufficient data, 3 a square-off leg was not confirmed filled (review needed).
+
+**Profit-exit mode (`--profit-exit`)**
+1. **Holiday stop:** if Redis `is_market_holiday` is `yes`, it returns `skipped_market_holiday` before any broker call.
+2. **Threshold:** combined P&L % over both legs of the cycle (`--threshold`, default 20). Dry-run output shows the plan.
+3. **Cancel (only when the threshold is met):** every open order on this cycle's legs is cancelled, and each cancel must be confirmed through the order book. If one is still open, or has filled in the meantime, the run aborts with no SELL and the next run re-plans. Orders on other instruments are ignored.
+4. **Sell sequence:** the leg with the higher P&L is sold first, at MARKET, using the existing `place_exit_order_market` attributes (tag `PT20-SQ`). The position is re-read just before each sell. The second leg is sent only after the first is confirmed filled. A single remaining leg is sold even at a loss.
+5. **Record:** each fill is recorded with `auto_record_manual_exit(..., status_override="PROFIT_TARGET_CLOSED")`, which closes the FSM leg and clears its Redis exit state, so the FSM stops issuing exits for it.
+6. **Market hours:** `--execute` is refused outside 09:15–15:30 IST on weekdays.
+
+Without `--execute`, nothing is sent: the output lists `would_cancel` and the planned sequence.
+
+**Relationship to the existing 20% rule.** `common/profit_monitor.py` also authorises a both-legs exit in Redis at 20% (`EXIT_BOTH`), which the exit managers act on. Both can fire; whichever runs first wins, and the other finds no open position. The monitor runs every 4 minutes, so it is usually first.
+
+**Cron (VM is UTC; the market-hours guard works in IST regardless).** Installed live with `--execute`:
+```cron
+3-59/4 4-10 * * 1,4,5 cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/cycle_pl_monitor.py --thursday --profit-exit --execute >> /home/ubuntu/logs/cycle_pl_thursday_$(date +\%F).log 2>&1
+3-59/4 4-10 * * 1-5   cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/cycle_pl_monitor.py --tuesday --profit-exit --execute  >> /home/ubuntu/logs/cycle_pl_tuesday_$(date +\%F).log 2>&1
+```
+The offset `3-59/4` avoids the collectors at :02/:32 and the peak monitors at :16/:46. The run window is 04:03–10:59 UTC (09:33–15:29 IST).
+
+**Status and limits**
+- The cancel-and-sell path is covered by unit tests with a mocked broker (31 tests in `tests/test_cycle_pl_monitor.py`). It has not yet been exercised against the live broker. The first real test will be the next Tuesday or Thursday cycle that reaches 20%.
+- The holiday check applies only to `--profit-exit`. The read-only modes do not read the flag.
+- The cancel step covers any open order on the cycle's legs, including a manual pending SELL, not only exit-manager SL-M orders.
+- The market-hours guard checks weekdays and clock time. It does not use the NSE holiday calendar; the Redis flag is the holiday control.
+
 ### Runtime Configuration (Controlled Exclusively via Redis Cloud)
 
 All runtime execution gates, sizing, and order mode switches are controlled **exclusively via Redis Cloud** as the single source of truth. The `.env` file is strictly reserved for static infrastructure credentials (API keys, Redis/MongoDB connection strings, Discord webhooks) and contains zero dynamic execution switches.
@@ -998,6 +1039,11 @@ All production crontab schedules execute in **UTC** on AWS EC2:
 # Thursday 3-Day Exit Manager (broker per THURSDAY_BROKER, currently Upstox; Lots: 1 = 65 qty)
 45-59 3 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Thursday-Fno-Exit-Orders-V1.py --execute >> logs/thu_exit_$(date +\%F).log 2>&1
 * 4-9 * * 1-5 cd ~/nifty50_strategies && mkdir -p logs && .venv/bin/python scripts/Thursday-Fno-Exit-Orders-V1.py --execute >> logs/thu_exit_$(date +\%F).log 2>&1
+
+# Cycle P&L Monitor — combined 20% profit exit (live, --execute). Every 4 min (offset :03), 04:03–10:59 UTC = 09:33–15:29 IST
+# Thursday track: Mon, Thu, Fri. Tuesday track: Mon–Fri. Holiday stop via Redis is_market_holiday=yes.
+3-59/4 4-10 * * 1,4,5 cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/cycle_pl_monitor.py --thursday --profit-exit --execute >> /home/ubuntu/logs/cycle_pl_thursday_$(date +\%F).log 2>&1
+3-59/4 4-10 * * 1-5 cd /home/ubuntu/nifty50_strategies && .venv/bin/python scripts/cycle_pl_monitor.py --tuesday --profit-exit --execute >> /home/ubuntu/logs/cycle_pl_tuesday_$(date +\%F).log 2>&1
 ```
 
 ### Weekly Monday email report

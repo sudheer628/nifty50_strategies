@@ -361,7 +361,8 @@ def _leg_status(open_qty: int, sold_qty: int) -> str:
     return "SOLD"
 
 
-def evaluate_cycle(track: str, broker_name: Optional[str] = None, cycle_id: Optional[str] = None) -> Dict[str, Any]:
+def evaluate_cycle(track: str, broker_name: Optional[str] = None, cycle_id: Optional[str] = None,
+                   broker_view: Optional["BrokerView"] = None) -> Dict[str, Any]:
     if track not in TRACKS:
         raise InsufficientData(f"Unknown track {track!r}")
     spec = TRACKS[track]
@@ -371,7 +372,7 @@ def evaluate_cycle(track: str, broker_name: Optional[str] = None, cycle_id: Opti
     cycle = str(row["cycle_id"])
     warnings: List[str] = []
 
-    broker = BrokerView(broker_name)
+    broker = broker_view or BrokerView(broker_name)
     legs_out: Dict[str, Any] = {}
     total_pl = 0.0
     total_cost = 0.0
@@ -455,6 +456,230 @@ def render(result: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Combined profit-exit (ACTS ON THE BROKER ONLY WITH --execute)
+# ---------------------------------------------------------------------------
+
+PROFIT_EXIT_TAG = "PT20-SQ"
+PROFIT_EXIT_REASON = "PROFIT_TARGET_20PCT_SQUAREOFF"
+MARKET_OPEN_IST = (9, 15)
+MARKET_CLOSE_IST = (15, 30)
+FILL_POLL_SECONDS = 2.0
+FILL_POLL_ATTEMPTS = 15
+TRACK_AUTO_STRATEGY = {"tuesday": "5day_strategy", "thursday": "3day_strategy"}
+
+
+def _is_market_open_ist(now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now(IST)
+    hm = (now.hour, now.minute)
+    return now.weekday() < 5 and MARKET_OPEN_IST <= hm <= MARKET_CLOSE_IST
+
+
+def open_cycle_orders(broker: "BrokerView", leg_tokens: set, leg_symbols: set) -> List[Dict[str, Any]]:
+    """Open broker orders that belong to this cycle's legs. Other orders are ignored."""
+    from common.broker_adapters import OPEN_ORDER_STATUSES, normalize_order_status
+
+    found = []
+    for o in broker.orders:
+        if normalize_order_status(o.get("status")) not in OPEN_ORDER_STATUSES:
+            continue
+        tok = str(o.get("instrument_token") or "")
+        sym = str(o.get("trading_symbol") or "").upper()
+        if (tok and tok in leg_tokens) or (sym and sym in leg_symbols):
+            found.append({k: o.get(k) for k in ("order_id", "status", "transaction_type", "trading_symbol", "quantity", "tag")})
+    return found
+
+
+def plan_profit_exit(result: Dict[str, Any], threshold_pct: float) -> Dict[str, Any]:
+    """Decide what to sell. Combined P&L % is measured over both legs of the cycle."""
+    legs = result["legs"]
+    active = [l for l in legs.values() if l["open_qty"] > 0]
+    combined_pct = result["total_pl_pct"]
+    if not active:
+        return {"action": "none", "reason": "no active leg at broker"}
+    if combined_pct < threshold_pct:
+        return {"action": "none", "reason": f"combined P&L {combined_pct:+.2f}% below threshold {threshold_pct:.2f}%"}
+    # Higher leg P&L first; a single active leg is sold regardless of its own sign.
+    ordered = sorted(active, key=lambda l: l["leg_pl"], reverse=True)
+    return {
+        "action": "square_off",
+        "combined_pl_pct": combined_pct,
+        "sequence": [
+            {"leg": l["leg"], "symbol": l["symbol"], "strike": l["strike"], "opt_type": l["opt_type"],
+             "qty": l["open_qty"], "ltp": l["ltp"], "leg_pl": l["leg_pl"], "instrument_token": l["instrument_token"]}
+            for l in ordered
+        ],
+    }
+
+
+def _place_market_sell(broker: "BrokerView", leg: Dict[str, Any], qty: int) -> Dict[str, Any]:
+    """The only place that submits an order. Called only from run_profit_exit when execute=True."""
+    pos = broker.position_for(instrument_token=leg["instrument_token"]) or {}
+    position = {"instrument_token": leg["instrument_token"], "tradingsymbol": leg["symbol"]}
+    product = broker.adapter.get_exit_product(pos) if pos else None
+    return broker.adapter.place_exit_order_market(
+        broker.token, position, qty, product=product or "D", tag=PROFIT_EXIT_TAG,
+    )
+
+
+def _wait_for_fill(broker: "BrokerView", order_id: str) -> Dict[str, Any]:
+    from common.broker_adapters import TERMINAL_CANCELLED_STATUSES, TERMINAL_FILLED_STATUSES, normalize_order_status
+
+    for _ in range(FILL_POLL_ATTEMPTS):
+        broker.orders = broker.adapter.fetch_order_book(broker.token)
+        o = broker.order_by_id(order_id)
+        if o is not None:
+            st = normalize_order_status(o.get("status"))
+            if st in TERMINAL_FILLED_STATUSES:
+                return {"state": "filled", "filled_qty": int(_f(o.get("filled_quantity"))),
+                        "avg_price": _f(o.get("average_price"))}
+            if st in TERMINAL_CANCELLED_STATUSES:
+                return {"state": st, "filled_qty": int(_f(o.get("filled_quantity"))),
+                        "avg_price": _f(o.get("average_price"))}
+        time.sleep(FILL_POLL_SECONDS)
+    return {"state": "timeout", "filled_qty": 0, "avg_price": 0.0}
+
+
+def _fresh_open_qty(broker: "BrokerView", instrument_token: str) -> int:
+    """Re-read the broker position right before selling: the leg must still be open."""
+    broker.positions = _as_list(broker.adapter.fetch_positions(broker.token))
+    pos = broker.position_for(instrument_token=instrument_token)
+    return int(_f(pos.get("quantity"))) if pos is not None else 0
+
+
+def _expiry_iso(yyyymmdd: str) -> str:
+    return f"{yyyymmdd[0:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+
+
+def _market_holiday_flag() -> Optional[str]:
+    """Redis is_market_holiday flag ('yes'/'no'). None if Redis is unreadable."""
+    from config import get_redis_client
+
+    try:
+        r = get_redis_client()
+        val = r.get("is_market_holiday") if r else None
+    except Exception:
+        return None
+    if isinstance(val, bytes):
+        val = val.decode("utf-8", "replace")
+    return str(val).strip().lower() if val is not None else None
+
+
+def _cancel_and_confirm(view: "BrokerView", orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Cancel the cycle's open orders and wait until each one is confirmed cancelled."""
+    from common.broker_adapters import OPEN_ORDER_STATUSES, TERMINAL_CANCELLED_STATUSES, normalize_order_status
+
+    requests_out = []
+    for o in orders:
+        oid = str(o["order_id"])
+        resp = view.adapter.cancel_order(view.token, oid)
+        requests_out.append({"order_id": oid, "request_success": bool(resp.get("success"))})
+
+    pending = {str(o["order_id"]) for o in orders}
+    final: Dict[str, str] = {}
+    for _ in range(FILL_POLL_ATTEMPTS):
+        view.orders = view.adapter.fetch_order_book(view.token)
+        for oid in list(pending):
+            found = view.order_by_id(oid)
+            st = normalize_order_status((found or {}).get("status"))
+            if st in TERMINAL_CANCELLED_STATUSES:
+                final[oid] = "cancelled"
+                pending.discard(oid)
+            elif st and st not in OPEN_ORDER_STATUSES:
+                final[oid] = st  # e.g. filled meanwhile: must NOT be sold again
+                pending.discard(oid)
+        if not pending:
+            break
+        time.sleep(FILL_POLL_SECONDS)
+    for oid in pending:
+        final[oid] = "unconfirmed"
+    return {"requests": requests_out, "final": final,
+            "confirmed": all(v == "cancelled" for v in final.values())}
+
+
+def run_profit_exit(track: str, threshold_pct: float = 20.0, execute: bool = False,
+                    broker_name: Optional[str] = None, cycle_id: Optional[str] = None,
+                    now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = now or datetime.now(IST)
+
+    # 0. Exchange holiday: stop before any broker call for the day.
+    if _market_holiday_flag() == "yes":
+        return {"action": "skipped_market_holiday", "track": track,
+                "note": "Redis is_market_holiday=yes; no broker calls made"}
+
+    db_path, row = find_latest_cycle(track, cycle_id)
+    broker_name = (broker_name or row.get("broker") or "upstox").lower()
+    view = BrokerView(broker_name)
+    result = evaluate_cycle(track, broker_name=broker_name, cycle_id=cycle_id, broker_view=view)
+
+    # 1. Orders on this cycle's legs (anything else at the broker is ignored).
+    tokens = {l["instrument_token"] for l in result["legs"].values() if l["instrument_token"]}
+    symbols = {str(l["symbol"]).upper() for l in result["legs"].values() if l["symbol"]}
+    open_orders = open_cycle_orders(view, tokens, symbols)
+
+    # 2. Threshold on combined P&L over both legs.
+    plan = plan_profit_exit(result, threshold_pct)
+    out: Dict[str, Any] = {
+        "cycle_id": result["cycle_id"], "track": track, "threshold_pct": threshold_pct,
+        "combined_pl_pct": result["total_pl_pct"], "plan": plan,
+        "open_cycle_orders": open_orders,
+        "mode": "execute" if execute else "dry_run",
+    }
+    if plan["action"] != "square_off":
+        return out  # below threshold: open orders are reported only, never touched
+    if not execute:
+        out["note"] = "dry-run: nothing sent. Re-run with --execute to cancel open orders and square off."
+        if open_orders:
+            out["would_cancel"] = [o["order_id"] for o in open_orders]
+        return out
+    if not _is_market_open_ist(now):
+        out["action"] = "refused_market_closed"
+        return out
+
+    # 3. Threshold met: cancel this cycle's open orders and confirm before any SELL.
+    if open_orders:
+        cancel = _cancel_and_confirm(view, open_orders)
+        out["cancel"] = cancel
+        if not cancel["confirmed"]:
+            out["action"] = "aborted_open_orders_not_cancelled"
+            return out
+
+    # 4. Sequential square-off: higher-P&L leg first; second leg only after the first is confirmed filled.
+    expiry_iso = _expiry_iso(result["expiry"])
+    fills = []
+    for step in plan["sequence"]:
+        qty_now = _fresh_open_qty(view, step["instrument_token"])
+        if qty_now <= 0:
+            fills.append({"leg": step["leg"], "skipped": "not active at broker"})
+            continue
+        resp = _place_market_sell(view, step, qty_now)
+        if not resp.get("success"):
+            fills.append({"leg": step["leg"], "error": "order rejected", "response": resp})
+            break
+        fill = _wait_for_fill(view, resp.get("order_id"))
+        fill.update({"leg": step["leg"], "order_id": resp.get("order_id"), "qty_requested": qty_now})
+        fills.append(fill)
+        if fill["state"] != "filled" or fill["filled_qty"] != qty_now:
+            break  # do not start the second leg until the first is confirmed
+
+        # 5. Record the fill so the FSM stops issuing exits for this leg.
+        from scripts.auto_record_manual_exit import auto_record_manual_exit
+
+        try:
+            fill["db_record"] = auto_record_manual_exit(
+                track=TRACK_AUTO_STRATEGY[track], broker=broker_name, strike=int(step["strike"]),
+                option_type=step["opt_type"], expiry_iso=expiry_iso, sell_price=fill["avg_price"],
+                sell_ts=int(now.timestamp()), sell_qty=fill["filled_qty"], dry_run=False,
+                exit_reason_override=PROFIT_EXIT_REASON, status_override="PROFIT_TARGET_CLOSED",
+            )
+        except Exception as exc:  # the SELL already filled: report it, do not hide it
+            fill["db_record_error"] = f"{type(exc).__name__}: {exc}"
+            break
+    out["action"] = "square_off_executed"
+    out["fills"] = fills
+    return out
+
+
 def _run_once(args) -> int:
     track = "tuesday" if args.tuesday else "thursday"
     as_json = not args.table
@@ -489,7 +714,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--watch", type=int, default=0, metavar="SECONDS",
                         help="Repeat every N seconds until interrupted (e.g. 60)")
     parser.add_argument("--table", action="store_true", help="Print a human-readable table instead of JSON")
+    parser.add_argument("--profit-exit", action="store_true",
+                        help="Check the combined profit threshold and square off. Dry-run unless --execute.")
+    parser.add_argument("--threshold", type=float, default=20.0, help="Combined P&L %% threshold (default 20)")
+    parser.add_argument("--execute", action="store_true",
+                        help="With --profit-exit: actually send MARKET SELL orders and record fills.")
     args = parser.parse_args(argv)
+
+    if args.profit_exit:
+        track = "tuesday" if args.tuesday else "thursday"
+        try:
+            res = run_profit_exit(track, threshold_pct=args.threshold, execute=args.execute,
+                                  broker_name=args.broker, cycle_id=args.cycle_id)
+        except InsufficientData as exc:
+            print(json.dumps({"status": "insufficient_data", "track": track, "message": str(exc)}, indent=2))
+            return 2
+        except Exception as exc:
+            print(json.dumps({"status": "error", "track": track, "message": f"{type(exc).__name__}: {exc}"}, indent=2))
+            return 1
+        print(json.dumps(res, indent=2, default=str))
+        # 3 = a square-off was attempted but a leg was not confirmed filled (needs review)
+        failed = [f for f in res.get("fills", []) if "skipped" not in f and (f.get("state") != "filled" or "error" in f or "db_record_error" in f)]
+        return 3 if failed or str(res.get("action", "")).startswith("aborted") else 0
 
     if args.watch <= 0:
         return _run_once(args)
