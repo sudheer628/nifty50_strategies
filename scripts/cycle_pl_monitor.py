@@ -457,17 +457,25 @@ def render(result: Dict[str, Any]) -> str:
 
 def _run_once(args) -> int:
     track = "tuesday" if args.tuesday else "thursday"
+    as_json = not args.table
     try:
         result = evaluate_cycle(track, broker_name=args.broker, cycle_id=args.cycle_id)
     except InsufficientData as exc:
-        msg = f"INSUFFICIENT DATA ({track}): {exc}"
-        print(json.dumps({"status": "insufficient_data", "track": track, "message": str(exc)}) if args.json else msg)
+        if as_json:
+            print(json.dumps({"status": "insufficient_data", "track": track, "message": str(exc)}, indent=2))
+        else:
+            print(f"INSUFFICIENT DATA ({track}): {exc}")
         return 2
     except Exception as exc:  # broker/network/config errors
-        msg = f"ERROR ({track}): {type(exc).__name__}: {exc}"
-        print(json.dumps({"status": "error", "track": track, "message": str(exc)}) if args.json else msg)
+        if as_json:
+            print(json.dumps({"status": "error", "track": track, "message": str(exc)}, indent=2))
+        else:
+            print(f"ERROR ({track}): {type(exc).__name__}: {exc}")
         return 1
-    print(json.dumps(result, indent=2, default=str) if args.json else render(result))
+    if as_json:
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        print(render(result))
     return 0
 
 
@@ -480,7 +488,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cycle-id", default=None, help="Specific cycle_id (default: latest FILLED cycle)")
     parser.add_argument("--watch", type=int, default=0, metavar="SECONDS",
                         help="Repeat every N seconds until interrupted (e.g. 60)")
-    parser.add_argument("--json", action="store_true", help="Emit JSON instead of a table")
+    parser.add_argument("--table", action="store_true", help="Print a human-readable table instead of JSON")
     args = parser.parse_args(argv)
 
     if args.watch <= 0:
