@@ -54,16 +54,29 @@ def _now_ist() -> datetime:
     return datetime.now(IST_TZ)
 
 
+def _resolve_sqlite_base(sqlite_dir: str) -> str:
+    clean_dir = sqlite_dir.rstrip("/\\")
+    if os.path.basename(clean_dir) == "strategies":
+        return os.path.dirname(clean_dir)
+    return clean_dir
+
+
 def _get_signals_db_path(sqlite_dir: str, dt: datetime) -> str:
     yyyy_mm = dt.strftime("%Y_%m")
-    base = sqlite_dir.replace("/strategies", "").rstrip("/\\")
+    base = _resolve_sqlite_base(sqlite_dir)
     return os.path.join(base, f"signals_data_{yyyy_mm}.db")
 
 
 def _get_nsf_db_path(sqlite_dir: str, dt: datetime) -> str:
     yyyy_mm = dt.strftime("%Y_%m")
-    base = sqlite_dir.replace("/strategies", "").rstrip("/\\")
-    return os.path.join(base, f"nifty_signal_features_{yyyy_mm}.db")
+    base = _resolve_sqlite_base(sqlite_dir)
+    nsf_path = os.path.join(base, f"nifty_signal_features_{yyyy_mm}.db")
+    if os.path.exists(nsf_path):
+        return nsf_path
+    alt_path = os.path.join(base, f"signals_data_{yyyy_mm}.db")
+    if os.path.exists(alt_path):
+        return alt_path
+    return nsf_path
 
 
 def evaluate_iv_stability(

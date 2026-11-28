@@ -138,6 +138,10 @@ def evaluate_gamma_signals(
     clean_dir = sqlite_dir.rstrip("/\\")
     base_dir = os.path.dirname(clean_dir) if os.path.basename(clean_dir) == "strategies" else clean_dir
     nsf_db = os.path.join(base_dir, f"nifty_signal_features_{yyyy_mm}.db")
+    if not os.path.exists(nsf_db):
+        alt_db = os.path.join(base_dir, f"signals_data_{yyyy_mm}.db")
+        if os.path.exists(alt_db):
+            nsf_db = alt_db
 
     if not os.path.exists(nsf_db):
         return None, None, None, f"NSF DB not found: {nsf_db}"

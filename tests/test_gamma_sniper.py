@@ -207,3 +207,57 @@ def test_evaluate_gamma_signals_rangebound(tmp_path):
     assert "Market rangebound" in reason
 
 
+def test_evaluate_gamma_signals_falls_back_to_unified_signals_db(tmp_path):
+    """Verify gamma sniper reads VIEW signals from signals_data_YYYY_MM.db when NSF DB is decommissioned."""
+    import json
+
+    signals_db = str(tmp_path / "signals_data_2026_12.db")
+    conn = sqlite3.connect(signals_db)
+    conn.execute("""
+        CREATE TABLE market_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pk TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            price REAL,
+            data TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE VIEW signals AS
+        SELECT
+            id,
+            ts,
+            symbol,
+            price AS ltp,
+            CAST(json_extract(data, '$.vwap') AS REAL) AS vwap,
+            CAST(json_extract(data, '$.vwap_distance') AS REAL) AS vwap_distance,
+            CAST(json_extract(data, '$.nsf_rsi14') AS REAL) AS nsf_rsi14
+        FROM market_data
+        WHERE pk LIKE 'INDEX#%'
+    """)
+    as_of = datetime(2026, 12, 7, 13, 30, 0, tzinfo=IST_TZ)
+    base_ts = int(as_of.timestamp())
+
+    for i in range(3):
+        ts = base_ts - (2 - i) * 60
+        conn.execute(
+            "INSERT INTO market_data (pk, ts, symbol, price, data) VALUES (?, ?, ?, ?, ?)",
+            (
+                "INDEX#NIFTY50",
+                ts,
+                "NIFTY50",
+                25100.0,
+                json.dumps({"vwap": 25055.0, "vwap_distance": 0.18, "nsf_rsi14": 62.0}),
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    direction, vwap_dist, rsi, reason = evaluate_gamma_signals(str(tmp_path / "strategies"), as_of)
+    assert direction == "CALL"
+    assert vwap_dist == 0.18
+    assert rsi == 62.0
+    assert "Bullish gamma breakout" in reason
+
+
